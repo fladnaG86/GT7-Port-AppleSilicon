@@ -5,8 +5,13 @@
 #include <cstdint>
 #include <cstring>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "common/log.h"
 #include "common/types.h"
+#include "core/tls.h"
 #include "hle/hle.h"
 
 namespace Hle::AvPlayer {
@@ -21,6 +26,8 @@ struct PlayerContext {
     uint64_t current_time_ms = 0;
     void* object_ptr = nullptr;
     AvPlayerEventCallback event_cb = nullptr;
+    bool ready_on_add = false; // the game waits for StateReady before it starts
+    std::atomic<u32> generation{0}; // of Start calls: only the latest ends the movie
 };
 
 static PlayerContext g_player;
@@ -42,11 +49,19 @@ void* sceAvPlayerInit(void* init_data) {
     return &g_player;
 }
 
+// The Ex struct is the plain one with a leading size field.
 s32 sceAvPlayerInitEx(const void* p_data, void** p_player) {
-    (void)p_data;
     DC_INFO("sceAvPlayerInitEx()");
     g_player.active = false;
     g_player.current_time_ms = 0;
+    g_player.object_ptr = nullptr;
+    g_player.event_cb = nullptr;
+    if (p_data) {
+        void* const* ptrs = static_cast<void* const*>(p_data);
+        g_player.object_ptr = ptrs[11];
+        g_player.event_cb = reinterpret_cast<AvPlayerEventCallback>(ptrs[12]);
+        g_player.ready_on_add = true;
+    }
     if (p_player) {
         *p_player = &g_player;
     }
@@ -82,7 +97,21 @@ s32 sceAvPlayerStart(void* handle) {
     DC_INFO("sceAvPlayerStart(handle=%p)", handle);
     if (handle == &g_player && g_player.event_cb) {
         g_player.event_cb(g_player.object_ptr, 3 /*StatePlay*/, 0, nullptr);
-        g_player.event_cb(g_player.object_ptr, 1 /*StateStop*/, 0, nullptr);
+        if (g_player.ready_on_add) {
+            // On a console it comes from the player's own thread, after Start
+            // returns, and such games then only wait for it.
+            std::thread([generation = ++g_player.generation] {
+                constexpr auto kMovieLength = std::chrono::milliseconds(300);
+                Core::Tls::SetupThread();
+                std::this_thread::sleep_for(kMovieLength);
+                if (generation == g_player.generation) {
+                    g_player.event_cb(g_player.object_ptr, 1 /*StateStop*/, 0, nullptr);
+                }
+                Core::Tls::TeardownThread();
+            }).detach();
+        } else {
+            g_player.event_cb(g_player.object_ptr, 1 /*StateStop*/, 0, nullptr);
+        }
     }
     return 0;
 }

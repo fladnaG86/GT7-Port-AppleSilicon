@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "common/log.h"
+#include "core/loader/linker.h"
 #include "core/memory.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
@@ -28,6 +29,10 @@ s32 sceKernelAllocateDirectMemory(s64 search_start, s64 search_end, u64 len, u64
 
 s32 sceKernelReleaseDirectMemory(s64 start, u64 len) {
     return OrbisError(Mem::ReleaseDirect(start, len));
+}
+
+s32 sceKernelCheckedReleaseDirectMemory(s64 start, u64 len) {
+    return sceKernelReleaseDirectMemory(start, len);
 }
 
 u64 sceKernelGetDirectMemorySize() {
@@ -84,6 +89,80 @@ s32 sceKernelMunmap(void* addr, u64 len) {
 
 s32 sceKernelMprotect(void* addr, u64 len, int prot) {
     return OrbisError(Mem::Protect(reinterpret_cast<VAddr>(addr), len, prot));
+}
+
+// Memory types only matter to the real GPU's caches, so they are not tracked.
+s32 sceKernelMtypeprotect(void* addr, u64 len, int, int prot) {
+    return sceKernelMprotect(addr, len, prot);
+}
+
+s32 sceKernelMapDirectMemory2(void** addr, u64 len, int, int prot, int flags, s64 phys, u64 align) {
+    return sceKernelMapNamedDirectMemory(addr, len, prot, flags, phys, align, nullptr);
+}
+
+struct BatchMapEntry {
+    void* start;
+    s64 phys;
+    u64 len;
+    s8 prot;
+    s8 type;
+    s16 reserved;
+    s32 op;
+};
+static_assert(sizeof(BatchMapEntry) == 32);
+
+enum BatchMapOp : s32 {
+    kBatchMapDirect = 0,
+    kBatchUnmap = 1,
+    kBatchProtect = 2,
+    kBatchMapFlexible = 3,
+    kBatchTypeProtect = 4,
+};
+
+// Stops at the first failure; `*done` tells the guest how many entries applied.
+s32 sceKernelBatchMap2(BatchMapEntry* entries, int count, int* done, int flags) {
+    s32 result = ORBIS_OK;
+    int applied = 0;
+    for (; applied < count; ++applied) {
+        BatchMapEntry& e = entries[applied];
+        switch (e.op) {
+        case kBatchMapDirect:
+            result = sceKernelMapNamedDirectMemory(&e.start, e.len, e.prot, flags, e.phys, 0,
+                                                   nullptr);
+            break;
+        case kBatchUnmap:
+            result = sceKernelMunmap(e.start, e.len);
+            break;
+        case kBatchProtect:
+            result = sceKernelMprotect(e.start, e.len, e.prot);
+            break;
+        case kBatchMapFlexible:
+            result = sceKernelMapNamedFlexibleMemory(&e.start, e.len, e.prot, flags, nullptr);
+            break;
+        case kBatchTypeProtect:
+            result = sceKernelMtypeprotect(e.start, e.len, e.type, e.prot);
+            break;
+        default:
+            result = OrbisError(EINVAL);
+            break;
+        }
+        if (result != ORBIS_OK) {
+            DC_WARN("batch map entry %d op %d at %p len %#llx failed: %#x (from %s)", applied, e.op,
+                    e.start, e.len, result,
+                    Core::Loader::Linker::Instance()
+                        ->Describe(reinterpret_cast<u64>(__builtin_return_address(0)))
+                        .c_str());
+            break;
+        }
+    }
+    if (done) {
+        *done = applied;
+    }
+    return result;
+}
+
+s32 sceKernelBatchMap(BatchMapEntry* entries, int count, int* done) {
+    return sceKernelBatchMap2(entries, count, done, Mem::kMapFixed);
 }
 
 s32 sceKernelMlock(const void*, u64) {
@@ -166,6 +245,7 @@ void RegisterMemory() {
     constexpr const char* k = "libkernel";
     DC_HLE(k, sceKernelAllocateDirectMemory);
     DC_HLE(k, sceKernelReleaseDirectMemory);
+    DC_HLE(k, sceKernelCheckedReleaseDirectMemory);
     DC_HLE(k, sceKernelGetDirectMemorySize);
     DC_HLE(k, sceKernelMapDirectMemory);
     DC_HLE(k, sceKernelMapNamedDirectMemory);
@@ -174,6 +254,10 @@ void RegisterMemory() {
     DC_HLE(k, sceKernelReserveVirtualRange);
     DC_HLE(k, sceKernelMunmap);
     DC_HLE(k, sceKernelMprotect);
+    DC_HLE(k, sceKernelMtypeprotect);
+    DC_HLE(k, sceKernelMapDirectMemory2);
+    DC_HLE(k, sceKernelBatchMap);
+    DC_HLE(k, sceKernelBatchMap2);
     DC_HLE(k, sceKernelMlock);
     DC_HLE(k, sceKernelSetVirtualRangeName);
     DC_HLE(k, sceKernelSetPrtAperture);

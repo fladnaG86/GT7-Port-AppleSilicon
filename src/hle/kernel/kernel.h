@@ -34,6 +34,9 @@ void RegisterTime();
 void RegisterMisc();
 void RegisterFile();
 void RegisterSync();
+void RegisterFiber();
+// Debugging: logs every fiber and, for the suspended ones, where they stopped.
+void DumpFibers();
 
 // Where /app0 and the writable PS4 mount points live on the host.
 void SetFileRoots(const std::filesystem::path& game_root, const std::filesystem::path& user_root);

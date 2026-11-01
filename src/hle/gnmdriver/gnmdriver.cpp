@@ -105,6 +105,24 @@ void TriggerGnmEvent(u32 irq) {
     }
 }
 
+// Games tell compute interrupts apart by pipe, not by queue.
+void OnGpuInterrupt(u32 irq) {
+    if (irq < Gpu::Liverpool::CommandProcessor::kIrqCompute) {
+        TriggerGnmEvent(irq);
+        return;
+    }
+    u32 pipe = 0;
+    {
+        std::scoped_lock lk(g_queue_lock);
+        auto it = g_compute_queues.find(irq - Gpu::Liverpool::CommandProcessor::kIrqCompute);
+        if (it == g_compute_queues.end()) {
+            return;
+        }
+        pipe = it->second.pipe_id;
+    }
+    TriggerGnmEvent(pipe);
+}
+
 // ----------------------------------------------------- PM4 hardware init ----
 u32 sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     if (!cmdbuf || size < kHwInitPacketSize) {
@@ -188,6 +206,20 @@ s32 sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
     return 0;
 }
 
+s32 sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
+    if (!cmdbuf || size <= 0x27) {
+        return -1;
+    }
+    if (!ps_regs) {
+        cmdbuf = WriteShReg(cmdbuf, 8u, 0u, 0u);
+        cmdbuf = WriteContextReg(cmdbuf, 0x203u, 0u);
+        cmdbuf = WriteContextReg(cmdbuf, 0x8fu, 0xfu);
+        WriteNop(cmdbuf, 0x1d);
+        return 0;
+    }
+    return sceGnmSetPsShader(cmdbuf, size, ps_regs);
+}
+
 s32 sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
     if (!cmdbuf || size <= 0x18 || !cs_regs) {
         return -1;
@@ -196,6 +228,106 @@ s32 sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
     cmdbuf = WriteShReg(cmdbuf, 0x212u, cs_regs[2], cs_regs[3]);
     cmdbuf = WriteShReg(cmdbuf, 0x207u, cs_regs[4], cs_regs[5], cs_regs[6]);
     WriteNop(cmdbuf, 11);
+    return 0;
+}
+
+s32 sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32* cs_regs, u32 modifier) {
+    if (!cmdbuf || size <= 0x18 || !cs_regs || (modifier & 0xfffffc3fu)) {
+        return -1;
+    }
+    const u32 rsrc1 = modifier == 0 ? cs_regs[2] : (cs_regs[2] & 0xfffffc3fu) | modifier;
+    cmdbuf = WriteShReg(cmdbuf, 0x20cu, cs_regs[0], 0u);
+    cmdbuf = WriteShReg(cmdbuf, 0x212u, rsrc1, cs_regs[3]);
+    cmdbuf = WriteShReg(cmdbuf, 0x207u, cs_regs[4], cs_regs[5], cs_regs[6]);
+    WriteNop(cmdbuf, 11);
+    return 0;
+}
+
+// ---- Draws: each packet sits in a fixed block, padded with a NOP. ----
+constexpr u32 kFlagsReserved = 0x1ffffffeu;
+constexpr u32 kDrawAutoInitiator = 2; // DI_SRC_SEL_AUTO_INDEX
+
+// Bit 0 of the flags and of a type 3 header both mean "predicated".
+s32 sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32 flags) {
+    constexpr u32 kBlockSize = 7;
+    constexpr u32 kPacketSize = 3;
+    if (!cmdbuf || size < kBlockSize || (flags & kFlagsReserved)) {
+        return -1;
+    }
+    cmdbuf[0] = 0xc0012d00u | (flags & 1);
+    cmdbuf[1] = index_count;
+    cmdbuf[2] = kDrawAutoInitiator;
+    WriteNop(cmdbuf + kPacketSize, kBlockSize - kPacketSize - 1);
+    return 0;
+}
+
+s32 sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, const void* index_addr, u32 flags,
+                    u32 /*type*/) {
+    constexpr u32 kBlockSize = 10;
+    constexpr u32 kPacketSize = 6;
+    const u64 addr = reinterpret_cast<u64>(index_addr);
+    if (!cmdbuf || size < kBlockSize || !addr || (addr & 1) || (flags & kFlagsReserved)) {
+        return -1;
+    }
+    cmdbuf[0] = 0xc0042700u | (flags & 1);
+    cmdbuf[1] = index_count;
+    cmdbuf[2] = static_cast<u32>(addr);
+    cmdbuf[3] = static_cast<u32>(addr >> 32);
+    cmdbuf[4] = index_count;
+    cmdbuf[5] = 0;
+    WriteNop(cmdbuf + kPacketSize, kBlockSize - kPacketSize - 1);
+    return 0;
+}
+
+s32 sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, u32 index_count, u32 flags) {
+    constexpr u32 kBlockSize = 9;
+    constexpr u32 kPacketSize = 5;
+    if (!cmdbuf || size < kBlockSize || (flags & kFlagsReserved)) {
+        return -1;
+    }
+    cmdbuf[0] = 0xc0033500u | (flags & 1);
+    cmdbuf[1] = index_count;
+    cmdbuf[2] = index_offset;
+    cmdbuf[3] = index_count;
+    cmdbuf[4] = 0;
+    WriteNop(cmdbuf + kPacketSize, kBlockSize - kPacketSize - 1);
+    return 0;
+}
+
+constexpr u32 kIaMultiVgtParam = 0x2aau;
+
+s32 sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_minus_one, u32 partial_vs_wave,
+                        u32 wd_switch_on_eop) {
+    if (!cmdbuf || size < 3 || prim_group_minus_one >= 0x100 ||
+        (partial_vs_wave | wd_switch_on_eop) >= 2) {
+        return -1;
+    }
+    WriteContextReg(cmdbuf, kIaMultiVgtParam, (partial_vs_wave << 16) | prim_group_minus_one);
+    return 0;
+}
+
+s32 sceGnmResetVgtControl(u32* cmdbuf, u32 size) {
+    if (!cmdbuf || size < 3) {
+        return -1;
+    }
+    WriteContextReg(cmdbuf, kIaMultiVgtParam, 0xffu);
+    return 0;
+}
+
+// DISPATCH_DIRECT in a block of 9 dwords: the packet, then padding.
+s32 sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 x, u32 y, u32 z, u32 flags) {
+    constexpr u32 kBlockSize = 9;
+    constexpr u32 kPacketSize = 5;
+    constexpr u32 kHeader = 0xc0031502u; // type 3, 4 body dwords, opcode 0x15, compute
+    if (!cmdbuf || size < kBlockSize || static_cast<s32>(x | y | z) < 0) {
+        return -1;
+    }
+    cmdbuf[0] = kHeader | (flags & 1); // bit 0: predicated
+    cmdbuf[1] = x;
+    cmdbuf[2] = y;
+    cmdbuf[3] = z;
+    cmdbuf[4] = (flags & 0x18) | 0x41; // COMPUTE_DISPATCH_INITIATOR
+    WriteNop(cmdbuf + kPacketSize, kBlockSize - kPacketSize - 1);
     return 0;
 }
 
@@ -255,6 +387,41 @@ s32 sceGnmSetGsRingSizes(u32 esgs_ring_size, u32 gsvs_ring_size) {
 }
 
 // ------------------------------------------------------------- Sync & Markers ----
+// The block holds a cache flush on a console; memory here is coherent, so a wait is enough.
+s32 sceGnmComputeWaitOnAddress(u32* cmdbuf, u32 size, u64 addr, u32 mask, u32 func, u32 ref) {
+    constexpr u32 kPacketSize = 7;
+    if (!cmdbuf || size < kPacketSize + 1 || (addr & 3)) {
+        return -1;
+    }
+    cmdbuf[0] = Type3(Op::WaitRegMem, 6);
+    cmdbuf[1] = 0x10u | (func & 7); // memory poll
+    cmdbuf[2] = static_cast<u32>(addr);
+    cmdbuf[3] = static_cast<u32>(addr >> 32);
+    cmdbuf[4] = ref;
+    cmdbuf[5] = mask;
+    cmdbuf[6] = 10u; // poll interval
+    WriteNop(cmdbuf + kPacketSize, size - kPacketSize - 1);
+    return 0;
+}
+
+// SET_BASE plus the graphics form of DISPATCH_INDIRECT, which the command
+// processor already runs: it fills the 8 dwords the caller reserves.
+s32 sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, u64 args, u32 modifier) {
+    constexpr u32 kPacketSize = 7;
+    if (!cmdbuf || size < kPacketSize + 1 || !args) {
+        return -1;
+    }
+    cmdbuf[0] = Type3(Op::SetBase, 3);
+    cmdbuf[1] = 1; // base select: indirect arguments
+    cmdbuf[2] = static_cast<u32>(args);
+    cmdbuf[3] = static_cast<u32>(args >> 32);
+    cmdbuf[4] = Type3(Op::DispatchIndirect, 2);
+    cmdbuf[5] = 0; // offset from the base
+    cmdbuf[6] = (modifier & 0x18) | 0x41; // COMPUTE_DISPATCH_INITIATOR
+    WriteNop(cmdbuf + kPacketSize, size - kPacketSize - 1);
+    return 0;
+}
+
 s32 sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, u32 buf_idx) {
     if (!cmdbuf || size != 7) {
         return -1;
@@ -390,6 +557,15 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
 
     Instance().SubmitGraphics(CollectBuffers(count, dcb_ptrs, dcb_sizes, ccb_ptrs, ccb_sizes), [vo_handle, buf_idx, flip_arg] {
         FlipOnGpuThread(vo_handle, buf_idx, flip_arg);
+    });
+    return 0;
+}
+
+// The game flips separately from its submits: the flip queues behind them.
+s32 sceVideoOutSubmitFlip(s32 vo_handle, s32 buf_idx, u32 /*flip_mode*/, s64 flip_arg) {
+    VideoOut::Driver::Instance().MarkFlipPending(vo_handle, static_cast<u32>(buf_idx));
+    Instance().SubmitGraphics({}, [vo_handle, buf_idx, flip_arg] {
+        FlipOnGpuThread(static_cast<u32>(vo_handle), static_cast<u32>(buf_idx), flip_arg);
     });
     return 0;
 }
@@ -559,10 +735,22 @@ int sceGnmDisableMipStatsReport() {
 } // namespace
 
 void RegisterGnmDriver() {
-    Instance().SetInterruptHandler([](u32 irq) { TriggerGnmEvent(irq); });
+    Instance().SetInterruptHandler([](u32 irq) { OnGpuInterrupt(irq); });
 
     Hle::Register("libSceGnmDriver", "Idffwf3yh8s", reinterpret_cast<void*>(sceGnmDrawInitDefaultHardwareState));
     Hle::Register("libSceGnmDriver", "0H2vBYbTLHI", reinterpret_cast<void*>(sceGnmDrawInitDefaultHardwareState200));
+    Hle::Register("libSceGnmDriver", "yb2cRhagD1I", reinterpret_cast<void*>(sceGnmDrawInitDefaultHardwareState200)); // ...350
+    DC_HLE("libSceGnmDriver", sceGnmSetCsShaderWithModifier);
+    DC_HLE("libSceGnmDriver", sceGnmDispatchDirect);
+    DC_HLE("libSceGnmDriver", sceGnmComputeWaitOnAddress);
+    DC_HLE("libSceGnmDriver", sceGnmDispatchIndirectOnMec);
+    DC_HLE("libSceGnmDriver", sceGnmSetPsShader350);
+    DC_HLE("libSceGnmDriver", sceGnmDrawIndexAuto);
+    DC_HLE("libSceGnmDriver", sceGnmDrawIndex);
+    DC_HLE("libSceGnmDriver", sceGnmDrawIndexOffset);
+    DC_HLE("libSceGnmDriver", sceGnmSetVgtControl);
+    DC_HLE("libSceGnmDriver", sceGnmResetVgtControl);
+    DC_HLE("libSceVideoOut", sceVideoOutSubmitFlip);
     Hle::Register("libSceGnmDriver", "nF6bFRUBRAU", reinterpret_cast<void*>(sceGnmDispatchInitDefaultHardwareState));
 
     Hle::Register("libSceGnmDriver", "bQVd5YzCal0", reinterpret_cast<void*>(sceGnmSetPsShader));

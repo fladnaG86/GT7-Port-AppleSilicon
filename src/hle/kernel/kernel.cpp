@@ -136,6 +136,7 @@ void RegisterKernel() {
     Kernel::RegisterMisc();
     Kernel::RegisterFile();
     Kernel::RegisterSync();
+    Kernel::RegisterFiber();
     DC_HLE("libkernel", _sceKernelRtldSetApplicationHeapAPI);
     DC_HLE("libkernel", __tls_get_addr);
     DC_HLE("libkernel", sceKernelGetProcParam);

@@ -88,7 +88,8 @@ struct FontState {
     CTFontRef base = nullptr; // the face at an arbitrary size
     float scale_w = 16.0f, scale_h = 16.0f;
     CTFontRef sized = nullptr; // `base` at the current scale
-    float sized_w = 0.0f, sized_h = 0.0f;
+    float sized_w = 0.0f, sized_h = 0.0f, sized_slant = 0.0f;
+    float slant = 0.0f; // shear of sceFontSetEffectSlant
 };
 
 std::mutex g_lock;
@@ -97,14 +98,15 @@ alignas(64) u8 g_renderer[256];
 
 // The face at `w` x `h` pixels (em size), cached per font.
 CTFontRef Sized(FontState& f) {
-    if (!f.sized || f.sized_w != f.scale_w || f.sized_h != f.scale_h) {
+    if (!f.sized || f.sized_w != f.scale_w || f.sized_h != f.scale_h || f.sized_slant != f.slant) {
         if (f.sized) {
             CFRelease(f.sized);
         }
-        const CGAffineTransform m = CGAffineTransformMakeScale(f.scale_w / f.scale_h, 1.0);
+        const CGAffineTransform m = CGAffineTransformMake(f.scale_w / f.scale_h, 0, f.slant, 1, 0, 0);
         f.sized = CTFontCreateCopyWithAttributes(f.base, f.scale_h, &m, nullptr);
         f.sized_w = f.scale_w;
         f.sized_h = f.scale_h;
+        f.sized_slant = f.slant;
     }
     return f.sized;
 }
@@ -213,6 +215,18 @@ s32 sceFontOpenFontMemory(void* lib, const void* data, u32 size, const void* par
     return 0;
 }
 
+// The system font sets belong to the firmware: a Mac face stands in for them.
+s32 sceFontOpenFontSet(void* lib, u32 font_set_type, u32 open_mode, const void* detail, FontState** out) {
+    if (!out) {
+        return kErrorInvalidParameter;
+    }
+    DC_INFO("font: system font set %#x -> Helvetica Neue", font_set_type);
+    auto* f = new FontState;
+    f->base = CTFontCreateWithName(CFSTR("HelveticaNeue"), 16.0, nullptr);
+    *out = f;
+    return 0;
+}
+
 s32 sceFontCloseFont(FontState* f) {
     std::scoped_lock lk(g_lock);
     if (f) {
@@ -231,6 +245,24 @@ s32 sceFontBindRenderer(FontState* f, void* renderer) {
 
 s32 sceFontUnbindRenderer(FontState* f) {
     return 0;
+}
+
+s32 sceFontRebindRenderer(FontState* f) {
+    return 0;
+}
+
+s32 sceFontSetEffectSlant(FontState* f, float ratio) {
+    if (!f) {
+        return kErrorInvalidParameter;
+    }
+    std::scoped_lock lk(g_lock);
+    f->slant = ratio;
+    return 0;
+}
+
+// Synthetic emboldening is not applied: glyphs keep the face's own weight.
+s32 sceFontSetEffectWeight(FontState* f, float, float, u32) {
+    return f ? 0 : kErrorInvalidParameter;
 }
 
 s32 sceFontSetScalePixel(FontState* f, float w, float h) {
@@ -298,6 +330,17 @@ void sceFontRenderSurfaceInit(RenderSurface* s, void* buffer, s32 width_byte, s3
     s->height = std::max(height, 0);
     s->sc_x1 = static_cast<u32>(s->width);
     s->sc_y1 = static_cast<u32>(s->height);
+}
+
+void sceFontRenderSurfaceSetScissor(RenderSurface* s, s32 x0, s32 y0, s32 w, s32 h) {
+    if (!s) {
+        return;
+    }
+    const s64 x1 = static_cast<s64>(x0) + w, y1 = static_cast<s64>(y0) + h;
+    s->sc_x0 = static_cast<u32>(std::clamp<s64>(x0, 0, s->width));
+    s->sc_y0 = static_cast<u32>(std::clamp<s64>(y0, 0, s->height));
+    s->sc_x1 = static_cast<u32>(std::clamp<s64>(x1, 0, s->width));
+    s->sc_y1 = static_cast<u32>(std::clamp<s64>(y1, 0, s->height));
 }
 
 // Rasterizes `code` with its pen position at (x, y) (y down, on the
@@ -395,6 +438,11 @@ void RegisterFont() {
     DC_HLE(kFont, sceFontSupportExternalFonts);
     DC_HLE(kFont, sceFontSupportSystemFonts);
     DC_HLE(kFont, sceFontOpenFontMemory);
+    DC_HLE(kFont, sceFontOpenFontSet);
+    DC_HLE(kFont, sceFontRebindRenderer);
+    DC_HLE(kFont, sceFontSetEffectSlant);
+    DC_HLE(kFont, sceFontSetEffectWeight);
+    DC_HLE(kFont, sceFontRenderSurfaceSetScissor);
     DC_HLE(kFont, sceFontCloseFont);
     DC_HLE(kFont, sceFontSetScalePixel);
     DC_HLE(kFont, sceFontSetupRenderScalePixel);

@@ -3,6 +3,8 @@
 #include "hle/services/misc_services.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -13,7 +15,65 @@ namespace Hle::MiscServices {
 
 namespace {
 
+// libSceRandom
+constexpr u64 kRandomMaxSize = 64;
+constexpr s32 kRandomErrorInvalid = static_cast<s32>(0x817C0016);
+
+s32 sceRandomGetRandomNumber(void* buf, u64 size) {
+    if (size > kRandomMaxSize) {
+        return kRandomErrorInvalid;
+    }
+    arc4random_buf(buf, size);
+    return 0;
+}
+
+// libSceSigninDialog: no system UI to show, so it finishes as soon as it opens.
+constexpr s32 kDialogNone = 0;
+constexpr s32 kDialogInitialized = 1;
+constexpr s32 kDialogFinished = 3;
+constexpr s32 kDialogErrorNotInitialized = static_cast<s32>(0x80B80003);
+
+s32 g_signin_status = kDialogNone;
+
+s32 sceSigninDialogInitialize() {
+    g_signin_status = kDialogInitialized;
+    return 0;
+}
+
+s32 sceSigninDialogOpen(const void*) {
+    if (g_signin_status == kDialogNone) {
+        return kDialogErrorNotInitialized;
+    }
+    g_signin_status = kDialogFinished;
+    return 0;
+}
+
+s32 sceSigninDialogUpdateStatus() {
+    return g_signin_status;
+}
+
+s32 sceSigninDialogGetStatus() {
+    return g_signin_status;
+}
+
+s32 sceSigninDialogGetResult(s32* result) {
+    if (g_signin_status != kDialogFinished) {
+        return kDialogErrorNotInitialized;
+    }
+    *result = 0;
+    return 0;
+}
+
+s32 sceSigninDialogTerminate() {
+    g_signin_status = kDialogNone;
+    return 0;
+}
+
 // libSceCommonDialog
+s32 sceCommonDialogIsUsed() {
+    return 0;
+}
+
 s32 sceCommonDialogInitialize() {
     return 0;
 }
@@ -90,6 +150,24 @@ s32 sceAppContentAppParamGetInt(s32 paramId, s32* out_value) {
     return 0;
 }
 
+// Mount points are NUL-terminated strings in a 16-byte guest buffer.
+s32 sceAppContentTemporaryDataMount2(s32 /*option*/, char* mount_point) {
+    std::strncpy(mount_point, "/temp0", 16);
+    return 0;
+}
+
+constexpr u64 kAvailableSpaceKb = 50ull << 20;
+
+s32 sceAppContentTemporaryDataGetAvailableSpaceKb(const char*, u64* kb) {
+    *kb = kAvailableSpaceKb;
+    return 0;
+}
+
+s32 sceAppContentDownloadDataGetAvailableSpaceKb(const char*, u64* kb) {
+    *kb = kAvailableSpaceKb;
+    return 0;
+}
+
 s32 sceAppContentAddcontUnmount() {
     return 0;
 }
@@ -123,8 +201,13 @@ s32 sceAudioInGetSilentState(s32 handle) {
 }
 
 // libSceHttp & libSceSsl
+// Returns a context id: zero or negative means failure.
 s32 sceHttpInit(s32 pool_id, s32 ssl_id, size_t pool_size) {
-    return 0;
+    return 1;
+}
+
+s32 sceHttp2Init(s32 pool_id, s32 ssl_id, size_t pool_size, s32 max_requests) {
+    return 1;
 }
 
 s32 sceHttpCreateEpoll(s32 pool_id, const char* name) {
@@ -248,6 +331,17 @@ s32 sceMsgDialogUpdateStatus(void* status) {
 } // namespace
 
 void RegisterMiscServices() {
+    DC_HLE("libSceHttp2", sceHttp2Init);
+    for (const char* lib : {"libSceSigninDialog"}) {
+        DC_HLE(lib, sceSigninDialogInitialize);
+        DC_HLE(lib, sceSigninDialogOpen);
+        DC_HLE(lib, sceSigninDialogUpdateStatus);
+        DC_HLE(lib, sceSigninDialogGetStatus);
+        DC_HLE(lib, sceSigninDialogGetResult);
+        DC_HLE(lib, sceSigninDialogTerminate);
+    }
+    DC_HLE("libSceCommonDialog", sceCommonDialogIsUsed);
+    DC_HLE("libSceRandom", sceRandomGetRandomNumber);
     DC_HLE("libSceCommonDialog", sceCommonDialogInitialize);
     DC_HLE("libSceGameLiveStreaming", sceGameLiveStreamingInitialize);
     DC_HLE("libSceGameLiveStreaming", sceGameLiveStreamingEnableLiveStreaming);
@@ -261,6 +355,9 @@ void RegisterMiscServices() {
     DC_HLE("libSceUsbd", sceUsbdHandleEventsTimeout);
 
     DC_HLE("libSceAppContent", sceAppContentInitialize);
+    DC_HLE("libSceAppContent", sceAppContentTemporaryDataMount2);
+    DC_HLE("libSceAppContent", sceAppContentTemporaryDataGetAvailableSpaceKb);
+    DC_HLE("libSceAppContent", sceAppContentDownloadDataGetAvailableSpaceKb);
     DC_HLE("libSceAppContent", sceAppContentAppParamGetInt);
     DC_HLE("libSceAppContent", sceAppContentAddcontUnmount);
     DC_HLE("libSceAppContent", sceAppContentGetAddcontInfoList);

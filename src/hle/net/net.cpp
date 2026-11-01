@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
 #include "common/log.h"
 #include "hle/hle.h"
 
@@ -48,6 +51,12 @@ s32 sceNetGetMacAddress(OrbisNetEtherAddr* addr, s32 flags) {
 s32 sceNetPoolCreate(const char* name, s32 size, s32 flags) {
     DC_INFO("sceNetPoolCreate(name=%s, size=%d, flags=%#x) -> pool 1", name ? name : "", size, flags);
     return 1;
+}
+
+constexpr int kGuestAfInet6 = 28; // FreeBSD; the host value differs
+
+const char* sceNetInetNtop(int af, const void* src, char* dst, u32 size) {
+    return inet_ntop(af == kGuestAfInet6 ? AF_INET6 : af, src, dst, size);
 }
 
 s32 sceNetCtlInit() {
@@ -173,6 +182,13 @@ s32 sceNetClose(s32 s) {
     return 0;
 }
 
+// No sockets behind this HLE: a lookup never produces an address, and reporting
+// success with 0.0.0.0 would send games down their connect paths.
+s32 sceNetResolverStartNtoa(s32, const char* hostname, void*, s32, s32, s32) {
+    DC_INFO("sceNetResolverStartNtoa(%s) -> no DNS", hostname ? hostname : "null");
+    return static_cast<s32>(0x804101E1); // ORBIS_NET_ERROR_RESOLVER_ENODNS
+}
+
 } // namespace
 
 void RegisterNet() {
@@ -190,6 +206,8 @@ void RegisterNet() {
     DC_HLE("libSceNet", sceNetSetsockopt);
     DC_HLE("libSceNet", sceNetGetsockopt);
     DC_HLE("libSceNet", sceNetClose);
+    DC_HLE("libSceNet", sceNetResolverStartNtoa);
+    DC_HLE("libSceNet", sceNetInetNtop);
     DC_HLE("libSceNetCtl", sceNetCtlInit);
     DC_HLE("libSceNetCtl", sceNetCtlTerm);
     DC_HLE("libSceNetCtl", sceNetCtlGetInfo);

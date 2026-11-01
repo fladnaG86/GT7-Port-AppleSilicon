@@ -32,6 +32,8 @@ class CommandProcessor {
 public:
     // Interrupt sources the game can listen to (sceGnmAddEqEvent ids).
     static constexpr u32 kIrqGfxEop = 0x40;
+    // kIrqCompute + vqid: end of pipe on that compute queue.
+    static constexpr u32 kIrqCompute = 0x100;
 
     struct Stats {
         std::atomic<u64> packets{0};

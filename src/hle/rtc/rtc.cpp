@@ -25,6 +25,46 @@ s32 sceRtcGetCurrentNetworkTick(OrbisRtcTick* pTick) {
     return 0;
 }
 
+s32 sceRtcGetCurrentTick(OrbisRtcTick* pTick) {
+    return sceRtcGetCurrentNetworkTick(pTick);
+}
+
+s32 FillClock(OrbisRtcDateTime* pTime, const std::tm& tm, u32 microsecond) {
+    pTime->year = static_cast<u16>(tm.tm_year + 1900);
+    pTime->month = static_cast<u16>(tm.tm_mon + 1);
+    pTime->day = static_cast<u16>(tm.tm_mday);
+    pTime->hour = static_cast<u16>(tm.tm_hour);
+    pTime->minute = static_cast<u16>(tm.tm_min);
+    pTime->second = static_cast<u16>(tm.tm_sec);
+    pTime->microsecond = microsecond;
+    return 0;
+}
+
+// `tz_minutes` is the offset from UTC to report the time in.
+s32 sceRtcGetCurrentClock(OrbisRtcDateTime* pTime, s32 tz_minutes) {
+    if (!pTime) {
+        return -1;
+    }
+    const auto now = std::chrono::system_clock::now();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+    const time_t t = static_cast<time_t>(us / 1000000) + tz_minutes * 60;
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    return FillClock(pTime, tm, static_cast<u32>(us % 1000000));
+}
+
+s32 sceRtcGetCurrentClockLocalTime(OrbisRtcDateTime* pTime) {
+    if (!pTime) {
+        return -1;
+    }
+    const auto now = std::chrono::system_clock::now();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+    const time_t t = static_cast<time_t>(us / 1000000);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    return FillClock(pTime, tm, static_cast<u32>(us % 1000000));
+}
+
 s32 sceRtcGetTime_t(const OrbisRtcTick* pTick, time_t* outTime) {
     if (!pTick || !outTime) {
         return -1;
@@ -62,6 +102,9 @@ s32 sceRtcSetTick(OrbisRtcDateTime* pTime, const OrbisRtcTick* pTick) {
 void RegisterRtc() {
     constexpr const char* lib = "libSceRtc";
     DC_HLE(lib, sceRtcGetCurrentNetworkTick);
+    DC_HLE(lib, sceRtcGetCurrentTick);
+    DC_HLE(lib, sceRtcGetCurrentClock);
+    DC_HLE(lib, sceRtcGetCurrentClockLocalTime);
     DC_HLE(lib, sceRtcGetTime_t);
     DC_HLE(lib, sceRtcSetTick);
 }

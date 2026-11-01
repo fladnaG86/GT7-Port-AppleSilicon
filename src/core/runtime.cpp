@@ -1,3 +1,8 @@
+#include <cstdarg>
+#include <cstdio>
+
+#include "core/guest_profile.h"
+#include "core/guest_trace.h"
 #include "core/runtime.h"
 
 #include <algorithm>
@@ -84,7 +89,77 @@ bool IsHeapMovabs(VAddr site) {
     return (code[0] & 0xFE) == 0x48 && (code[1] & 0xF8) == 0xB8 && imm == kFixedHeapOld;
 }
 
+// GT7 v1.00 keeps its next arena address in a .data qword that starts at the
+// same fixed base; moving that value relocates every arena. Returns false for
+// any other executable.
+bool RelocateGt7Arenas(const Loader::Module& exe) {
+    constexpr u64 kArenaCursor = 0x6475e08;
+    constexpr u64 kArenaFunc = 0x3b4a710;
+    // mov rax, [rip+disp] ; movabs rdx, 0x400000000 (arena size)
+    static constexpr u8 kSignature[] = {0x48, 0x8b, 0x05, 0xf1, 0xb6, 0x92, 0x02, 0x48,
+                                        0xba, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00};
+    if (exe.Size() < kArenaCursor + sizeof(u64)) {
+        return false; // a smaller executable: another game
+    }
+    if (std::memcmp(reinterpret_cast<const void*>(exe.Base() + kArenaFunc), kSignature,
+                    sizeof(kSignature)) != 0) {
+        return false;
+    }
+    auto* cursor = reinterpret_cast<u64*>(exe.Base() + kArenaCursor);
+    if (*cursor != kFixedHeapOld) {
+        DC_WARN("gt7 arena cursor is %#llx, leaving it", *cursor);
+        return false;
+    }
+    *cursor = kFixedHeapNew;
+    DC_INFO("gt7 arenas: %#llx -> %#llx", kFixedHeapOld, kFixedHeapNew);
+    return true;
+}
+
+// GT7's logger buffers its file output, so the last lines before a hang never
+// reach it. DC_GAME_LOG sends every line to our log as it is emitted.
+extern "C" void DcGt7Log(void*, int level, void*, void*, const char* file, int line,
+                         const char* format, ...) {
+    char text[1024];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    const char* name = file ? file : "?";
+    for (const char* c = name; *c; ++c) {
+        if (*c == '\\' || *c == '/') {
+            name = c + 1;
+        }
+    }
+    DC_INFO("game[%d] %s:%d %s", level, name, line, text);
+}
+
+void HookGt7Log(const Loader::Module& exe) {
+    constexpr u64 kLogger = 0x3b16530;
+    static constexpr u8 kPrologue[] = {0x55, 0x48, 0x89, 0xe5};
+    if (!std::getenv("DC_GAME_LOG")) {
+        return;
+    }
+    auto* code = reinterpret_cast<u8*>(exe.Base() + kLogger);
+    if (std::memcmp(code, kPrologue, sizeof(kPrologue)) != 0) {
+        DC_WARN("game log: no logger at %#llx", kLogger);
+        return;
+    }
+    const VAddr page = reinterpret_cast<VAddr>(code) & ~0xFFFull;
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    // jmp [rip+0] ; absolute target
+    static constexpr u8 kJump[] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const u64 target = reinterpret_cast<u64>(&DcGt7Log);
+    std::memcpy(code, kJump, sizeof(kJump));
+    std::memcpy(code + sizeof(kJump), &target, sizeof(target));
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
+}
+
 void RelocateFixedHeap(const Loader::Module& exe) {
+    if (RelocateGt7Arenas(exe)) {
+        HookGt7Log(exe);
+        GuestTrace::Start(exe.Base());
+        return;
+    }
     for (const VAddr site : HeapSites(exe)) {
         if (!IsHeapMovabs(site)) {
             DC_WARN("heap remap: no movabs %#llx at %#llx", kFixedHeapOld, site);
@@ -259,6 +334,8 @@ void* GuestMain(void*) {
     if (const char* arg = Benchmark::GuestArg()) {
         g_params.argv[g_params.argc++] = arg;
     }
+    GuestProfile::RegisterThread("main");
+    GuestProfile::Start();
     DC_INFO("jumping to entry point %#llx", exe->Entry());
     JumpToEntry(&g_params, exe->Entry(), &ProgramExit);
 }

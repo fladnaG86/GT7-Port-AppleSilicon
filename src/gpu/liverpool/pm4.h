@@ -65,7 +65,11 @@ constexpr u32 Type3(u32 opcode, u32 body_dwords, bool compute = false) {
 
 inline u32 HeaderType(u32 h) { return h >> 30; }
 inline u32 HeaderOpcode(u32 h) { return (h >> 8) & 0xFF; }
-inline u32 HeaderBodyDwords(u32 h) { return ((h >> 16) & 0x3FFF) + 1; }
+// A count of 0x3FFF means no body at all: the one-dword NOP.
+inline u32 HeaderBodyDwords(u32 h) {
+    const u32 count = (h >> 16) & 0x3FFF;
+    return count == 0x3FFF ? 0 : count + 1;
+}
 
 // ------------------------------------------------- packet writers (Gnm) ----
 

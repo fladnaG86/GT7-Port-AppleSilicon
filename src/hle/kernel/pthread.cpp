@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "common/log.h"
+#include "core/guest_profile.h"
 #include "core/tls.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
@@ -262,6 +263,9 @@ s32 scePthreadCondDestroy(Cond** c) { return OrbisError(posix_pthread_cond_destr
 s32 scePthreadCondWait(Cond** c, Mutex** m) { return OrbisError(posix_pthread_cond_wait(c, m)); }
 s32 scePthreadCondSignal(Cond** c) { return OrbisError(posix_pthread_cond_signal(c)); }
 s32 scePthreadCondBroadcast(Cond** c) { return OrbisError(posix_pthread_cond_broadcast(c)); }
+// The host cannot wake one chosen thread. Waking all is safe: waiters must
+// already re-check their predicate against spurious wakeups.
+s32 scePthreadCondSignalto(Cond** c, void* /*thread*/) { return scePthreadCondBroadcast(c); }
 s32 scePthreadCondTimedwait(Cond** c, Mutex** m, u32 usec) {
     return OrbisError(WaitRelative(GetCond(c), GetMutex(m), u64(usec) * 1000));
 }
@@ -385,6 +389,7 @@ void* HostThreadStart(void* raw) {
     pthread_setspecific(g_self_key, t);
     t->host = pthread_self();
     pthread_setname_np(t->name.c_str());
+    Core::GuestProfile::RegisterThread(t->name.c_str());
     Core::Tls::Tcb* tcb = Core::Tls::SetupThread();
     tcb->thread = t;
 
@@ -760,6 +765,7 @@ void RegisterPthread() {
     DC_HLE(k, scePthreadCondTimedwait);
     DC_HLE(k, scePthreadCondSignal);
     DC_HLE(k, scePthreadCondBroadcast);
+    DC_HLE(k, scePthreadCondSignalto);
     DC_HLE(k, scePthreadRwlockInit);
     DC_HLE(k, scePthreadRwlockDestroy);
     DC_HLE(k, scePthreadRwlockRdlock);

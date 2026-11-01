@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <vector>
 
@@ -85,6 +86,26 @@ u8* EmitJmp(u8* c, VAddr target) {
     return c + 4;
 }
 
+// jmp tramp + NOP padding, written while the code page is briefly writable.
+void WriteJump(VAddr site, VAddr tramp, int length) {
+    u8 bytes[8];
+    const s32 rel32 = static_cast<s32>(static_cast<s64>(tramp) - static_cast<s64>(site + 5));
+    bytes[0] = 0xE9;
+    std::memcpy(bytes + 1, &rel32, 4);
+    for (int i = 5; i < length; ++i) {
+        bytes[i] = 0x90;
+    }
+
+    const VAddr page_begin = AlignDown(site, kHostPage);
+    const VAddr page_end = AlignUp(site + length, kHostPage);
+    void* pages = reinterpret_cast<void*>(page_begin);
+    mprotect(pages, page_end - page_begin, PROT_READ | PROT_WRITE | PROT_EXEC);
+    std::memcpy(reinterpret_cast<void*>(site), bytes, length);
+    mprotect(pages, page_end - page_begin, PROT_READ | PROT_EXEC);
+
+    ++g_patched_sites;
+}
+
 // Replaces the EXTRQ at `site` with a jump to an SSE2 equivalent:
 //   psllq xmm, 64 - idx - len   ; drop bits above the field
 //   psrlq xmm, 64 - len         ; move the field to bit 0, zero-extended
@@ -113,24 +134,112 @@ bool PatchExtrq(VAddr site) {
     c = EmitJmp(c, site + e.length);
     area->next = AlignUp(reinterpret_cast<VAddr>(c), 16);
 
-    // jmp tramp + NOP padding, written while the code page is briefly writable.
-    u8 bytes[8];
-    const s32 rel32 = static_cast<s32>(static_cast<s64>(reinterpret_cast<VAddr>(tramp)) -
-                                       static_cast<s64>(site + 5));
-    bytes[0] = 0xE9;
-    std::memcpy(bytes + 1, &rel32, 4);
-    for (int i = 5; i < e.length; ++i) {
-        bytes[i] = 0x90;
+    WriteJump(site, reinterpret_cast<VAddr>(tramp), e.length);
+    return true;
+}
+
+// Decoded `insertq xmm1, xmm2, imm8 len, imm8 idx`: F2 [REX] 0F 78 /r ib ib,
+// register form. Puts the low `len` bits of xmm2 at bit `idx` of xmm1.
+struct Insertq {
+    int length; // bytes of the instruction
+    int dst;    // 0..15
+    int src;    // 0..15
+    int len;    // field length in bits (0 means 64)
+    int idx;    // field start bit
+};
+
+bool DecodeInsertq(const u8* p, Insertq& out) {
+    if (p[0] != 0xF2) {
+        return false;
+    }
+    int i = 1;
+    int rex = 0;
+    if ((p[i] & 0xF0) == 0x40) {
+        rex = p[i];
+        ++i;
+    }
+    if (p[i] != 0x0F || p[i + 1] != 0x78) {
+        return false;
+    }
+    const u8 modrm = p[i + 2];
+    if ((modrm >> 6) != 3) {
+        return false;
+    }
+    out.dst = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    out.src = (modrm & 7) | ((rex & 1) << 3);
+    out.len = p[i + 3] & 0x3F;
+    out.idx = p[i + 4] & 0x3F;
+    out.length = i + 5;
+    return true;
+}
+
+u8* EmitBytes(u8* c, std::initializer_list<u8> bytes) {
+    for (const u8 b : bytes) {
+        *c++ = b;
+    }
+    return c;
+}
+
+// movq r64, xmm: gpr is rax (0), rcx (1) or rdx (2).
+u8* EmitMovqToGpr(u8* c, int gpr, int xmm) {
+    return EmitBytes(c, {0x66, static_cast<u8>(0x48 | (xmm >= 8 ? 4 : 0)), 0x0F, 0x7E,
+                         static_cast<u8>(0xC0 | ((xmm & 7) << 3) | gpr)});
+}
+
+// movq xmm, r64
+u8* EmitMovqToXmm(u8* c, int xmm, int gpr) {
+    return EmitBytes(c, {0x66, static_cast<u8>(0x48 | (xmm >= 8 ? 4 : 0)), 0x0F, 0x6E,
+                         static_cast<u8>(0xC0 | ((xmm & 7) << 3) | gpr)});
+}
+
+// movabs rdx, imm64
+u8* EmitMovRdx(u8* c, u64 value) {
+    c = EmitBytes(c, {0x48, 0xBA});
+    std::memcpy(c, &value, sizeof(value));
+    return c + sizeof(value);
+}
+
+// Replaces the INSERTQ at `site` with a jump to an integer equivalent. It runs
+// on the guest's stack, so it steps over the red zone and keeps the flags and
+// the registers it borrows. The upper qword is undefined after INSERTQ.
+bool PatchInsertq(VAddr site) {
+    constexpr size_t kTrampolineSize = 96;
+    Insertq e;
+    if (!DecodeInsertq(reinterpret_cast<const u8*>(site), e)) {
+        return false;
+    }
+    PatchArea* area = nullptr;
+    for (PatchArea& a : g_areas) {
+        if (site >= a.code_begin && site < a.code_end) {
+            area = &a;
+        }
+    }
+    if (!area || area->next + kTrampolineSize > area->end) {
+        DC_ERROR("no trampoline space for INSERTQ at %#llx", site);
+        return false;
     }
 
-    const VAddr page_begin = AlignDown(site, kHostPage);
-    const VAddr page_end = AlignUp(site + e.length, kHostPage);
-    void* pages = reinterpret_cast<void*>(page_begin);
-    mprotect(pages, page_end - page_begin, PROT_READ | PROT_WRITE | PROT_EXEC);
-    std::memcpy(reinterpret_cast<void*>(site), bytes, e.length);
-    mprotect(pages, page_end - page_begin, PROT_READ | PROT_EXEC);
+    const int len = e.len == 0 ? 64 : e.len;
+    const u64 mask = len == 64 ? ~0ull : (1ull << len) - 1;
+    u8* tramp = reinterpret_cast<u8*>(area->next);
+    u8* c = tramp;
+    c = EmitBytes(c, {0x48, 0x8D, 0x64, 0x24, 0x80}); // lea rsp, [rsp - 128]
+    c = EmitBytes(c, {0x9C, 0x50, 0x51, 0x52});       // pushfq; push rax, rcx, rdx
+    c = EmitMovqToGpr(c, 0, e.dst);
+    c = EmitMovqToGpr(c, 1, e.src);
+    c = EmitMovRdx(c, mask);
+    c = EmitBytes(c, {0x48, 0x21, 0xD1});                                // and rcx, rdx
+    c = EmitBytes(c, {0x48, 0xC1, 0xE1, static_cast<u8>(e.idx)});        // shl rcx, idx
+    c = EmitMovRdx(c, ~(mask << e.idx));
+    c = EmitBytes(c, {0x48, 0x21, 0xD0});       // and rax, rdx
+    c = EmitBytes(c, {0x48, 0x09, 0xC8});       // or rax, rcx
+    c = EmitMovqToXmm(c, e.dst, 0);
+    c = EmitBytes(c, {0x5A, 0x59, 0x58, 0x9D}); // pop rdx, rcx, rax; popfq
+    c = EmitBytes(c, {0x48, 0x8D, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00}); // lea rsp, [rsp + 128]
+    c = EmitJmp(c, site + e.length);
+    area->next = AlignUp(reinterpret_cast<VAddr>(c), 16);
 
-    ++g_patched_sites;
+    WriteJump(site, reinterpret_cast<VAddr>(tramp), e.length);
     return true;
 }
 
@@ -203,7 +312,7 @@ void Handler(int sig, siginfo_t* info, void* raw) {
         std::scoped_lock lk(g_patch_lock);
         const u8* code = reinterpret_cast<const u8*>(rip);
         // Another thread may have patched this site while we were faulting.
-        if (code[0] == 0xE9 || PatchExtrq(rip)) {
+        if (code[0] == 0xE9 || PatchExtrq(rip) || PatchInsertq(rip)) {
             return; // re-executes the now-patched site
         }
         Describe("illegal instruction", rip, rip, rsp);

@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include <atomic>
+
 #include "common/log.h"
 #include "hle/hle.h"
 
@@ -19,6 +21,24 @@ s32 sceUserServiceInitialize(const void* params) {
 
 s32 sceUserServiceTerminate() {
     DC_INFO("sceUserServiceTerminate()");
+    return 0;
+}
+
+struct UserServiceEvent {
+    s32 type; // 0 = login, 1 = logout
+    s32 user_id;
+};
+
+constexpr s32 kUserServiceErrorNoEvent = static_cast<s32>(0x80960007);
+
+// The one user logs in once at boot; nothing happens after that.
+s32 sceUserServiceGetEvent(UserServiceEvent* event) {
+    static std::atomic_flag login_sent = ATOMIC_FLAG_INIT;
+    if (login_sent.test_and_set()) {
+        return kUserServiceErrorNoEvent;
+    }
+    event->type = 0;
+    event->user_id = kInitialUserId;
     return 0;
 }
 
@@ -56,6 +76,7 @@ void RegisterUserService() {
     DC_HLE(lib, sceUserServiceInitialize);
     DC_HLE(lib, sceUserServiceTerminate);
     DC_HLE(lib, sceUserServiceGetInitialUser);
+    DC_HLE(lib, sceUserServiceGetEvent);
     DC_HLE(lib, sceUserServiceGetLoginUserIdList);
     DC_HLE(lib, sceUserServiceGetUserName);
 }

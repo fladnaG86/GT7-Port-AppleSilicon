@@ -141,12 +141,29 @@ uintptr_t Driver::GetBufferLabelAddress(s32 handle) {
     return reinterpret_cast<uintptr_t>(ports[handle].labels.data());
 }
 
+s32 Driver::GetFlipStatus(s32 handle, SceVideoOutFlipStatus* status) {
+    std::scoped_lock lk(lock);
+    if (handle <= 0 || static_cast<size_t>(handle) >= ports.size() || !status) {
+        return -1;
+    }
+    const Port& p = ports[handle];
+    *status = {};
+    status->count = p.flip_count;
+    status->flip_arg = p.last_flip_arg;
+    status->num_flip_pending = p.flips_pending;
+    status->current_buffer = p.prev_buffer;
+    return 0;
+}
+
 void Driver::MarkFlipPending(s32 handle, u32 buf_idx) {
     // Note: Do not mark label = 1 here. The command buffer itself may check
     // WaitFlipDone(buf_idx) at start of frame; marking it pending before execution
     // causes a deadlock. The displayed buffer is tracked in OnFlipDone.
-    (void)handle;
     (void)buf_idx;
+    std::scoped_lock lk(lock);
+    if (handle > 0 && static_cast<size_t>(handle) < ports.size()) {
+        ++ports[handle].flips_pending;
+    }
 }
 
 void Driver::OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg) {
@@ -168,6 +185,8 @@ void Driver::OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg) {
             p.prev_buffer = static_cast<s32>(buf_idx);
         }
         ++p.flip_count;
+        p.last_flip_arg = flip_arg;
+        p.flips_pending = std::max(p.flips_pending - 1, 0);
         queues = p.flip_queues;
         data = (flip_arg << 16) | (p.flip_count & 0xFFFF);
     }
@@ -271,6 +290,15 @@ s32 sceVideoOutGetVblankStatus(s32 handle, SceVideoOutVblankStatus* status) {
     return Driver::Instance().GetVblankStatus(handle, status);
 }
 
+s32 sceVideoOutGetFlipStatus(s32 handle, SceVideoOutFlipStatus* status) {
+    return Driver::Instance().GetFlipStatus(handle, status);
+}
+
+s32 sceVideoOutGetDeviceCapabilityInfo_(s32 /*handle*/, u64* capability) {
+    *capability = 0;
+    return 0;
+}
+
 s32 sceVideoOutAddFlipEvent(Kernel::EventQueue* eq, s32 handle, void* udata) {
     return Driver::Instance().AddFlipEvent(eq, handle, udata);
 }
@@ -315,6 +343,8 @@ s32 sceVideoOutGetEventData(const Kernel::GuestKevent* ev, s64* data) {
 
 void RegisterVideoOut() {
     Hle::Register("libSceVideoOut", "Up36PTk687E", reinterpret_cast<void*>(sceVideoOutOpen));
+    Hle::Register("libSceVideoOut", "SbU3dwp80lQ", reinterpret_cast<void*>(sceVideoOutGetFlipStatus));
+    Hle::Register("libSceVideoOut", "kGVLc3htQE8", reinterpret_cast<void*>(sceVideoOutGetDeviceCapabilityInfo_));
     Hle::Register("libSceVideoOut", "i6-sR91Wt-4", reinterpret_cast<void*>(sceVideoOutSetBufferAttribute));
     Hle::Register("libSceVideoOut", "w3BY+tAEiQY", reinterpret_cast<void*>(sceVideoOutRegisterBuffers));
     Hle::Register("libSceVideoOut", "CBiu4mCE1DA", reinterpret_cast<void*>(sceVideoOutSetFlipRate));

@@ -53,6 +53,8 @@ set(DC_CORE_SOURCES
     src/core/runtime.cpp
     src/core/runtime.h
     src/core/signals.cpp
+    src/core/guest_profile.cpp
+    src/core/guest_trace.cpp
     src/core/signals.h
     src/core/tls.cpp
     src/core/tls.h
@@ -78,6 +80,7 @@ set(DC_CORE_SOURCES
     src/hle/kernel/misc.cpp
     src/hle/kernel/pthread.cpp
     src/hle/kernel/sync.cpp
+    src/hle/kernel/fiber.cpp
     src/hle/kernel/time.cpp
     src/hle/video_out/video_out.h
     src/hle/video_out/video_out.cpp

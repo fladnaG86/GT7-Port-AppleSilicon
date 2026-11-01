@@ -2,10 +2,10 @@
 """Generate src/hle/nid_db.inc: names for every NID the game's modules import.
 
 The full NID -> name table comes from shadPS4 (src/core/aerolib/aerolib.inl,
-GPL-2.0-or-later); we keep only the entries Driveclub actually uses.
+GPL-2.0-or-later); we keep only the entries the given games actually use.
 
 Usage:
-    tools/gen_nid_db.py shadps4/src/core/aerolib/aerolib.inl extracted/Image0 src/hle/nid_db.inc
+    tools/gen_nid_db.py shadps4/src/core/aerolib/aerolib.inl src/hle/nid_db.inc Image0 [Image0 ...]
 """
 
 import os
@@ -22,7 +22,11 @@ import struct  # noqa: E402
 
 def imported_nids(path):
     with open(path, "rb") as f:
-        s = Self(f.read())
+        data = f.read()
+    if data[:4] != b"\x4f\x15\x3d\x1d":  # stubs and plain ELFs carry no import table we read
+        print(f"skipping {path}: not a SELF")
+        return set()
+    s = Self(data)
     idx, dynlib_ph = s.phdr(PT_SCE_DYNLIBDATA)
     dynlib = s.blobs[idx]
     _, dyn_ph = s.phdr(PT_DYNAMIC)
@@ -45,15 +49,16 @@ def imported_nids(path):
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) < 4:
         sys.exit(__doc__)
-    aerolib, game_dir, out = sys.argv[1:]
+    aerolib, out, *game_dirs = sys.argv[1:]
 
     wanted = set()
-    for root in (game_dir, os.path.join(game_dir, "sce_module")):
-        for name in sorted(os.listdir(root)):
-            if name == "eboot.bin" or name.endswith((".prx", ".sprx")):
-                wanted |= imported_nids(os.path.join(root, name))
+    for game_dir in game_dirs:
+        for root in (game_dir, os.path.join(game_dir, "sce_module")):
+            for name in sorted(os.listdir(root)):
+                if name == "eboot.bin" or name.endswith((".prx", ".sprx")):
+                    wanted |= imported_nids(os.path.join(root, name))
 
     stub = re.compile(r'STUB\("([^"]{11})",\s*([^)]+)\)')
     names = {}

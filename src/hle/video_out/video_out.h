@@ -36,6 +36,20 @@ struct SceVideoOutResolutionStatus {
     u32 reserved1[3] = {0};
 };
 
+struct SceVideoOutFlipStatus {
+    u64 count;
+    u64 process_time;
+    u64 tsc;
+    s64 flip_arg;
+    u64 submit_tsc;
+    u64 reserved0;
+    s32 num_gpu_flip_pending;
+    s32 num_flip_pending;
+    s32 current_buffer;
+    u32 reserved1;
+};
+static_assert(sizeof(SceVideoOutFlipStatus) == 64);
+
 struct SceVideoOutVblankStatus {
     u64 count = 0;
     u64 process_time = 0;
@@ -67,6 +81,7 @@ public:
     // sceVideoOutSetFlipRate), like the console's vsync'd flip queue.
     void WaitFlipVblank(s32 handle);
     s32 GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status);
+    s32 GetFlipStatus(s32 handle, SceVideoOutFlipStatus* status);
 
     static Driver& Instance();
 
@@ -82,6 +97,8 @@ private:
         u64 flip_count = 0;
         u64 vblank_count = 0;
         u64 last_flip_vblank = 0;
+        s64 last_flip_arg = 0;
+        s32 flips_pending = 0;
         SceVideoOutVblankStatus vblank_status{};
         std::vector<Kernel::EventQueue*> flip_queues;
         std::vector<Kernel::EventQueue*> vblank_queues;

@@ -16,6 +16,35 @@ namespace Hle::Kernel {
 
 namespace {
 
+struct GuestTimesec {
+    s64 t;
+    u32 west_sec;
+    u32 dst_sec;
+};
+
+// `seconds` is UTC; the guest gets local time plus the zone it applied.
+s32 sceKernelConvertUtcToLocaltime(s64 seconds, s64* local, GuestTimesec* zone, u32* dst_sec) {
+    const time_t t = static_cast<time_t>(seconds);
+    tm parts{};
+    if (!localtime_r(&t, &parts)) {
+        return OrbisError(EINVAL);
+    }
+    const u32 dst = parts.tm_isdst > 0 ? 3600 : 0;
+    const s32 west = static_cast<s32>(parts.tm_gmtoff) - static_cast<s32>(dst);
+    if (local) {
+        *local = seconds + parts.tm_gmtoff;
+    }
+    if (zone) {
+        zone->t = seconds;
+        zone->west_sec = static_cast<u32>(west);
+        zone->dst_sec = dst;
+    }
+    if (dst_sec) {
+        *dst_sec = dst;
+    }
+    return ORBIS_OK;
+}
+
 const u64 g_start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
 u64 TscFrequency() {
@@ -180,6 +209,7 @@ time_t lc_mktime(tm* t) {
 void RegisterTime() {
     constexpr const char* k = "libkernel";
     DC_HLE(k, sceKernelClockGettime);
+    DC_HLE(k, sceKernelConvertUtcToLocaltime);
     DC_HLE(k, sceKernelGettimeofday);
     DC_HLE(k, sceKernelGettimezone);
     DC_HLE(k, sceKernelGetProcessTime);

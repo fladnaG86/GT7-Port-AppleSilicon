@@ -24,6 +24,7 @@ struct GuestKevent {
 };
 static_assert(sizeof(GuestKevent) == 32);
 
+constexpr s16 kEvfiltTimer = -7;
 constexpr s16 kEvfiltUser = -11;
 constexpr s16 kEvfiltVideoOut = -13;
 constexpr s16 kEvfiltGraphicsCore = -14;

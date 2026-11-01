@@ -1,11 +1,16 @@
 // libkernel semaphores and event queues.
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 
 #include "common/log.h"
 #include "hle/hle.h"
@@ -92,7 +97,62 @@ s32 sceKernelCreateEqueue(EventQueue** eq, const char* name) {
     return ORBIS_OK;
 }
 
+// Periodic timers: one host thread each, stopped by clearing the flag it owns.
+std::mutex g_timer_lock;
+std::map<std::pair<EventQueue*, int>, std::shared_ptr<std::atomic<bool>>> g_timers;
+
+void StopTimer(EventQueue* eq, int id) {
+    auto it = g_timers.find({eq, id});
+    if (it != g_timers.end()) {
+        it->second->store(false);
+        g_timers.erase(it);
+    }
+}
+
+s32 sceKernelAddTimerEvent(EventQueue* eq, int id, u32 usec, void* udata) {
+    if (!eq) {
+        return OrbisError(EBADF);
+    }
+    auto running = std::make_shared<std::atomic<bool>>(true);
+    {
+        std::scoped_lock lk(g_timer_lock);
+        StopTimer(eq, id);
+        g_timers[{eq, id}] = running;
+    }
+    eq->Add(static_cast<u64>(id), kEvfiltTimer, udata);
+    std::thread([eq, id, usec, running] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::microseconds(usec));
+            std::scoped_lock lk(g_timer_lock); // keeps eq alive against DeleteEqueue
+            if (!running->load()) {
+                return;
+            }
+            eq->Trigger(static_cast<u64>(id), kEvfiltTimer, 1);
+        }
+    }).detach();
+    return ORBIS_OK;
+}
+
+s32 sceKernelDeleteTimerEvent(EventQueue* eq, int id) {
+    {
+        std::scoped_lock lk(g_timer_lock);
+        StopTimer(eq, id);
+    }
+    return eq->Remove(static_cast<u64>(id), kEvfiltTimer) ? ORBIS_OK : OrbisError(ENOENT);
+}
+
 s32 sceKernelDeleteEqueue(EventQueue* eq) {
+    {
+        std::scoped_lock lk(g_timer_lock);
+        for (auto it = g_timers.begin(); it != g_timers.end();) {
+            if (it->first.first == eq) {
+                it->second->store(false);
+                it = g_timers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     delete eq;
     return ORBIS_OK;
 }
@@ -235,6 +295,151 @@ s32 sceKernelCancelSema(Sema* sem, int count, int* waiters) {
     return ORBIS_OK;
 }
 
+// ----------------------------------------------------------- event flags ----
+
+constexpr u32 kEventFlagWaitAnd = 0x01;
+constexpr u32 kEventFlagWaitOr = 0x02;
+constexpr u32 kEventFlagClearAll = 0x10;
+constexpr u32 kEventFlagClearPattern = 0x20;
+
+struct EventFlag {
+    std::mutex lock;
+    std::condition_variable cv;
+    u64 bits;
+    u64 cancels = 0;
+    bool deleted = false;
+
+    bool Matches(u64 pattern, u32 mode) const {
+        return (mode & kEventFlagWaitAnd) ? (bits & pattern) == pattern : (bits & pattern) != 0;
+    }
+
+    void Consume(u64 pattern, u32 mode, u64* result) {
+        if (result) {
+            *result = bits;
+        }
+        if (mode & kEventFlagClearAll) {
+            bits = 0;
+        } else if (mode & kEventFlagClearPattern) {
+            bits &= ~pattern;
+        }
+    }
+};
+
+bool ValidWaitMode(u32 mode) {
+    return ((mode & kEventFlagWaitAnd) != 0) != ((mode & kEventFlagWaitOr) != 0);
+}
+
+s32 sceKernelCreateEventFlag(EventFlag** flag, const char*, u32, u64 init, const void*) {
+    if (!flag) {
+        return OrbisError(EINVAL);
+    }
+    auto* f = new EventFlag();
+    f->bits = init;
+    *flag = f;
+    return ORBIS_OK;
+}
+
+s32 sceKernelDeleteEventFlag(EventFlag* f) {
+    if (!f) {
+        return OrbisError(ESRCH);
+    }
+    {
+        std::scoped_lock lk(f->lock);
+        f->deleted = true;
+    }
+    f->cv.notify_all();
+    // Waiters may still touch it; leak rather than race (rare, small).
+    return ORBIS_OK;
+}
+
+s32 sceKernelSetEventFlag(EventFlag* f, u64 bits) {
+    if (!f) {
+        return OrbisError(ESRCH);
+    }
+    {
+        std::scoped_lock lk(f->lock);
+        f->bits |= bits;
+    }
+    f->cv.notify_all();
+    return ORBIS_OK;
+}
+
+s32 sceKernelClearEventFlag(EventFlag* f, u64 bits) {
+    if (!f) {
+        return OrbisError(ESRCH);
+    }
+    std::scoped_lock lk(f->lock);
+    f->bits &= bits;
+    return ORBIS_OK;
+}
+
+s32 sceKernelCancelEventFlag(EventFlag* f, u64 bits, int* waiters) {
+    if (!f) {
+        return OrbisError(ESRCH);
+    }
+    if (waiters) {
+        *waiters = 0;
+    }
+    {
+        std::scoped_lock lk(f->lock);
+        f->bits = bits;
+        ++f->cancels;
+    }
+    f->cv.notify_all();
+    return ORBIS_OK;
+}
+
+s32 sceKernelPollEventFlag(EventFlag* f, u64 pattern, u32 mode, u64* result) {
+    if (!f) {
+        return OrbisError(ESRCH);
+    }
+    if (!pattern || !ValidWaitMode(mode)) {
+        return OrbisError(EINVAL);
+    }
+    std::scoped_lock lk(f->lock);
+    if (!f->Matches(pattern, mode)) {
+        return OrbisError(EBUSY);
+    }
+    f->Consume(pattern, mode, result);
+    return ORBIS_OK;
+}
+
+s32 sceKernelWaitEventFlag(EventFlag* f, u64 pattern, u32 mode, u64* result, u32* timeout_us) {
+    if (!f) {
+        return OrbisError(ESRCH);
+    }
+    if (!pattern || !ValidWaitMode(mode)) {
+        return OrbisError(EINVAL);
+    }
+    std::unique_lock lk(f->lock);
+    const u64 cancels = f->cancels;
+    auto done = [&] { return f->deleted || f->cancels != cancels || f->Matches(pattern, mode); };
+    if (!timeout_us) {
+        f->cv.wait(lk, done);
+    } else {
+        const auto start = std::chrono::steady_clock::now();
+        const bool got = f->cv.wait_for(lk, std::chrono::microseconds(*timeout_us), done);
+        const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+        *timeout_us = spent >= *timeout_us ? 0 : static_cast<u32>(*timeout_us - spent);
+        if (!got) {
+            if (result) {
+                *result = f->bits;
+            }
+            return OrbisError(ETIMEDOUT);
+        }
+    }
+    if (f->deleted) {
+        return OrbisError(EACCES);
+    }
+    if (f->cancels != cancels) {
+        return OrbisError(ECANCELED);
+    }
+    f->Consume(pattern, mode, result);
+    return ORBIS_OK;
+}
+
 // POSIX sem_t is a 16-byte struct on FreeBSD; we keep our pointer in it.
 Sema*& SemSlot(void* sem) {
     return *static_cast<Sema**>(sem);
@@ -292,6 +497,15 @@ void RegisterSync() {
     DC_HLE(k, sceKernelAddUserEventEdge);
     DC_HLE(k, sceKernelTriggerUserEvent);
     DC_HLE(k, sceKernelDeleteUserEvent);
+    DC_HLE(k, sceKernelAddTimerEvent);
+    DC_HLE(k, sceKernelDeleteTimerEvent);
+    DC_HLE(k, sceKernelCreateEventFlag);
+    DC_HLE(k, sceKernelDeleteEventFlag);
+    DC_HLE(k, sceKernelSetEventFlag);
+    DC_HLE(k, sceKernelClearEventFlag);
+    DC_HLE(k, sceKernelCancelEventFlag);
+    DC_HLE(k, sceKernelPollEventFlag);
+    DC_HLE(k, sceKernelWaitEventFlag);
     DC_HLE(k, sceKernelGetEventFilter);
     DC_HLE(k, sceKernelGetEventId);
     DC_HLE(k, sceKernelGetEventData);

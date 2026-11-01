@@ -1,3 +1,4 @@
+#include "core/guest_profile.h"
 #include "gpu/liverpool/command_processor.h"
 
 #include <atomic>
@@ -185,6 +186,7 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
     char name[32];
     std::snprintf(name, sizeof(name), ring.index == 0 ? "GPU gfx" : "GPU compute %u", ring.index);
     pthread_setname_np(name);
+    Core::GuestProfile::RegisterThread("CP");
     // The CP threads are on every frame's critical path, among dozens of
     // guest threads (some spin-waiting) at the default QoS: ask for P-cores and
     // priority. DC_NO_QOS=1 leaves the default (A/B).
@@ -644,6 +646,13 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         case Op::IndirectBuffer: {
             const u32* ib = Ptr<const u32>(body[0], body[1] & 0xFFFF);
             const u32 size = body[2] & 0xFFFFF;
+            constexpr u32 kIbChain = 1u << 20;
+            // A chained buffer replaces the current one, however many links there are.
+            if (body[2] & kIbChain) {
+                p = ib;
+                end = ib + size;
+                continue;
+            }
             if (depth < 4) {
                 Execute({ib, size}, compute, depth + 1);
             }
@@ -663,7 +672,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 int_sel = (dw2 >> 24) & 7;
             const bool irq = int_sel == kIntWriteConfirm || int_sel == kIntUndocumented;
             FenceWrite((dw2 >> 29) & 7, u64(body[2]) | (u64(body[3]) << 32), body[4], body[5],
-                       irq && !compute ? kIrqGfxEop : 0);
+                       !irq ? 0 : compute ? kIrqCompute + t_ring->index : kIrqGfxEop);
             break;
         }
         case Op::EventWriteEos: {

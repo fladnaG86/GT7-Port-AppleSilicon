@@ -15,8 +15,18 @@ namespace {
 // Error codes
 constexpr s32 kErrorNpSignedOut = static_cast<s32>(0x80550006);
 
+// DC_OFFLINE: the user is signed out and online queries fail, which is what
+// games see on a console with no PSN account.
+bool Offline() {
+    static const bool offline = std::getenv("DC_OFFLINE") != nullptr;
+    return offline;
+}
+
 // libSceNpManager
 s32 sceNpGetNpId(s32 user_id, void* np_id) {
+    if (Offline()) {
+        return kErrorNpSignedOut;
+    }
     if (np_id) {
         std::memset(np_id, 0, 32);
         std::strncpy(reinterpret_cast<char*>(np_id), "Player", 16);
@@ -26,6 +36,9 @@ s32 sceNpGetNpId(s32 user_id, void* np_id) {
 }
 
 s32 sceNpGetOnlineId(s32 user_id, void* online_id) {
+    if (Offline()) {
+        return kErrorNpSignedOut;
+    }
     if (online_id) {
         std::memset(online_id, 0, 20);
         std::strncpy(reinterpret_cast<char*>(online_id), "Player", 16);
@@ -70,7 +83,7 @@ s32 sceNpDeleteRequest(s32 req_id) {
 s32 sceNpPollAsync(s32 req_id, s32* result) {
     (void)req_id;
     if (result) {
-        *result = 0;
+        *result = Offline() ? kErrorNpSignedOut : 0;
     }
     return 0;
 }
@@ -104,6 +117,35 @@ s32 sceNpSetNpTitleId(const void* title_id, const void* secret) {
     return 0;
 }
 
+s32 sceNpGetState(s32 /*user_id*/, s32* state) {
+    *state = Offline() ? 1 : 2; // SIGNED_OUT / SIGNED_IN
+    return 0;
+}
+
+s32 sceNpHasSignedUp(s32 /*user_id*/, u8* has_signed_up) {
+    *has_signed_up = Offline() ? 0 : 1;
+    return 0;
+}
+
+s32 sceNpRegisterStateCallbackA(void*, void*) {
+    return 1; // callback handle; the state never changes, so it never fires
+}
+
+s32 sceNpRegisterNpReachabilityStateCallback(void*, void*) {
+    return 0;
+}
+
+s32 sceNpCheckNpReachability(s32 /*req_id*/, s32 /*user_id*/) {
+    return Offline() ? kErrorNpSignedOut : 0;
+}
+
+s32 sceNpGetNpReachabilityState(s32 /*user_id*/, u32* state) {
+    constexpr u32 kUnavailable = 0;
+    constexpr u32 kReachable = 2;
+    *state = Offline() ? kUnavailable : kReachable;
+    return 0;
+}
+
 s32 sceNpRegisterStateCallback(void* cb, void* arg) {
     g_state_cb = reinterpret_cast<NpStateCallback>(cb);
     g_state_arg = arg;
@@ -114,6 +156,10 @@ s32 sceNpRegisterStateCallback(void* cb, void* arg) {
 s32 sceNpCheckNpAvailability(s32 user_id) {
     (void)user_id;
     return 0;
+}
+
+s32 sceNpCheckNpAvailabilityA(s32 /*req_id*/, s32 /*user_id*/) {
+    return Offline() ? kErrorNpSignedOut : 0;
 }
 
 s32 sceNpNotifyPlusFeature(s32 user_id, s32 feature, s64 reserved) {
@@ -371,7 +417,14 @@ void RegisterNp() {
     DC_HLE(kNpManager, sceNpSetContentRestriction);
     DC_HLE(kNpManager, sceNpSetNpTitleId);
     DC_HLE(kNpManager, sceNpRegisterStateCallback);
+    DC_HLE(kNpManager, sceNpGetState);
+    DC_HLE(kNpManager, sceNpCheckNpReachability);
+    DC_HLE(kNpManager, sceNpGetNpReachabilityState);
+    DC_HLE(kNpManager, sceNpHasSignedUp);
+    DC_HLE(kNpManager, sceNpRegisterStateCallbackA);
+    DC_HLE(kNpManager, sceNpRegisterNpReachabilityStateCallback);
     DC_HLE(kNpManager, sceNpCheckNpAvailability);
+    DC_HLE(kNpManager, sceNpCheckNpAvailabilityA);
     DC_HLE(kNpManager, sceNpCheckPlus);
     DC_HLE(kNpManager, sceNpNotifyPlusFeature);
     DC_HLE(kNpManager, sceNpGetAccountLanguage);

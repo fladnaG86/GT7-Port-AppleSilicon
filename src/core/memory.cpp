@@ -66,6 +66,10 @@ VAddr FindFree(VAddr hint, u64 size, u64 align) {
     if (hint >= AddressSpace::kSystemReservedMax && hint < AddressSpace::kUserMin) {
         hint = AddressSpace::kUserMin;
     }
+    // A hint is only a suggestion: past the end of the range, search from the start.
+    if (hint >= AddressSpace::kUserMax) {
+        hint = 0;
+    }
     VAddr addr = AlignUp(hint ? hint : kDefaultSearchBase, std::max(align, kPage));
     for (;;) {
         if (!AddressSpace::Contains(addr, size)) {

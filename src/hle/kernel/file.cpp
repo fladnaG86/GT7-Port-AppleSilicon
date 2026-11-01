@@ -319,6 +319,10 @@ s64 sceKernelGetdirentries(int fd, u8* buf, u64 nbytes, s64* basep) {
 
 } // namespace
 
+fs::path UserDataRoot() {
+    return g_user_root;
+}
+
 void SetFileRoots(const fs::path& game_root, const fs::path& user_root) {
     g_game_root = fs::absolute(game_root);
     g_user_root = user_root;
