@@ -422,6 +422,36 @@ s32 sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, u64 args, u32 modifier) {
     return 0;
 }
 
+// DRAW_(INDEX_)INDIRECT: args at the SET_BASE address + data_offset. The SGPR
+// offsets become SH register offsets of the stage's USER_DATA_0.
+static s32 WriteDrawIndirect(u32 op, u32* cmdbuf, u32 size, u32 data_offset, u32 stage,
+                             u32 vertex_sgpr, u32 instance_sgpr, u32 flags) {
+    static constexpr u32 kUserData[7] = {0, 0, 0x4c, 0, 0xcc, 0, 0x14c};
+    constexpr u32 kPacketSize = 5;
+    if (!cmdbuf || size < kPacketSize + 1 || stage >= 7 || vertex_sgpr >= 16 || instance_sgpr >= 16) {
+        return -1;
+    }
+    cmdbuf[0] = Type3(op, 4) | (flags & 1);
+    cmdbuf[1] = data_offset;
+    cmdbuf[2] = vertex_sgpr ? vertex_sgpr + kUserData[stage] : 0;
+    cmdbuf[3] = instance_sgpr ? instance_sgpr + kUserData[stage] : 0;
+    cmdbuf[4] = 0;
+    WriteNop(cmdbuf + kPacketSize, size - kPacketSize - 1);
+    return 0;
+}
+
+s32 sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 stage, u32 vertex_sgpr,
+                            u32 instance_sgpr, u32 flags) {
+    return WriteDrawIndirect(Op::DrawIndexIndirect, cmdbuf, size, data_offset, stage, vertex_sgpr,
+                             instance_sgpr, flags);
+}
+
+s32 sceGnmDrawIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 stage, u32 vertex_sgpr,
+                       u32 instance_sgpr, u32 flags) {
+    return WriteDrawIndirect(Op::DrawIndirect, cmdbuf, size, data_offset, stage, vertex_sgpr,
+                             instance_sgpr, flags);
+}
+
 s32 sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, u32 buf_idx) {
     if (!cmdbuf || size != 7) {
         return -1;
@@ -746,6 +776,8 @@ void RegisterGnmDriver() {
     DC_HLE("libSceGnmDriver", sceGnmDispatchIndirectOnMec);
     DC_HLE("libSceGnmDriver", sceGnmSetPsShader350);
     DC_HLE("libSceGnmDriver", sceGnmDrawIndexAuto);
+    DC_HLE("libSceGnmDriver", sceGnmDrawIndexIndirect);
+    DC_HLE("libSceGnmDriver", sceGnmDrawIndirect);
     DC_HLE("libSceGnmDriver", sceGnmDrawIndex);
     DC_HLE("libSceGnmDriver", sceGnmDrawIndexOffset);
     DC_HLE("libSceGnmDriver", sceGnmSetVgtControl);

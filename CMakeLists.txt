@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 # Without this the binary requires the build machine's macOS version.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
 
-project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
+project(GT7Port LANGUAGES C CXX OBJC OBJCXX)
 
 # Backends
 #   macOS:          this tree, Metal renderer (src/gpu/metal).
@@ -13,7 +13,7 @@ project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
 #                   it does not configure there.
 if (NOT APPLE)
     message(FATAL_ERROR
-        "Driveclub Native: this tree (src/) builds the macOS backend only.\n"
+        "GT7 Port: this tree (src/) builds the macOS backend only.\n"
         "For Windows/Linux use the DCport backend: see windows/README.md.")
 endif()
 
@@ -140,11 +140,11 @@ add_library(libatrac9 STATIC ${DC_LIBATRAC9_SOURCES})
 target_include_directories(libatrac9 PUBLIC third_party/libatrac9/src)
 target_compile_options(libatrac9 PRIVATE -w $<$<CONFIG:Release>:-O3 -march=btver2>)
 
-add_executable(driveclub ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
+add_executable(gt7 ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
 
-target_include_directories(driveclub PRIVATE src)
+target_include_directories(gt7 PRIVATE src)
 
-target_compile_options(driveclub PRIVATE
+target_compile_options(gt7 PRIVATE
     -Wall -Wextra -Wno-unused-parameter
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
     $<$<CONFIG:Release>:-O3 -march=btver2>
@@ -154,7 +154,7 @@ target_compile_options(driveclub PRIVATE
 # sit inside the default 4 GB __PAGEZERO. Shrink it, move our own image above
 # every guest range, and pin the zero-fill reservations from address_space.cpp
 # to the guest ranges so the kernel maps them before any library can.
-target_link_options(driveclub PRIVATE
+target_link_options(gt7 PRIVATE
     -Wl,-no_pie,-pagezero_size,0x4000,-image_base,0x700000000000
     -Wl,-segaddr,GUEST_TCB,0x4000
     -Wl,-segaddr,GUEST_SYSMGD,0x400000
@@ -162,7 +162,7 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_USER,0x7000000000
 )
 
-target_link_libraries(driveclub PRIVATE
+target_link_libraries(gt7 PRIVATE
     SDL3::SDL3
     libatrac9
     "-framework Metal"

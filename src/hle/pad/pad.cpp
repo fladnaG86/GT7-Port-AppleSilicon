@@ -140,7 +140,31 @@ s32 scePadResetOrientation(s32 handle) {
 
 } // namespace
 
+// DC_PAD_RECORD=<file>: every input with its time since start, as text.
+// DC_PAD_REPLAY=<file> plays such a file back with the same timing.
+//   B <sec> <hex mask> <0|1>   button
+//   T <sec> <right> <value>    analog trigger
+//   S <sec> <right> <y> <value> stick axis
+static std::chrono::steady_clock::time_point g_input_t0 = std::chrono::steady_clock::now();
+
+static double InputTime() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_input_t0).count();
+}
+
+static std::FILE* RecordFile() {
+    static std::FILE* f = [] {
+        const char* e = std::getenv("DC_PAD_RECORD");
+        return e ? std::fopen(e, "w") : nullptr;
+    }();
+    return f;
+}
+
 void SetButton(u32 button, bool pressed) {
+    const u32 before = g_buttons.load();
+    if (std::FILE* f = RecordFile(); f && ((before & button) != 0) != pressed) {
+        std::fprintf(f, "B %.3f %x %d\n", InputTime(), button, pressed ? 1 : 0);
+        std::fflush(f);
+    }
     if (pressed) {
         g_buttons.fetch_or(button);
     } else {
@@ -149,6 +173,16 @@ void SetButton(u32 button, bool pressed) {
 }
 
 void SetStick(bool right, u8 x, u8 y) {
+    if (std::FILE* f = RecordFile()) {
+        const u8 ox = (right ? g_right_x : g_left_x).load(), oy = (right ? g_right_y : g_left_y).load();
+        if (ox != x) {
+            std::fprintf(f, "S %.3f %d 0 %u\n", InputTime(), right, x);
+        }
+        if (oy != y) {
+            std::fprintf(f, "S %.3f %d 1 %u\n", InputTime(), right, y);
+        }
+        std::fflush(f);
+    }
     if (right) {
         g_right_x.store(x);
         g_right_y.store(y);
@@ -159,10 +193,18 @@ void SetStick(bool right, u8 x, u8 y) {
 }
 
 void SetStickAxis(bool right, bool y, u8 value) {
+    if (std::FILE* f = RecordFile()) {
+        std::fprintf(f, "S %.3f %d %d %u\n", InputTime(), right, y, value);
+        std::fflush(f);
+    }
     (right ? (y ? g_right_y : g_right_x) : (y ? g_left_y : g_left_x)).store(value);
 }
 
 void SetTrigger(bool right, u8 value) {
+    if (std::FILE* f = RecordFile(); f && (right ? g_r2 : g_l2).load() != value) {
+        std::fprintf(f, "T %.3f %d %u\n", InputTime(), right, value);
+        std::fflush(f);
+    }
     (right ? g_r2 : g_l2).store(value);
     SetButton(right ? kR2 : kL2, value > 30);
 }
@@ -204,6 +246,50 @@ static void StartAutoPress() {
     }).detach();
 }
 
+static void StartReplay() {
+    const char* e = std::getenv("DC_PAD_REPLAY");
+    if (!e) {
+        return;
+    }
+    struct Event {
+        char kind;
+        double t;
+        u32 a, b, c;
+    };
+    std::vector<Event> events;
+    if (std::FILE* f = std::fopen(e, "r")) {
+        char line[96];
+        while (std::fgets(line, sizeof(line), f)) {
+            Event ev{};
+            if (std::sscanf(line, "B %lf %x %u", &ev.t, &ev.a, &ev.b) == 3) {
+                ev.kind = 'B';
+            } else if (std::sscanf(line, "T %lf %u %u", &ev.t, &ev.a, &ev.b) == 3) {
+                ev.kind = 'T';
+            } else if (std::sscanf(line, "S %lf %u %u %u", &ev.t, &ev.a, &ev.b, &ev.c) == 4) {
+                ev.kind = 'S';
+            } else {
+                continue;
+            }
+            events.push_back(ev);
+        }
+        std::fclose(f);
+    }
+    DC_INFO("pad: replaying %zu inputs from %s", events.size(), e);
+    std::thread([events = std::move(events)] {
+        for (const Event& ev : events) {
+            std::this_thread::sleep_until(g_input_t0 +
+                                          std::chrono::milliseconds(static_cast<s64>(ev.t * 1000)));
+            if (ev.kind == 'B') {
+                SetButton(ev.a, ev.b != 0);
+            } else if (ev.kind == 'T') {
+                SetTrigger(ev.a != 0, static_cast<u8>(ev.b));
+            } else {
+                SetStickAxis(ev.a != 0, ev.b != 0, static_cast<u8>(ev.c));
+            }
+        }
+    }).detach();
+}
+
 // DC_AUTO_THROTTLE=<sec>,<ms> / DC_AUTO_BRAKE=<sec>,<ms>: full R2 / L2 for
 // <ms> from <sec> after start.
 static void StartAutoTrigger(const char* var, bool right) {
@@ -224,7 +310,9 @@ static void StartAutoTrigger(const char* var, bool right) {
 }
 
 void RegisterPad() {
+    g_input_t0 = std::chrono::steady_clock::now();
     StartAutoPress();
+    StartReplay();
     StartAutoTrigger("DC_AUTO_THROTTLE", true);
     StartAutoTrigger("DC_AUTO_BRAKE", false);
     constexpr const char* lib = "libScePad";

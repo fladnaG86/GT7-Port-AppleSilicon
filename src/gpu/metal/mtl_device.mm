@@ -76,7 +76,7 @@ static long long GpuCoreCount() {
 // One line that identifies the machine in bug reports.
 static void LogSystem() {
     NSString* version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    DC_INFO("system: Driveclub Native %s, %s, %s, %lld GPU cores, %lldP+%lldE CPU cores, %lld GB, "
+    DC_INFO("system: GT7 Port %s, %s, %s, %lld GPU cores, %lldP+%lldE CPU cores, %lld GB, "
             "macOS %s (%s)%s",
             version ? version.UTF8String : "dev build", SysctlString("hw.model").c_str(),
             SysctlString("machdep.cpu.brand_string").c_str(), GpuCoreCount(),

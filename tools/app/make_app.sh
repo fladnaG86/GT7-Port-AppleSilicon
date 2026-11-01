@@ -1,5 +1,5 @@
 #!/bin/bash
-# Packages build/driveclub as Driveclub.app inside a drag-to-install .dmg.
+# Packages build/gt7 as Driveclub.app inside a drag-to-install .dmg.
 # Usage: tools/app/make_app.sh <version> [SDL3 dylib]
 #   <version>    e.g. 0.2.0
 #   SDL3 dylib   x86_64 libSDL3.0.dylib to bundle; build it with
@@ -9,7 +9,7 @@ set -euo pipefail
 
 version=${1:?usage: make_app.sh <version> [SDL3 dylib]}
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-sdl=${2:-$(otool -l "$repo/build/driveclub" | sed -n '/LC_RPATH/{n;n;s/^ *path \(.*\) (offset [0-9]*)$/\1/p;}' | head -1)/libSDL3.0.dylib}
+sdl=${2:-$(otool -l "$repo/build/gt7" | sed -n '/LC_RPATH/{n;n;s/^ *path \(.*\) (offset [0-9]*)$/\1/p;}' | head -1)/libSDL3.0.dylib}
 dist="$repo/dist"
 app="$dist/Driveclub.app"
 scratch=$(mktemp -d)
@@ -23,7 +23,7 @@ fi
 # Both binaries must run on the app's minimum macOS (LSMinimumSystemVersion
 # below), not just on the build machine's.
 min_macos=15.0
-for bin in "$repo/build/driveclub" "$sdl"; do
+for bin in "$repo/build/gt7" "$sdl"; do
     minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos"{print $2; exit}')
     if [ "$(printf '%s\n%s\n' "$minos" "$min_macos" | sort -V | tail -1)" != "$min_macos" ]; then
         echo "$bin requires macOS $minos (> $min_macos): build with CMAKE_OSX_DEPLOYMENT_TARGET=$min_macos" >&2
@@ -34,7 +34,7 @@ done
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
 
-cp "$repo/build/driveclub" "$app/Contents/MacOS/driveclub"
+cp "$repo/build/gt7" "$app/Contents/MacOS/driveclub"
 cp "$sdl" "$app/Contents/Frameworks/libSDL3.0.dylib"
 otool -l "$app/Contents/MacOS/driveclub" | sed -n '/LC_RPATH/{n;n;s/^ *path \(.*\) (offset [0-9]*)$/\1/p;}' |
     while IFS= read -r rpath; do

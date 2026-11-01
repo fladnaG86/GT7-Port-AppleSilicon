@@ -536,12 +536,17 @@ struct MetalRenderer::Impl {
     std::unordered_map<u64, id<MTLTexture>>
         views; // (base, count, format) -> view
     RenderTarget *view_of = nullptr; // sRGB/linear twin whose texture this views
+    bool has_crops = false;          // a shorter T# reads it (see CropOf)
+    u32 comp_swap = 0;               // CB_INFO.COMP_SWAP it was last bound with
   };
   using TargetMap =
       std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
   TargetMap color_targets; // by address
   TargetMap depth_targets;
   u64 write_seq = 0;
+  std::unordered_map<u64, u32> storage_swizzles; // address -> selectors of its storage writes
+  // Crops of color targets read through a shorter T#, by (address, height).
+  std::unordered_map<u64, std::unique_ptr<RenderTarget>> target_crops;
 
   // GetTexture results for one T# descriptor. The answer changes only when a
   // render target is created, grown or replaced, or a mip alias appears; the
@@ -2699,8 +2704,31 @@ struct MetalRenderer::Impl {
               rt->tex.pixelFormat); // the shader reads what the view holds
           *type_out = tt;
         }
+        // COMP_SWAP 2 stores exports as ABGR in memory, which a T# undoes with
+        // its selectors; host targets keep export order, so the selectors move.
+        u32 rt_swz = swz;
+        // A storage write goes through its T# selectors too, so the same T#
+        // reads back in place; host storage textures ignore selectors. Constant
+        // selectors stay: the channel does not exist in memory.
+        if (const auto it = storage_swizzles.find(addr);
+            it != storage_swizzles.end() && it->second == swz) {
+          rt_swz = 0;
+          for (u32 c = 0; c < 4; ++c) {
+            const u32 sel = (swz >> (3 * c)) & 7;
+            rt_swz |= (sel >= 4 ? 4 + c : sel) << (3 * c);
+          }
+        } else if (rt->comp_swap == 2) {
+          rt_swz = 0;
+          for (u32 c = 0; c < 4; ++c) {
+            u32 sel = (swz >> (3 * c)) & 7;
+            rt_swz |= (sel >= 4 ? 11 - sel : sel) << (3 * c);
+          }
+        }
+        if (RenderTarget *crop = CropOf(*rt, tt, width, height, base_level, last_level)) {
+          return TargetView(*crop, 0, 1, view_fmt, 0, 1, rt_swz);
+        }
         return TargetView(*rt, base_level, last_level - base_level + 1,
-                          view_fmt, base_array, slice_count, swz);
+                          view_fmt, base_array, slice_count, rt_swz);
       }
       if (tt.dim == TexDim::Tex2D) {
         if (RenderTarget *rt =
@@ -2751,6 +2779,11 @@ struct MetalRenderer::Impl {
       }
       RenderTarget &target = GetColorTarget(addr, f, width, height,
                                             last_level + 1, tt.dim, layers);
+      if (swz != kIdentitySwizzle) {
+        storage_swizzles[addr] = swz;
+      } else {
+        storage_swizzles.erase(addr);
+      }
       if (initial && !target.initialized) {
         EndPass();
         EnsureCommandBuffer();
@@ -2865,9 +2898,14 @@ struct MetalRenderer::Impl {
       }
       d.usage = MTLTextureUsageShaderRead;
       d.storageMode = cpu_upload ? MTLStorageModeManaged : MTLStorageModePrivate;
+      // One-channel format: W selects its only channel (GT7's glyphs: 1,1,1,W).
+      u32 tswz = swz;
+      if (fi.format == MTLPixelFormatR8Unorm && ((tswz >> 9) & 7) == 7) {
+        tswz = (tswz & 0x1FF) | (4u << 9);
+      }
       d.swizzle =
-          MTLTextureSwizzleChannelsMake(Swizzle(swz), Swizzle(swz >> 3),
-                                        Swizzle(swz >> 6), Swizzle(swz >> 9));
+          MTLTextureSwizzleChannelsMake(Swizzle(tswz), Swizzle(tswz >> 3),
+                                        Swizzle(tswz >> 6), Swizzle(tswz >> 9));
       e.tex = [device newTextureWithDescriptor:d];
       if (!e.tex) {
         return Dummy(tt);
@@ -2971,6 +3009,24 @@ struct MetalRenderer::Impl {
     d.borderColor = border == 0   ? MTLSamplerBorderColorTransparentBlack
                     : border == 1 ? MTLSamplerBorderColorOpaqueBlack
                                   : MTLSamplerBorderColorOpaqueWhite;
+    // FORCE_UNNORMALIZED: coordinates in texels (GT7's glyphs). Metal allows
+    // this only without mips or anisotropy, clamped, with one filter.
+    if ((s[0] >> 15) & 1) {
+      d.normalizedCoordinates = NO;
+      // Borders stay transparent: smearing the edge texel fills whole quads.
+      const auto pixel_clamp = [](u32 clamp) {
+        return (clamp & 7) >= 4 ? MTLSamplerAddressModeClampToZero
+                                : MTLSamplerAddressModeClampToEdge;
+      };
+      d.sAddressMode = pixel_clamp(s[0]);
+      d.tAddressMode = pixel_clamp(s[0] >> 3);
+      d.rAddressMode = pixel_clamp(s[0] >> 6);
+      d.minFilter = d.magFilter;
+      d.mipFilter = MTLSamplerMipFilterNotMipmapped;
+      d.maxAnisotropy = 1;
+      d.lodMinClamp = 0.0f;
+      d.lodMaxClamp = 0.0f;
+    }
     id<MTLSamplerState> st = [device newSamplerStateWithDescriptor:d];
     samplers[key] = st ? st : default_sampler;
     return samplers[key];
@@ -3252,6 +3308,53 @@ struct MetalRenderer::Impl {
   static constexpr u32 kVertexBufferBase = 16;
   static constexpr u32 kMaxVertexBuffers = 14;
 
+  // A T# shorter than the target at its address (GT7's blur keeps its passes
+  // in two halves of one surface and reads each by its own extent). Metal views
+  // cannot crop and normalized coordinates would span both halves: the T# gets
+  // a copy of its rows, taken again after each new pass on the target.
+  RenderTarget *CropOf(RenderTarget &rt, const TextureType &tt, u32 width, u32 height,
+                       u32 base_level, u32 last_level) {
+    if (tt.dim != TexDim::Tex2D || rt.dim != TexDim::Tex2D || base_level || last_level ||
+        rt.levels != 1 || rt.width != width || rt.height <= height ||
+        rt.tex.sampleCount != 1) {
+      return nullptr;
+    }
+    auto &crop = target_crops[Hash(rt.addr, u64(height) << 32 | width)];
+    if (!crop || crop->tex.pixelFormat != rt.tex.pixelFormat) {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+      d.textureType = MTLTextureType2D;
+      d.pixelFormat = rt.tex.pixelFormat;
+      d.width = width;
+      d.height = height;
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      d.storageMode = MTLStorageModePrivate;
+      crop = std::make_unique<RenderTarget>();
+      crop->tex = [device newTextureWithDescriptor:d];
+      crop->addr = rt.addr;
+      crop->width = width;
+      crop->height = height;
+      if (!crop->tex) {
+        crop.reset();
+        return nullptr;
+      }
+    }
+    rt.has_crops = true;
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    [b copyFromTexture:rt.tex
+           sourceSlice:0
+           sourceLevel:0
+          sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(width, height, 1)
+             toTexture:crop->tex
+      destinationSlice:0
+      destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [b endEncoding];
+    return crop.get();
+  }
+
   id<MTLTexture> TargetView(RenderTarget &rt, u32 base, u32 count,
                             MTLPixelFormat fmt = MTLPixelFormatInvalid,
                             u32 sbase = 0, u32 scount = ~0u,
@@ -3412,6 +3515,9 @@ struct MetalRenderer::Impl {
         continue;
       }
       RenderTarget &rt = *colors[k];
+      if (rt.has_crops) {
+        ++texture_epoch; // its crops go stale: the next bind copies them again
+      }
       rp.colorAttachments[k].texture = rt.tex;
       rp.colorAttachments[k].slice = rt.bind_slice;
       rp.colorAttachments[k].level = rt.bind_level;
@@ -4217,9 +4323,21 @@ struct MetalRenderer::Impl {
     ring.esgs_itemsize = r[Reg::VGT_ESGS_RING_ITEMSIZE] & 0x7FFF;
     ring.vert_itemsize = r[Reg::VGT_GS_VERT_ITEMSIZE] & 0x7FFF;
     ring.slots = plane / 64;
-    if (plane % 64 || ring.slots < 3 || ring.slots > 32 || !ring.esgs_itemsize ||
+    // Planes past the 12-bit immediate leave every offset in soffset, out of
+    // sight here; a plane holds VGT_GS_MAX_VERT_OUT vertices.
+    if (!plane) {
+      ring.slots = r[Reg::VGT_GS_MAX_VERT_OUT] & 0x7FF;
+    }
+    if (plane % 64 || ring.slots < 3 || ring.slots > 64 || !ring.esgs_itemsize ||
         !ring.vert_itemsize) {
-      ReportOnce("gs emulation: copy shader layout not understood");
+      std::string list;
+      for (const u32 o : offsets) {
+        list += " " + std::to_string(o);
+      }
+      ReportOnce("gs emulation: copy shader layout not understood (plane " + std::to_string(plane) +
+                 ", esgs item " + std::to_string(ring.esgs_itemsize) + ", vert item " +
+                 std::to_string(ring.vert_itemsize) + ", vs " + std::to_string(vs_addr) +
+                 ", max verts " + std::to_string(r[Reg::VGT_GS_MAX_VERT_OUT]) + ", offsets" + list + ")");
       return false;
     }
     // Never write past the rings, whatever count the guest gave: primitives
@@ -4267,10 +4385,35 @@ struct MetalRenderer::Impl {
     }
     ring.stage = Shader::RingStage::Export;
     ring.index_size = dc.indexed ? dc.index_size : 0;
+    u64 es_index_va = dc.indexed ? dc.index_base + u64(dc.index_offset) * dc.index_size : 0;
+    // A base vertex reaches the ES as explicit indices: one pipeline serves
+    // every base. GT7 draws each text glyph as a line at its own base.
+    const u32 es_verts = n * ring.input_verts;
+    const u32 base_vertex = r[Reg::VGT_INDX_OFFSET] + (dc.indexed ? 0 : dc.first_vertex);
+    if (base_vertex) {
+      if (dc.indexed && !Readable(es_index_va, u64(es_verts) * dc.index_size)) {
+        ReportOnce("index buffer not mapped");
+        return false;
+      }
+      const u64 va = ArenaAlloc(u64(es_verts) * 4);
+      if (!va) {
+        return false;
+      }
+      auto *out = reinterpret_cast<u32 *>(va);
+      for (u32 k = 0; k < es_verts; ++k) {
+        u32 v = k;
+        if (dc.indexed) {
+          v = dc.index_size == 4 ? reinterpret_cast<const u32 *>(es_index_va)[k]
+                                 : reinterpret_cast<const u16 *>(es_index_va)[k];
+        }
+        out[k] = v + base_vertex;
+      }
+      es_index_va = va;
+      ring.index_size = 4;
+    }
     if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_ES),
                  r.UserData(Reg::SPI_SHADER_USER_DATA_ES_0),
-                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5), n * ring.input_verts, 64,
-                 dc.indexed ? dc.index_base + u64(dc.index_offset) * dc.index_size : 0)) {
+                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5), es_verts, 64, es_index_va)) {
       return false;
     }
     ring.stage = Shader::RingStage::Geometry;
@@ -4292,6 +4435,7 @@ struct MetalRenderer::Impl {
     auto copy = std::make_unique<RegFile>(r);
     (*copy)[Reg::VGT_SHADER_STAGES_EN] &= ~0x20u;
     (*copy)[Reg::VGT_PRIMITIVE_TYPE] = static_cast<u32>(PrimType::TriList);
+    (*copy)[Reg::VGT_INDX_OFFSET] = 0; // the ES took the base; these index the ring
     DrawCall d = dc;
     d.indexed = true;
     d.count = n * ring.IndicesPerPrim();
@@ -4575,6 +4719,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       const ColorFormatInfo cf =
           ColorTargetFormat(fmt, ColorInfo::NumberType(info));
       colors[k] = &ColorTargetFor(r, k);
+      if (colors[k]->comp_swap != ColorInfo::CompSwap(info)) {
+        colors[k]->comp_swap = ColorInfo::CompSwap(info);
+        ++texture_epoch; // T# selectors over it change meaning
+      }
       color_fmt[k] = cf.format;
       out_type[k] = cf.out;
       any_color = true;

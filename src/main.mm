@@ -1,5 +1,5 @@
 // Driveclub Native: entry point.
-// Usage: driveclub <game dir> [--load-only]; without a game dir (Finder launch
+// Usage: gt7 <game dir> [--load-only]; without a game dir (Finder launch
 // of Driveclub.app) the folder is picked in a dialog, see launcher.h.
 // Loads and links the game's modules, then brings up the window and the
 // Metal renderer.
@@ -94,7 +94,7 @@ int Run(int argc, char** argv) {
     Core::Runtime::StartGame(linker);
 
     SDL_Window* window =
-        SDL_CreateWindow("Driveclub Native", kWindowWidth, kWindowHeight,
+        SDL_CreateWindow("GT7 Port", kWindowWidth, kWindowHeight,
                          SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
                              (std::getenv("DC_HIDDEN") ? SDL_WINDOW_HIDDEN : 0)); // DC_HIDDEN: no window (frame dumps)
     if (!window) {
@@ -336,7 +336,7 @@ int Run(int argc, char** argv) {
             const double fps = double(flips - flips_seen) / secs;
             flips_seen = flips;
             char title[96];
-            std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f FPS",
+            std::snprintf(title, sizeof(title), "GT7 Port | %s | %.0f FPS",
                           gpu_name.c_str(), fps);
             SDL_SetWindowTitle(window, title);
             fps_window = now;

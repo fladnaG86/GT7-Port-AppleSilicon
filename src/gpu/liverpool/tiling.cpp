@@ -93,6 +93,7 @@ Micro MicroType2D(u32 tile_index) {
         return Micro::Depth;
     case 0x0A: return Micro::Display; // Display_2dThin
     case 0x0E: return Micro::Thin;    // Thin_2dThin
+    case 0x10: return Micro::Thin;    // Thin_ThinPrt: addressed as 2D thin (unverified)
     default: return Micro::None;
     }
 }

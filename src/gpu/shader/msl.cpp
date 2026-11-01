@@ -229,8 +229,8 @@ private:
             Line("{ uint gb_ = dc_gid.x * " + N(group_dwords) + "u + dc_lidx; device uint* ix_ = dc_gsidx + dc_gtid.x * " +
                  N(o.ring.IndicesPerPrim()) + "u; uint st_ = 0u;");
             Line("  for (uint t_ = 0u; t_ + 2u < " + N(o.ring.slots) + "u; ++t_) {");
-            Line("    if ((gs_cut_ >> t_) & 1u) st_ = t_;");
-            Line("    bool ok_ = t_ + 2u < gs_emit_ && ((gs_cut_ >> (t_ + 1u)) & 3u) == 0u;");
+            Line("    if ((gs_cut_ >> t_) & 1ul) st_ = t_;");
+            Line("    bool ok_ = t_ + 2u < gs_emit_ && ((gs_cut_ >> (t_ + 1u)) & 3ul) == 0ul;");
             Line("    uint a_ = ((t_ - st_) & 1u) ? t_ + 1u : t_, b_ = ((t_ - st_) & 1u) ? t_ : t_ + 1u;");
             Line("    ix_[t_ * 3u] = ok_ ? gb_ + a_ * 16u : gb_; ix_[t_ * 3u + 1u] = ok_ ? gb_ + b_ * 16u : gb_;");
             Line("    ix_[t_ * 3u + 2u] = ok_ ? gb_ + (t_ + 2u) * 16u : gb_;");
@@ -577,7 +577,7 @@ void Emitter::EmitSopp(const Inst& i) {
             if (op == 2) {
                 Line("if (exec_lo != 0u) gs_emit_ += 1u;");
             } else if (op == 1) {
-                Line("if (exec_lo != 0u && gs_emit_ < 32u) gs_cut_ |= 1u << gs_emit_;");
+                Line("if (exec_lo != 0u && gs_emit_ < 64u) gs_cut_ |= 1ul << gs_emit_;");
             }
         }
         break;
@@ -2011,7 +2011,7 @@ std::string Emitter::Run() {
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
         if (o.ring.stage != RingStage::None) {
             // One thread per vertex / primitive exactly (dispatchThreads).
-            src += "    uint gs_emit_ = 0u, gs_cut_ = 0u; (void)gs_emit_; (void)gs_cut_;\n";
+            src += "    uint gs_emit_ = 0u; ulong gs_cut_ = 0ul; (void)gs_emit_; (void)gs_cut_;\n";
         }
         src += decl + wrapped + "}\n";
     }

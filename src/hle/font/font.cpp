@@ -13,8 +13,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "common/log.h"
@@ -90,11 +95,23 @@ struct FontState {
     CTFontRef sized = nullptr; // `base` at the current scale
     float sized_w = 0.0f, sized_h = 0.0f, sized_slant = 0.0f;
     float slant = 0.0f; // shear of sceFontSetEffectSlant
+    std::string name;   // PostScript name
 };
 
 std::mutex g_lock;
 alignas(64) u8 g_library[256];
 alignas(64) u8 g_renderer[256];
+std::map<std::string, CTFontRef> g_faces; // faces the game opened, by PostScript name
+
+// DC_LOG_FONT=1: reports each (face, code) the game asks for and that has no
+// glyph, once.
+void LogGlyphMiss(const FontState& f, u32 code) {
+    static const bool enabled = std::getenv("DC_LOG_FONT") != nullptr;
+    static std::set<std::pair<std::string, u32>> seen;
+    if (enabled && seen.insert({f.name, code}).second) {
+        DC_INFO("font: %s has no glyph for U+%04X", f.name.c_str(), code);
+    }
+}
 
 // The face at `w` x `h` pixels (em size), cached per font.
 CTFontRef Sized(FontState& f) {
@@ -211,18 +228,51 @@ s32 sceFontOpenFontMemory(void* lib, const void* data, u32 size, const void* par
         CFRelease(name);
     }
     DC_INFO("font: opened %s (%u bytes)", buf, size);
+    f->name = buf;
+    {
+        std::scoped_lock lk(g_lock);
+        if (g_faces.emplace(f->name, f->base).second) {
+            CFRetain(f->base); // the map outlives this handle
+        }
+    }
     *out = f;
     return 0;
 }
 
-// The system font sets belong to the firmware: a Mac face stands in for them.
+// The system font sets are the firmware's SST family. GT7 ships the same faces
+// and opens them from memory first, so a set resolves to one of those; the low
+// nibble of the type is the weight. Without them a Mac face stands in.
 s32 sceFontOpenFontSet(void* lib, u32 font_set_type, u32 open_mode, const void* detail, FontState** out) {
     if (!out) {
         return kErrorInvalidParameter;
     }
-    DC_INFO("font: system font set %#x -> Helvetica Neue", font_set_type);
+    const char* face = "SST-Roman";
+    switch (font_set_type & 0xF) {
+    case 3:
+        face = "SST-Light";
+        break;
+    case 5:
+        face = "SST-Medium";
+        break;
+    case 7:
+        face = "SST-Bold";
+        break;
+    default:
+        break;
+    }
     auto* f = new FontState;
-    f->base = CTFontCreateWithName(CFSTR("HelveticaNeue"), 16.0, nullptr);
+    {
+        std::scoped_lock lk(g_lock);
+        if (const auto it = g_faces.find(face); it != g_faces.end()) {
+            f->base = static_cast<CTFontRef>(CFRetain(it->second));
+            f->name = face;
+        }
+    }
+    if (!f->base) {
+        f->base = CTFontCreateWithName(CFSTR("HelveticaNeue"), 16.0, nullptr);
+        f->name = "HelveticaNeue";
+    }
+    DC_INFO("font: system font set %#x -> %s", font_set_type, f->name.c_str());
     *out = f;
     return 0;
 }
@@ -303,6 +353,7 @@ s32 sceFontGetCharGlyphMetrics(FontState* f, u32 code, GlyphMetrics* m) {
     CTFontRef font = Sized(*f);
     CGGlyph glyph;
     if (!GlyphFor(font, code, &glyph)) {
+        LogGlyphMiss(*f, code);
         *m = {};
         return kErrorNoSupportGlyph;
     }
@@ -354,11 +405,17 @@ s32 sceFontRenderCharGlyphImageHorizontal(FontState* f, u32 code, RenderSurface*
     CTFontRef font = Sized(*f);
     CGGlyph glyph;
     if (!GlyphFor(font, code, &glyph)) {
+        LogGlyphMiss(*f, code);
         *m = {};
         std::memset(out, 0, sizeof(*out));
         return kErrorNoSupportGlyph;
     }
     Metrics(font, glyph, m);
+    if (static const bool log = std::getenv("DC_LOG_GLYPHS") != nullptr; log) {
+        DC_INFO("font: render %s U+%04X scale %.1f at %.1f,%.1f surface %dx%d bpp %d stride %d scissor %u,%u-%u,%u box %.1fx%.1f",
+                f->name.c_str(), code, f->scale_h, x, y, s->width, s->height, s->pixel_size_byte, s->width_byte,
+                s->sc_x0, s->sc_y0, s->sc_x1, s->sc_y1, m->width, m->height);
+    }
 
     // Pixel box of the glyph relative to the integer pen position; the
     // fractional part of the pen position shifts the outline.
@@ -402,6 +459,14 @@ s32 sceFontRenderCharGlyphImageHorizontal(FontState* f, u32 code, RenderSurface*
         }
     }
 
+    if (static const bool log = std::getenv("DC_LOG_GLYPHS") != nullptr; log && s->buffer) {
+        u32 peak = 0, lit = 0;
+        for (s32 k = 0; k < s->width_byte * s->height; ++k) {
+            peak = std::max<u32>(peak, s->buffer[k]);
+            lit += s->buffer[k] != 0;
+        }
+        DC_INFO("font: wrote U+%04X to %p dest %d,%d glyph %dx%d peak %u lit %u", code, s->buffer, dest_x, dest_y, gw, gh, peak, lit);
+    }
     std::memset(out, 0, sizeof(*out));
     out->update_rect = {static_cast<u32>(std::max(ux0, 0)), static_cast<u32>(std::max(uy0, 0)),
                         static_cast<u32>(uw), static_cast<u32>(uh)};
