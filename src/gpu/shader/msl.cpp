@@ -1023,10 +1023,13 @@ void Emitter::EmitDs(const Inst& i) {
         Line(lane_guard + "{ " + at(off16) + " = " + VName(i.data0) + "; " + at(off16 + 4) + " = " + VName(i.data0 + 1u) + "; }");
         break;
     case Ds::DS_WRITE2_B64:
-        Line(lane_guard + "{ " + at(i.offset0 * 8) + " = " + VName(i.data0) + "; " + at(i.offset0 * 8 + 4) + " = " +
-             VName(i.data0 + 1u) + "; " + at(i.offset1 * 8) + " = " + VName(i.data1) + "; " + at(i.offset1 * 8 + 4) +
-             " = " + VName(i.data1 + 1u) + "; }");
+    case Ds::DS_WRITE2ST64_B64: {
+        const u32 scale = static_cast<Ds>(i.op) == Ds::DS_WRITE2ST64_B64 ? 512 : 8;
+        Line(lane_guard + "{ " + at(i.offset0 * scale) + " = " + VName(i.data0) + "; " + at(i.offset0 * scale + 4) +
+             " = " + VName(i.data0 + 1u) + "; " + at(i.offset1 * scale) + " = " + VName(i.data1) + "; " +
+             at(i.offset1 * scale + 4) + " = " + VName(i.data1 + 1u) + "; }");
         break;
+    }
     case Ds::DS_WRITE_B96:
     case Ds::DS_WRITE_B128: {
         const u32 n = static_cast<Ds>(i.op) == Ds::DS_WRITE_B96 ? 3 : 4;
@@ -1069,13 +1072,16 @@ void Emitter::EmitDs(const Inst& i) {
         break;
     }
     case Ds::DS_READ2_B64:
-        Line("{ uint r_[4] = {" + at(i.offset0 * 8) + ", " + at(i.offset0 * 8 + 4) + ", " + at(i.offset1 * 8) + ", " +
-             at(i.offset1 * 8 + 4) + "};");
+    case Ds::DS_READ2ST64_B64: {
+        const u32 scale = static_cast<Ds>(i.op) == Ds::DS_READ2ST64_B64 ? 512 : 8;
+        Line("{ uint r_[4] = {" + at(i.offset0 * scale) + ", " + at(i.offset0 * scale + 4) + ", " +
+             at(i.offset1 * scale) + ", " + at(i.offset1 * scale + 4) + "};");
         for (u32 k = 0; k < 4; ++k) {
             SetV(i.dst + k, "r_[" + N(k) + "]");
         }
         Line("}");
         break;
+    }
     case Ds::DS_READ_U8: SetV(i.dst, "uint(((threadgroup uchar*)lds)[" + a + " + " + N(off16) + "u])"); break;
     case Ds::DS_READ_I8: SetV(i.dst, "uint(int(((threadgroup char*)lds)[" + a + " + " + N(off16) + "u]))"); break;
     case Ds::DS_READ_U16:

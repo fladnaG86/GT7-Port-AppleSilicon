@@ -214,7 +214,8 @@ constexpr u16 Vgpr0 = 256;
     X(DS_ADD_RTN_U32, 32) X(DS_SWIZZLE_B32, 53) X(DS_READ_B32, 54) X(DS_READ2_B32, 55)             \
     X(DS_READ2ST64_B32, 56) X(DS_READ_I8, 57) X(DS_READ_U8, 58) X(DS_READ_I16, 59)                 \
     X(DS_READ_U16, 60) X(DS_CONSUME, 61) X(DS_APPEND, 62) X(DS_WRITE_B64, 77)                      \
-    X(DS_WRITE2_B64, 78) X(DS_READ_B64, 118) X(DS_READ2_B64, 119) X(DS_WRITE_B96, 222)             \
+    X(DS_WRITE2_B64, 78) X(DS_WRITE2ST64_B64, 79) X(DS_READ_B64, 118) X(DS_READ2_B64, 119)        \
+    X(DS_READ2ST64_B64, 120) X(DS_WRITE_B96, 222)                                                  \
     X(DS_WRITE_B128, 223) X(DS_READ_B96, 254) X(DS_READ_B128, 255)
 
 #define GCN_ENUM_ENTRY(name, value) name = value,

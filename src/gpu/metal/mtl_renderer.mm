@@ -2673,8 +2673,14 @@ struct MetalRenderer::Impl {
     }
     if (!storage && !fi.compressed) {
       // As shadPS4's image views: the T# format (same texel size) and swizzle.
-      if (RenderTarget *rt =
-              Latest(color_targets, addr, tt.dim, width, height)) {
+      RenderTarget *latest = Latest(color_targets, addr, tt.dim, width, height);
+      // Transient memory reused by a surface of another size and texel width
+      // is not this image (GT7's 720x540 16F over a 512x256 11F scratch).
+      if (latest && (latest->width != width || latest->height != height) && fi.bytes_per_block &&
+          PixelBytes(latest->tex.pixelFormat) != fi.bytes_per_block) {
+        latest = nullptr;
+      }
+      if (RenderTarget *rt = latest) {
         // An array read past the slices rendered so far: grow it (shadPS4 sizes
         // images from the T#), the new slices read as zero until written.
         if (tt.dim == TexDim::Tex2DArray &&
@@ -2940,12 +2946,16 @@ struct MetalRenderer::Impl {
         Tiling::DetileSlice(m.tile_index, src + group_offset, out,
                             w_el, h_el, m.pitch_el, fi.bytes_per_block,
                             l % level_thick);
-        if (dump_texture == addr && dump_frames && l == 0 &&
-            lv == 0) { // DC_DUMP_TEXTURE=<addr>: raw linear bytes
+        if (dump_texture == addr && dump_frames && lv == 0 &&
+            (trace_frame ? frame_count + 2 >= trace_frame && frame_count <= trace_frame + 2
+                         : l == 0)) { // DC_DUMP_TEXTURE=<addr>: raw linear bytes, each
+                                      // layer near DC_TRACE_FRAME, else layer 0
           char path[512];
-          std::snprintf(path, sizeof(path), "%s/tex_%llx_%ux%u_bpe%u_f%llu.raw",
+          std::snprintf(path, sizeof(path), "%s/tex_%llx_%ux%u_bpe%u_f%llu_l%u.raw",
                         dump_frames, addr, width_el, height_el,
-                        fi.bytes_per_block, frame_count);
+                        fi.bytes_per_block, frame_count, l);
+          DC_INFO("gpu: dump tex %llx layer %u pitch_el %u slice %llu tile %u", addr, l,
+                  m.pitch_el, static_cast<unsigned long long>(m.slice_size), m.tile_index);
           std::ofstream(path, std::ios::binary)
               .write(reinterpret_cast<const char *>(out), image);
         }
@@ -4580,8 +4590,32 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   // Without ES and GS the copy VS reads whatever earlier GS draws left in the
   // GSVS ring: valid clip positions, so stray primitives on screen. A draw that
   // was not emulated is skipped.
+  // DC_TRACE_RT=<hex target>,<draws>: trace the flip after the first one that
+  // draws that often into the target, for runs whose flip numbers vary.
+  static const u64 trace_rt =
+      std::getenv("DC_TRACE_RT") ? std::strtoull(std::getenv("DC_TRACE_RT"), nullptr, 16) : 0;
+  if (trace_rt && !trace_frame && (u64(r.ColorTarget(0, Reg::CB_BASE)) << 8) == trace_rt) {
+    static const u32 want = [] {
+      const char *c = std::strchr(std::getenv("DC_TRACE_RT"), ',');
+      return c ? u32(std::atoi(c + 1)) : 1u;
+    }();
+    static u64 seen_frame = 0;
+    static u32 seen = 0;
+    seen = seen_frame == frame_count ? seen + 1 : 1;
+    seen_frame = frame_count;
+    if (seen >= want) {
+      trace_frame = frame_count + 1;
+      DC_INFO("gpu: DC_TRACE_RT: tracing flip %llu", (unsigned long long)trace_frame);
+    }
+  }
+  if (trace) { // Which hardware stages this draw asks for, tessellation included.
+    DC_INFO("gpu: stages 0x%x prim %u count %u", r[Reg::VGT_SHADER_STAGES_EN],
+            static_cast<u32>(r.Primitive()), dc.count);
+  }
   if (r[Reg::VGT_SHADER_STAGES_EN] & 0x20) {
-    DrawGs(r, dc);
+    const bool drawn = DrawGs(r, dc);
+    if (trace && !drawn)
+      DC_INFO("gpu:   skipped: gs not emulated");
     return;
   }
   CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
