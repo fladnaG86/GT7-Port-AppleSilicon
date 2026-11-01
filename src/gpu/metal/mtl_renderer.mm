@@ -538,6 +538,7 @@ struct MetalRenderer::Impl {
     RenderTarget *view_of = nullptr; // sRGB/linear twin whose texture this views
     bool has_crops = false;          // a shorter T# reads it (see CropOf)
     u32 comp_swap = 0;               // CB_INFO.COMP_SWAP it was last bound with
+    bool three_channels = false;     // its format has no alpha (10_11_11, 11_11_10)
   };
   using TargetMap =
       std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
@@ -2721,7 +2722,11 @@ struct MetalRenderer::Impl {
           rt_swz = 0;
           for (u32 c = 0; c < 4; ++c) {
             u32 sel = (swz >> (3 * c)) & 7;
-            rt_swz |= (sel >= 4 ? 11 - sel : sel) << (3 * c);
+            if (rt->three_channels) { // the swap reverses three channels: R <-> B
+              rt_swz |= (sel == 4 ? 6 : sel == 6 ? 4 : sel) << (3 * c);
+            } else {
+              rt_swz |= (sel >= 4 ? 11 - sel : sel) << (3 * c);
+            }
           }
         }
         if (RenderTarget *crop = CropOf(*rt, tt, width, height, base_level, last_level)) {
@@ -4721,6 +4726,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       colors[k] = &ColorTargetFor(r, k);
       if (colors[k]->comp_swap != ColorInfo::CompSwap(info)) {
         colors[k]->comp_swap = ColorInfo::CompSwap(info);
+        colors[k]->three_channels = fmt == 6 || fmt == 7;
         ++texture_epoch; // T# selectors over it change meaning
       }
       color_fmt[k] = cf.format;
