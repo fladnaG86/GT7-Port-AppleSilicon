@@ -711,7 +711,13 @@ void Emitter::EmitVop(const Inst& i) {
     const std::string cin = " + (" + Mask(i.src[2]) + " ? 1ul : 0ul)";
     switch (static_cast<Vop>(i.op)) {
     // ---- VOP2 ----
-    case Vop::V_CNDMASK_B32: SetV(i.dst, "(" + Mask(i.src[2]) + " ? " + u(1) + " : " + u(0) + ")"); break;
+    case Vop::V_CNDMASK_B32:
+        if (i.abs || i.neg) { // GT7's inlined acos selects -x: modifiers apply to the operands
+            SetV(i.dst, "as_type<uint>(" + Mask(i.src[2]) + " ? " + f(1) + " : " + f(0) + ")");
+            break;
+        }
+        SetV(i.dst, "(" + Mask(i.src[2]) + " ? " + u(1) + " : " + u(0) + ")");
+        break;
     case Vop::V_READLANE_B32: SetS(i.dst, u(0)); break;
     case Vop::V_WRITELANE_B32: SetV(i.dst, u(0)); break;
     case Vop::V_ADD_F32: SetVF(i, f(0) + " + " + f(1)); break;
