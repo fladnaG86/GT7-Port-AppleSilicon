@@ -4714,6 +4714,38 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         }
       }
     }
+    // Tessellation pipeline (HS_EN): not drawn yet. Log what emulating it needs.
+    if (r[Reg::VGT_SHADER_STAGES_EN] & 0x4) {
+      const u64 ls = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_LS);
+      const u64 hs = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_HS);
+      const u32 config = r[Reg::VGT_LS_HS_CONFIG];
+      DC_INFO("gpu:   tess pipeline: ls=%#llx rsrc %#x %#x hs=%#llx rsrc %#x %#x vs rsrc2 %#x "
+              "config=%#x (patches %u cp in %u out %u) tf_param=%#x hos min %#x max %#x",
+              ls, r[Reg::SPI_SHADER_PGM_RSRC1_LS], r[Reg::SPI_SHADER_PGM_RSRC2_LS], hs,
+              r[Reg::SPI_SHADER_PGM_RSRC1_HS], r[Reg::SPI_SHADER_PGM_RSRC2_HS],
+              r[Reg::SPI_SHADER_PGM_RSRC2_VS], config, config & 0xFF, (config >> 8) & 0x3F,
+              (config >> 14) & 0x3F, r[Reg::VGT_TF_PARAM], r[Reg::VGT_HOS_MIN_TESS_LEVEL],
+              r[Reg::VGT_HOS_MAX_TESS_LEVEL]);
+      for (const auto &[name, ud0] : {std::pair{"ls", Reg::SPI_SHADER_USER_DATA_LS_0},
+                                      std::pair{"hs", Reg::SPI_SHADER_USER_DATA_HS_0}}) {
+        std::string w;
+        for (u32 k = 0; k < 16; ++k) {
+          char b[12];
+          std::snprintf(b, sizeof(b), " %08x", r[ud0 + k]);
+          w += b;
+        }
+        DC_INFO("gpu:   tess pipeline: %s user data%s", name, w.c_str());
+      }
+      for (const auto &[name, addr] : {std::pair{"ls", ls}, std::pair{"hs", hs}}) {
+        const auto *code = reinterpret_cast<const u32 *>(addr);
+        if (dump_dir && addr && Readable(addr, 4)) {
+          char path[512];
+          std::snprintf(path, sizeof(path), "%s/%s_%llx.bin", dump_dir, name, addr);
+          std::ofstream(path, std::ios::binary)
+              .write(reinterpret_cast<const char *>(code), Shader::Gcn::ProgramSize(code));
+        }
+      }
+    }
     if (r.ColorTarget(0, Reg::CB_VIEW)) {
       DC_INFO("gpu:   cb0 view=%#x attrib=%#x pitch=%#x slice=%#x",
               r.ColorTarget(0, Reg::CB_VIEW), r.ColorTarget(0, Reg::CB_ATTRIB),
