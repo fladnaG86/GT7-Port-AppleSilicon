@@ -571,6 +571,10 @@ struct MetalRenderer::Impl {
   // A target was written: Latest() picks the most recently written surface at
   // an address, so when several share one the answer changes. With one target
   // there it cannot, and the cache stays valid.
+  // Target address -> write_seq of a compute memset over it. GT7 clears transient
+  // images that way, and a host target there keeps the pixels of the last surface.
+  std::unordered_map<u64, u64> memory_fills;
+
   void NoteTargetWritten(const RenderTarget &rt) {
     auto c = color_targets.find(rt.addr);
     if (c == color_targets.end() || c->second.size() > 1) {
@@ -2673,11 +2677,14 @@ struct MetalRenderer::Impl {
     }
     if (!storage && !fi.compressed) {
       // As shadPS4's image views: the T# format (same texel size) and swizzle.
-      RenderTarget *latest = Latest(color_targets, addr, tt.dim, width, height);
-      // Transient memory reused by a surface of another size and texel width
-      // is not this image (GT7's 720x540 16F over a 512x256 11F scratch).
-      if (latest && (latest->width != width || latest->height != height) && fi.bytes_per_block &&
-          PixelBytes(latest->tex.pixelFormat) != fi.bytes_per_block) {
+      // Transient memory reused by a surface of another texel width is not this
+      // image, even at the same size: GT7's 720x540 16F over a 512x256 11F
+      // scratch, and its 1920x1080 16F half of a 1920x2160 target over an old
+      // 1920x1080 R16F, which read as flat red.
+      RenderTarget *latest = Latest(color_targets, addr, tt.dim, width, height, fi.bytes_per_block);
+      // Cleared through memory after that surface was written: memory is the image.
+      if (const auto fill = memory_fills.find(addr);
+          latest && fill != memory_fills.end() && fill->second > latest->written) {
         latest = nullptr;
       }
       if (RenderTarget *rt = latest) {
@@ -3053,10 +3060,11 @@ struct MetalRenderer::Impl {
 
   // The variant at `addr` written last; with a size, the last one of that size
   // if there is one (aliased memory holds surfaces of several sizes, and a T#
-  // means the one matching its own extent, like shadPS4's image lookup).
+  // means the one matching its own extent, like shadPS4's image lookup). With
+  // texel_bytes, variants of another texel width are ignored.
   static RenderTarget *Latest(TargetMap &map, u64 addr,
                               std::optional<TexDim> dim = std::nullopt,
-                              u32 width = 0, u32 height = 0) {
+                              u32 width = 0, u32 height = 0, u32 texel_bytes = 0) {
     auto it = map.find(addr);
     if (it == map.end()) {
       return nullptr;
@@ -3065,6 +3073,9 @@ struct MetalRenderer::Impl {
     RenderTarget *sized = nullptr;
     for (auto &t : it->second) {
       if (dim && t->dim != *dim) {
+        continue;
+      }
+      if (texel_bytes && PixelBytes(t->tex.pixelFormat) != texel_bytes) {
         continue;
       }
       if (!best || t->written > best->written) {
@@ -5717,6 +5728,14 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   const u32 tx = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_X] & 0xFFFF);
   const u32 ty = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Y] & 0xFFFF);
   const u32 tz = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Z] & 0xFFFF);
+  // Memset shape: 256 threads in one line, destination V# of dwords in user data.
+  if (tx == 256 && ty == 1 && tz == 1 && gy == 1 && gz == 1 && ((ud[1] >> 16) & 0x3FFF) == 4) {
+    const u64 dst = ud[0] | (u64(ud[1] & 0xFFF) << 32);
+    if (color_targets.count(dst)) {
+      memory_fills[dst] = ++write_seq;
+      ++texture_epoch;
+    }
+  }
   if (trace) {
     DC_INFO("gpu: dispatch q%u cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x "
             "ud=%08x %08x %08x %08x %08x %08x %08x "
