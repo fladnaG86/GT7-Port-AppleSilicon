@@ -6063,6 +6063,44 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     [[MTLCaptureManager sharedCaptureManager] stopCapture];
     DC_INFO("gpu: captured dispatch cs %#llx", addr);
   }
+  // GT7 reads back what the GPU writes into its CPU pools (from 0xe000000000,
+  // ryGT7 FIX-213): a linear storage image there must reach guest memory.
+  static const bool cpu_readback = std::getenv("DC_NO_CPU_READBACK") == nullptr;
+  for (u32 k = 0; cpu_readback && k < res.tex.size() && k < tsharps_.size(); ++k) {
+    const u32 *t = tsharps_[k].data();
+    const u64 base = ((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
+    id<MTLTexture> tex = res.tex[k];
+    if (!cs->images[k].storage || base < 0xe000000000ull || ((t[3] >> 20) & 0x1F) != 8 ||
+        tex.textureType != MTLTextureType2D) {
+      continue;
+    }
+    const u32 row = (((t[4] >> 13) & 0x3FFF) + 1) * PixelBytes(tex.pixelFormat);
+    const u32 size = row * u32(tex.height);
+    if (!row || !Readable(base, size)) {
+      continue;
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBuffer> out = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    [b copyFromTexture:tex
+                 sourceSlice:0
+                 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0, 0, 0)
+                  sourceSize:MTLSizeMake(tex.width, tex.height, 1)
+                    toBuffer:out
+           destinationOffset:0
+      destinationBytesPerRow:row
+    destinationBytesPerImage:size];
+    [b endEncoding];
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      std::memcpy(reinterpret_cast<void *>(base), out.contents, size);
+    }];
+    if (trace) {
+      DC_INFO("gpu:   readback %ux%u to guest %#llx", u32(tex.width), u32(tex.height),
+              (unsigned long long)base);
+    }
+  }
   if (dump_passes && trace && dump_frames) {
     u32 n = 0;
     for (u32 k = 0; k < res.tex.size() && n < 8; ++k) {
