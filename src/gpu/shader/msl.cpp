@@ -879,6 +879,10 @@ void Emitter::EmitVop(const Inst& i) {
         break;
     case Vop::V_MOV_B32:
     case Vop::V_MOV_FED_B32:
+        if (i.abs || i.neg) { // VOP3 form: `v_mov_b32 v8, -v1`
+            SetV(i.dst, "as_type<uint>(" + f(0) + ")");
+            break;
+        }
         SetV(i.dst, u(0));
         break;
     case Vop::V_READFIRSTLANE_B32:

@@ -108,6 +108,14 @@ public:
                 Set(i.dst, {SgprSource::Constant, 0, v});
                 return;
             }
+            if (u32 v; op == Sop1::S_BREV_B32 && ImmediateOf(i, i.src[0], &v)) {
+                u32 r = 0;
+                for (u32 b = 0; b < 32; ++b) {
+                    r |= ((v >> b) & 1u) << (31u - b);
+                }
+                Set(i.dst, {SgprSource::Constant, 0, r});
+                return;
+            }
             Clobber(i.dst, Width(i));
             return;
         }
@@ -116,6 +124,11 @@ public:
             if (u32 a, b; static_cast<Sop2>(i.op) == Sop2::S_BFM_B32 &&
                           ImmediateOf(i, i.src[0], &a) && ImmediateOf(i, i.src[1], &b)) {
                 Set(i.dst, {SgprSource::Constant, 0, ((1u << (a & 31u)) - 1u) << (b & 31u)});
+                return;
+            }
+            if (u32 a, b; static_cast<Sop2>(i.op) == Sop2::S_LSHL_B32 &&
+                          ImmediateOf(i, i.src[0], &a) && ImmediateOf(i, i.src[1], &b)) {
+                Set(i.dst, {SgprSource::Constant, 0, a << (b & 31u)});
                 return;
             }
             Clobber(i.dst, Width(i));
