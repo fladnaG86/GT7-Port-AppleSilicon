@@ -28,6 +28,7 @@ struct SgprSource {
         UserData,    // user SGPR `ud`
         PointerLoad, // dword at (64-bit pointer in user SGPRs ud, ud+1) + offset
         BufferLoad,  // dword at V#(user SGPRs ud..ud+3).base + offset
+        Constant,    // `offset` is the value: built by the shader's own code
     };
     Kind kind = Unknown;
     u8 ud = 0;

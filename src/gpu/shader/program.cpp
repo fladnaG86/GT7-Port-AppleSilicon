@@ -104,15 +104,29 @@ public:
                 Set(i.dst + 1u, b);
                 return;
             }
+            if (u32 v; op == Sop1::S_MOV_B32 && ImmediateOf(i, i.src[0], &v)) {
+                Set(i.dst, {SgprSource::Constant, 0, v});
+                return;
+            }
             Clobber(i.dst, Width(i));
             return;
         }
         case Enc::SOP2:
+            // A sampler built in the shader (GT7's fog) writes LOD masks this way.
+            if (u32 a, b; static_cast<Sop2>(i.op) == Sop2::S_BFM_B32 &&
+                          ImmediateOf(i, i.src[0], &a) && ImmediateOf(i, i.src[1], &b)) {
+                Set(i.dst, {SgprSource::Constant, 0, ((1u << (a & 31u)) - 1u) << (b & 31u)});
+                return;
+            }
             Clobber(i.dst, Width(i));
             return;
         case Enc::SOPK:
             if (i.op >= static_cast<u16>(Sopk::S_CMPK_EQ_I32) && i.op <= static_cast<u16>(Sopk::S_CMPK_LE_U32)) {
                 return; // compares write SCC only
+            }
+            if (static_cast<Sopk>(i.op) == Sopk::S_MOVK_I32) {
+                Set(i.dst, {SgprSource::Constant, 0, static_cast<u32>(static_cast<s32>(i.simm16))});
+                return;
             }
             Clobber(i.dst, 1);
             return;
@@ -136,6 +150,20 @@ public:
     }
 
 private:
+    // An integer inline constant (128..192 = 0..64, 193..208 = -1..-16) or literal.
+    static bool ImmediateOf(const Inst& i, u16 code, u32* value) {
+        if (code == Operand::Literal) {
+            *value = i.literal;
+        } else if (code >= 128 && code <= 192) {
+            *value = code - 128u;
+        } else if (code >= 193 && code <= 208) {
+            *value = static_cast<u32>(192 - static_cast<s32>(code));
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     // Scalar registers an SALU instruction writes: two for the 64-bit forms.
     static u32 Width(const Inst& i) {
         const char* n = OpName(i.enc, i.op);
@@ -929,6 +957,8 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
     switch (src.kind) {
     case SgprSource::UserData:
         return ud[src.ud];
+    case SgprSource::Constant:
+        return src.offset;
     case SgprSource::PointerLoad: {
         const u64 base = (u64(ud[src.ud]) | (u64(ud[src.ud + 1]) << 32)) & 0xFFFFFFFFFFFFull;
         const u64 addr = base + src.offset;
