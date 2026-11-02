@@ -991,6 +991,13 @@ void Emitter::EmitDs(const Inst& i) {
             return;
         }
     }
+    if (static_cast<Ds>(i.op) == Ds::DS_SWIZZLE_B32 && p.stage == Stage::Compute) {
+        // Reads another lane of the wave (GT7's bloom sums a 2x2 of lanes). Metal
+        // threads have no such lanes, so each keeps its own value: same mean,
+        // less filtering. Skipping it left stale registers in the sum.
+        SetV(i.dst, VName(i.vaddr));
+        return;
+    }
     if (p.stage != Stage::Compute) {
         Unsupported(i);
         return;
