@@ -2742,8 +2742,10 @@ struct MetalRenderer::Impl {
                           view_fmt, base_array, slice_count, rt_swz);
       }
       if (tt.dim == TexDim::Tex2D) {
-        if (RenderTarget *rt =
-                Latest(depth_targets, addr, tt.dim, width, height)) {
+        // As for color above: scratch memory once used by a depth surface of
+        // another size is not this image (GT7's 720x540 over a 1024x512 depth).
+        RenderTarget *rt = Latest(depth_targets, addr, tt.dim, width, height);
+        if (rt && rt->width == width && rt->height == height) {
           return swz == kIdentitySwizzle
                      ? rt->tex
                      : TargetView(*rt, 0, rt->levels, MTLPixelFormatInvalid, 0,
