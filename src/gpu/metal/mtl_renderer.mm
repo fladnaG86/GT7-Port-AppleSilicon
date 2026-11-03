@@ -1530,6 +1530,155 @@ struct MetalRenderer::Impl {
     }];
   }
 
+  // DC_DUMP_BOUND=<hex addr>[,<slices>]: in a traced flip, the texture bound for
+  // that address (render target, storage or upload) is read back once: per-channel
+  // mean and max of every slice, and the first slices of level 0 as PPMs
+  // (tonemapped x/(1+x)) into DC_DUMP_FRAMES. To see whether lighting inputs
+  // such as GT7's light probe atlases hold anything.
+  std::set<u64> dumped_bound;
+  static float Half(u16 h) {
+    const u32 s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    const float v = e == 0 ? std::ldexp(float(m), -24)
+                    : e == 31 ? (m ? NAN : INFINITY)
+                              : std::ldexp(float(m | 0x400), int(e) - 25);
+    return s ? -v : v;
+  }
+  static float Small(u32 bits, u32 mbits) { // unsigned 11/10-bit float, 5-bit exponent
+    const u32 e = bits >> mbits, m = bits & ((1u << mbits) - 1);
+    if (e == 31) {
+      return m ? NAN : INFINITY;
+    }
+    return e == 0 ? std::ldexp(float(m), -14 - int(mbits))
+                  : std::ldexp(float(m | (1u << mbits)), int(e) - 15 - int(mbits));
+  }
+  void DumpBound(id<MTLTexture> tex, u64 addr) {
+    // <addr>[+<addr>...][,<slices>]
+    static const std::pair<std::vector<u64>, u32> want = [] {
+      std::pair<std::vector<u64>, u32> p{{}, 6};
+      if (const char *e = std::getenv("DC_DUMP_BOUND")) {
+        char *q = const_cast<char *>(e);
+        do {
+          p.first.push_back(std::strtoull(q, &q, 16) & kGpuAddrMask);
+        } while (*q == '+' && *++q);
+        if (*q == ',') {
+          p.second = u32(std::strtoul(q + 1, nullptr, 10));
+        }
+      }
+      return p;
+    }();
+    if (!tex || std::find(want.first.begin(), want.first.end(), addr & kGpuAddrMask) ==
+                    want.first.end() ||
+        !dumped_bound.insert((addr & kGpuAddrMask) ^ (frame_count << 48)).second) {
+      return;
+    }
+    const MTLPixelFormat f = tex.pixelFormat;
+    const u32 bpp = f == MTLPixelFormatRGBA16Float ? 8
+                    : (f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGBA8Unorm ||
+                       f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatR32Float)
+                        ? 4
+                        : 0;
+    if (!bpp) {
+      DC_INFO("gpu: dump bound %#llx: format %lu not handled", (unsigned long long)addr,
+              (unsigned long)f);
+      return;
+    }
+    const u32 w = u32(tex.width), h = u32(tex.height);
+    const u32 slices = tex.textureType == MTLTextureType2DArray ||
+                               tex.textureType == MTLTextureTypeCubeArray ||
+                               tex.textureType == MTLTextureTypeCube
+                           ? u32(tex.arrayLength) * (tex.textureType == MTLTextureType2DArray ? 1 : 6)
+                           : 1;
+    const u64 slice_bytes = u64(w) * h * bpp;
+    id<MTLBuffer> b = [device newBufferWithLength:slice_bytes * slices
+                                          options:MTLResourceStorageModeShared];
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> e = [cmd blitCommandEncoder];
+    for (u32 s = 0; s < slices; ++s) {
+      [e copyFromTexture:tex sourceSlice:s sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:slice_bytes * s
+          destinationBytesPerRow:w * bpp destinationBytesPerImage:slice_bytes];
+    }
+    [e endEncoding];
+    const std::string dir = dump_frames ? dump_frames : ".";
+    const u64 frame = frame_count;
+    const u32 nfiles = want.second;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      auto texel = [&](const u8 *p, float out[4]) {
+        if (f == MTLPixelFormatRGBA16Float) {
+          const u16 *q = reinterpret_cast<const u16 *>(p);
+          for (int c = 0; c < 4; ++c) out[c] = Half(q[c]);
+        } else if (f == MTLPixelFormatRG11B10Float) {
+          u32 v;
+          std::memcpy(&v, p, 4);
+          out[0] = Small(v & 0x7FF, 6);
+          out[1] = Small((v >> 11) & 0x7FF, 6);
+          out[2] = Small(v >> 22, 5);
+          out[3] = 1;
+        } else if (f == MTLPixelFormatR32Float) {
+          std::memcpy(&out[0], p, 4);
+          out[1] = out[2] = out[0];
+          out[3] = 1;
+        } else {
+          const bool bgra = f == MTLPixelFormatBGRA8Unorm;
+          out[0] = p[bgra ? 2 : 0] / 255.0f;
+          out[1] = p[1] / 255.0f;
+          out[2] = p[bgra ? 0 : 2] / 255.0f;
+          out[3] = p[3] / 255.0f;
+        }
+      };
+      double all[4] = {}, amax[4] = {};
+      u32 nonzero_slices = 0;
+      for (u32 s = 0; s < slices; ++s) {
+        const u8 *base = static_cast<const u8 *>(b.contents) + slice_bytes * s;
+        double sum[4] = {}, mx[4] = {};
+        std::vector<u8> img;
+        const bool write = s < nfiles;
+        if (write) {
+          img.resize(u64(w) * h * 3);
+        }
+        for (u64 i = 0; i < u64(w) * h; ++i) {
+          float t[4];
+          texel(base + i * bpp, t);
+          for (int c = 0; c < 4; ++c) {
+            const double v = std::isfinite(t[c]) ? t[c] : 0.0;
+            sum[c] += v;
+            mx[c] = std::max(mx[c], v);
+          }
+          if (write) {
+            for (int c = 0; c < 3; ++c) {
+              const float v = std::isfinite(t[c]) && t[c] > 0 ? t[c] : 0.0f;
+              img[i * 3 + c] = u8(std::min(255.0f, 255.0f * v / (1.0f + v)));
+            }
+          }
+        }
+        const double n = double(w) * h;
+        nonzero_slices += mx[0] + mx[1] + mx[2] > 0;
+        for (int c = 0; c < 4; ++c) {
+          all[c] += sum[c] / n / slices;
+          amax[c] = std::max(amax[c], mx[c]);
+        }
+        if (write) {
+          DC_INFO("gpu: dump bound %#llx flip %llu slice %u: mean %.4g %.4g %.4g %.4g max %.4g %.4g %.4g",
+                  (unsigned long long)addr, (unsigned long long)frame, s, sum[0] / n, sum[1] / n,
+                  sum[2] / n, sum[3] / n, mx[0], mx[1], mx[2]);
+          char path[512];
+          std::snprintf(path, sizeof(path), "%s/bound_%llx_f%llu_s%u.ppm", dir.c_str(),
+                        (unsigned long long)addr, (unsigned long long)frame, s);
+          if (FILE *fp = std::fopen(path, "wb")) {
+            std::fprintf(fp, "P6\n%u %u\n255\n", w, h);
+            std::fwrite(img.data(), 1, img.size(), fp);
+            std::fclose(fp);
+          }
+        }
+      }
+      DC_INFO("gpu: dump bound %#llx flip %llu: %ux%u fmt %lu, %u slices, %u not black, "
+              "mean %.4g %.4g %.4g max %.4g %.4g %.4g",
+              (unsigned long long)addr, (unsigned long long)frame, w, h, (unsigned long)f, slices,
+              nonzero_slices, all[0], all[1], all[2], amax[0], amax[1], amax[2]);
+    }];
+  }
+
   // ZStat for 32-bit float depth, every slice of an array (shadow cascades).
   // DC_ZSTAT_UV=u,v also prints the texel there in each slice.
   void ZStat32(RenderTarget &z, u64 draws) {
@@ -4028,6 +4177,7 @@ struct MetalRenderer::Impl {
                 (unsigned long)tex.mipmapLevelCount,
                 (unsigned long)tex.pixelFormat, t[5] & 0x1FFF,
                 (t[5] >> 13) & 0x1FFF);
+        DumpBound(tex, (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8);
       }
       if (img.compare && img.has_sampler &&
           img.sampler_index < ssharps_.size()) {
