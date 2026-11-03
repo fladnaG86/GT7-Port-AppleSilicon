@@ -22,6 +22,8 @@ namespace Gpu::Shader {
 
 enum class Stage : u8 { Vertex, Fragment, Compute };
 
+struct SgprExpr;
+
 struct SgprSource {
     enum Kind : u8 {
         Unknown,
@@ -29,12 +31,21 @@ struct SgprSource {
         PointerLoad, // dword at (64-bit pointer in user SGPRs ud, ud+1) + offset
         BufferLoad,  // dword at V#(user SGPRs ud..ud+3).base + offset
         Constant,    // `offset` is the value: built by the shader's own code
+        Computed,    // `expr` of other sources: a descriptor patched by the shader
     };
     Kind kind = Unknown;
     u8 ud = 0;
     u32 offset = 0; // bytes
+    std::shared_ptr<const SgprExpr> expr = {};
 
     bool operator==(const SgprSource&) const = default;
+};
+
+// GT7's cube filter loads a T# and rewrites its type and depth before a store.
+struct SgprExpr {
+    enum Op : u8 { And, Or, Add, Mul, Bfe, Lshl, Lshr };
+    Op op = And;
+    SgprSource a, b;
 };
 
 // A fetch-subroutine buffer load indexed by the vertex index (v0): the host

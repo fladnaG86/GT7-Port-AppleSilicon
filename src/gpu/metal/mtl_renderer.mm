@@ -459,8 +459,11 @@ struct MetalRenderer::Impl {
     u64 color[8] = {};
     u32 slice[8] = {};
     u64 depth = 0;
+    u32 depth_slice = 0;
+    u32 layers = 0;
     bool operator==(const PassState &) const = default;
   } pass;
+  u32 draw_layers = 0; // slices the VS of the current draw picks among; 0 = one
   u32 pass_width = 0, pass_height = 0;
   std::vector<id<MTLBuffer>> chunks;
   id<MTLBuffer> chunk = nil;
@@ -2831,8 +2834,8 @@ struct MetalRenderer::Impl {
       target.clear_pending = false;
       target.written = ++write_seq;
       NoteTargetWritten(target);
-      return TargetView(target, base_level, 1, MTLPixelFormatInvalid,
-                        base_array, slice_count);
+      return TargetView(target, base_level, last_level + 1 - base_level,
+                        MTLPixelFormatInvalid, base_array, slice_count);
     }
 
     if (fi.format == MTLPixelFormatInvalid || fi.gpu_only) {
@@ -3108,7 +3111,8 @@ struct MetalRenderer::Impl {
       d.textureType = MTLTextureType2DArray;
       d.arrayLength = std::max(depth_or_layers, 1u);
       d.usage = depth
-                    ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                    ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+                          MTLTextureUsagePixelFormatView
                     : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                           MTLTextureUsageShaderWrite |
                           MTLTextureUsagePixelFormatView;
@@ -3547,7 +3551,7 @@ struct MetalRenderer::Impl {
         ++texture_epoch; // its crops go stale: the next bind copies them again
       }
       rp.colorAttachments[k].texture = rt.tex;
-      rp.colorAttachments[k].slice = rt.bind_slice;
+      rp.colorAttachments[k].slice = draw_layers ? 0 : rt.bind_slice;
       rp.colorAttachments[k].level = rt.bind_level;
       rp.colorAttachments[k].loadAction = rt.initialized && !rt.clear_pending
                                               ? MTLLoadActionLoad
@@ -3569,7 +3573,9 @@ struct MetalRenderer::Impl {
     if (depth) {
       const bool clear =
           clear_depth || depth->clear_pending || !depth->initialized;
+      const u32 depth_slice = draw_layers ? 0 : depth->bind_slice;
       rp.depthAttachment.texture = depth->tex;
+      rp.depthAttachment.slice = depth_slice;
       rp.depthAttachment.loadAction =
           clear ? MTLLoadActionClear : MTLLoadActionLoad;
       rp.depthAttachment.clearDepth = clear_depth ? depth_value
@@ -3581,6 +3587,7 @@ struct MetalRenderer::Impl {
         const bool sclear =
             clear_stencil || depth->clear_pending || !depth->initialized;
         rp.stencilAttachment.texture = depth->tex;
+        rp.stencilAttachment.slice = depth_slice;
         rp.stencilAttachment.loadAction =
             sclear ? MTLLoadActionClear : MTLLoadActionLoad;
         rp.stencilAttachment.clearStencil = clear_stencil ? stencil_value
@@ -3593,8 +3600,13 @@ struct MetalRenderer::Impl {
       depth->clear_pending = false;
       depth->written = seq;
       ps.depth = reinterpret_cast<u64>(depth);
+      ps.depth_slice = depth->bind_slice;
       w = std::min(w, depth->width);
       h = std::min(h, depth->height);
+    }
+    if (draw_layers) {
+      rp.renderTargetArrayLength = draw_layers;
+      ps.layers = draw_layers;
     }
     pass_width = w;
     pass_height = h;
@@ -3948,7 +3960,8 @@ struct MetalRenderer::Impl {
     }
     RenderTarget &rt = array
                            ? GetColorTarget(base, cf.format, width, height, 1,
-                                            TexDim::Tex2DArray, slice_start + 1)
+                                            TexDim::Tex2DArray,
+                                            std::max(slice_start, slice_max) + 1)
                            : GetColorTarget(base, cf.format, width, height);
     rt.bind_slice = array ? slice_start : 0;
     rt.bind_level = 0;
@@ -4622,8 +4635,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
   }
   if (trace) { // Which hardware stages this draw asks for, tessellation included.
-    DC_INFO("gpu: stages 0x%x prim %u count %u", r[Reg::VGT_SHADER_STAGES_EN],
-            static_cast<u32>(r.Primitive()), dc.count);
+    DC_INFO("gpu: stages 0x%x prim %u count %u cb_view %#x db_view %#x pos_format %#x vs_out %#x",
+            r[Reg::VGT_SHADER_STAGES_EN], static_cast<u32>(r.Primitive()), dc.count,
+            r.ColorTarget(0, Reg::CB_VIEW), r[Reg::DB_DEPTH_VIEW],
+            r[Reg::SPI_SHADER_POS_FORMAT], r[Reg::PA_CL_VS_OUT_CNTL]);
   }
   if (r[Reg::VGT_SHADER_STAGES_EN] & 0x20) {
     const bool drawn = DrawGs(r, dc);
@@ -4858,7 +4873,19 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
                 : zfmt == 1   ? MTLPixelFormatDepth16Unorm
                               : MTLPixelFormatDepth32Float;
     if (zbase && w && h) {
-      depth = &GetDepthTarget(zbase, depth_fmt, w, h);
+      // DB_DEPTH_VIEW: like CB_COLOR_VIEW, a cube or a set of shadow cascades.
+      const u32 first = r[Reg::DB_DEPTH_VIEW] & 0x7FF,
+                last = (r[Reg::DB_DEPTH_VIEW] >> 13) & 0x7FF;
+      bool array = first || last;
+      if (!array) {
+        if (RenderTarget *a = Latest(depth_targets, zbase, TexDim::Tex2DArray)) {
+          array = a->width == w && a->height == h && a->tex.pixelFormat == depth_fmt;
+        }
+      }
+      depth = array ? &GetTarget(depth_targets, zbase, depth_fmt, w, h, true, 1,
+                                 TexDim::Tex2DArray, std::max(first, last) + 1)
+                    : &GetDepthTarget(zbase, depth_fmt, w, h);
+      depth->bind_slice = array ? first : 0;
       DepthFromColor(*depth);
       depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
       depth->clear_stencil = r[Reg::DB_STENCIL_CLEAR] & 0xFF;
@@ -4875,13 +4902,43 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     return;
   }
 
+  // PA_CL_VS_OUT_CNTL.USE_VTX_RENDER_TARGET_INDX: the VS picks the slice of the
+  // view, a cube face for instance. Metal needs every attachment layered.
+  struct LayerScope {
+    u32 &v;
+    ~LayerScope() { v = 0; }
+  } layer_scope{draw_layers};
+  if ((r[Reg::PA_CL_VS_OUT_CNTL] >> 18) & 1) {
+    u32 layers = ~0u;
+    for (u32 k = 0; k < 8; ++k) {
+      if (!colors[k]) {
+        continue;
+      }
+      const u32 view = r.ColorTarget(k, Reg::CB_VIEW);
+      const u32 first = view & 0x7FF, last = (view >> 13) & 0x7FF;
+      layers = colors[k]->tex.textureType == MTLTextureType2DArray && !first
+                   ? std::min<u32>({layers, last + 1,
+                                    u32(colors[k]->tex.arrayLength)})
+                   : 0;
+    }
+    if (depth) {
+      const u32 first = r[Reg::DB_DEPTH_VIEW] & 0x7FF,
+                last = (r[Reg::DB_DEPTH_VIEW] >> 13) & 0x7FF;
+      layers = depth->tex.textureType == MTLTextureType2DArray && !first
+                   ? std::min<u32>({layers, last + 1, u32(depth->tex.arrayLength)})
+                   : 0;
+    }
+    draw_layers = layers != ~0u && layers > 1 ? layers : 0;
+  }
   PassState want;
+  want.layers = draw_layers;
   for (u32 k = 0; k < 8; ++k) {
     want.color[k] = reinterpret_cast<u64>(colors[k]);
     want.slice[k] =
         colors[k] ? colors[k]->bind_slice | (colors[k]->bind_level << 24) : 0;
   }
   want.depth = reinterpret_cast<u64>(depth);
+  want.depth_slice = depth ? depth->bind_slice : 0;
   if ((depth_clear || (stencil_clear && stencil_valid)) && depth) {
     // The draw only exists to clear depth and/or stencil.
     depth->bounds_seq = 0;
@@ -5027,7 +5084,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
     id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
     [b copyFromTexture:depth->tex
-             sourceSlice:0
+             sourceSlice:depth->bind_slice
              sourceLevel:0
                toTexture:depth->bounds_copy
         destinationSlice:0
@@ -5065,6 +5122,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.rect_list = rect;
   vo.points = prim == PrimType::PointList;
   vo.vtx_point_size = vo.points && (r[Reg::PA_CL_VS_OUT_CNTL] & 1);
+  vo.vtx_layer = draw_layers != 0;
   const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
@@ -5141,7 +5199,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
   }
   vs_key = Hash(rect, vs_key);
-  vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1), vs_key);
+  // A layered pipeline states its topology class, so that goes in the key too.
+  const MTLPrimitiveTopologyClass layer_topology =
+      prim == PrimType::PointList ? MTLPrimitiveTopologyClassPoint
+      : prim == PrimType::LineList || prim == PrimType::LineStrip
+          ? MTLPrimitiveTopologyClassLine
+          : MTLPrimitiveTopologyClassTriangle;
+  vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1) |
+                    (u32(vo.vtx_layer) << 2) |
+                    (vo.vtx_layer ? u32(layer_topology) << 3 : 0),
+                vs_key);
   vs_key = Hash(capture, vs_key);
   vs_key = Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), vs_key);
   u64 ps_key = 0;
@@ -5222,6 +5289,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   if (pit == pipelines.end()) {
     if (!pending.count(pkey)) {
       MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+      if (vo.vtx_layer) {
+        d.inputPrimitiveTopology = layer_topology;
+      }
       if (nvbufs) {
         MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
         for (u32 k = 0; k < nvbufs; ++k) {

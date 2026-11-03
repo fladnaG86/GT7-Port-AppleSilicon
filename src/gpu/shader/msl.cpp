@@ -1380,7 +1380,12 @@ void Emitter::EmitImage(const Inst& i) {
         } else {
             value = std::string(vec) + "(uint4(" + comps[0] + ", " + comps[1] + ", " + comps[2] + ", " + comps[3] + "))";
         }
-        Line((guard ? "if (exec_lo != 0u) " : "") + t + ".write(" + value + ", " + int_coord(i.vaddr) + ");");
+        // IMAGE_STORE_MIP: the level follows the coordinates; the view covers them.
+        const std::string lod =
+            op == Mimg::IMAGE_STORE_MIP
+                ? ", " + VName(i.vaddr + (tt.dim == TexDim::Tex2D ? 2u : 3u))
+                : "";
+        Line((guard ? "if (exec_lo != 0u) " : "") + t + ".write(" + value + ", " + int_coord(i.vaddr) + lod + ");");
         return;
     }
     if (op == Mimg::IMAGE_LOAD || op == Mimg::IMAGE_LOAD_MIP) {
@@ -1525,8 +1530,13 @@ void Emitter::EmitExp(const Inst& i) {
         }
         if (i.target == ExpTarget::Pos0) {
             Line("out.pos = " + value + ";");
-        } else if (i.target == ExpTarget::Pos0 + 1 && o.points && o.vtx_point_size) {
-            Line("out.psize = " + value + ".x;");
+        } else if (i.target == ExpTarget::Pos0 + 1) {
+            if (o.points && o.vtx_point_size) {
+                Line("out.psize = " + value + ".x;");
+            }
+            if (o.vtx_layer && (i.en & 4)) { // an integer, not a float, in the z channel
+                Line("out.layer = " + VName(i.vsrc[2]) + ";");
+            }
         } else if (i.target >= ExpTarget::Param0) {
             Line("out.p" + N(i.target - ExpTarget::Param0) + " = " + value + ";");
         }
@@ -1919,6 +1929,9 @@ std::string Emitter::Run() {
         src += "struct VsOut {\n    float4 pos [[position]];\n";
         if (o.points) {
             src += "    float psize [[point_size]];\n";
+        }
+        if (o.vtx_layer) {
+            src += "    uint layer [[render_target_array_index]];\n";
         }
         for (u32 k = 0; k < 32; ++k) {
             if (p.param_mask & (1u << k)) {

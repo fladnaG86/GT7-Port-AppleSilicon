@@ -1,3 +1,4 @@
+#include <optional>
 #include "gpu/shader/program.h"
 
 #include <algorithm>
@@ -131,6 +132,15 @@ public:
                 Set(i.dst, {SgprSource::Constant, 0, a << (b & 31u)});
                 return;
             }
+            if (const auto op = ExprOp(static_cast<Sop2>(i.op))) {
+                const SgprSource a = Source(i, i.src[0]), b = Source(i, i.src[1]);
+                if (a.kind != SgprSource::Unknown && b.kind != SgprSource::Unknown) {
+                    SgprSource s{SgprSource::Computed};
+                    s.expr = std::make_shared<const SgprExpr>(SgprExpr{*op, a, b});
+                    Set(i.dst, s);
+                    return;
+                }
+            }
             Clobber(i.dst, Width(i));
             return;
         case Enc::SOPK:
@@ -152,6 +162,7 @@ public:
                     Clobber(i.sdst, 2);
                 }
             }
+            Clobber(kVccLo, 2); // VOPC and carries write it implicitly
             if (static_cast<Vop>(i.op) == Vop::V_READFIRSTLANE_B32 ||
                 static_cast<Vop>(i.op) == Vop::V_READLANE_B32) {
                 Clobber(i.dst);
@@ -163,6 +174,29 @@ public:
     }
 
 private:
+    static constexpr u32 kVccLo = 106; // compilers use it as a scratch pair
+
+    static std::optional<SgprExpr::Op> ExprOp(Sop2 op) {
+        switch (op) {
+        case Sop2::S_AND_B32: return SgprExpr::And;
+        case Sop2::S_OR_B32: return SgprExpr::Or;
+        case Sop2::S_ADD_I32:
+        case Sop2::S_ADD_U32: return SgprExpr::Add;
+        case Sop2::S_MUL_I32: return SgprExpr::Mul;
+        case Sop2::S_BFE_U32: return SgprExpr::Bfe;
+        case Sop2::S_LSHL_B32: return SgprExpr::Lshl;
+        case Sop2::S_LSHR_B32: return SgprExpr::Lshr;
+        default: return std::nullopt;
+        }
+    }
+
+    SgprSource Source(const Inst& i, u16 code) const {
+        if (u32 v; ImmediateOf(i, code, &v)) {
+            return {SgprSource::Constant, 0, v};
+        }
+        return code < state.size() ? state[code] : SgprSource{};
+    }
+
     // An integer inline constant (128..192 = 0..64, 193..208 = -1..-16) or literal.
     static bool ImmediateOf(const Inst& i, u16 code, u32* value) {
         if (code == Operand::Literal) {
@@ -189,7 +223,7 @@ private:
         }
     }
 
-    std::array<SgprSource, 104> state{};
+    std::array<SgprSource, 108> state{}; // s0-s103, then two reserved, vcc_lo, vcc_hi
 };
 
 // Calls f(first, count) for the SGPRs an instruction writes, as
@@ -972,6 +1006,24 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
         return ud[src.ud];
     case SgprSource::Constant:
         return src.offset;
+    case SgprSource::Computed: {
+        const u32 a = ResolveSgpr(src.expr->a, ud, cache);
+        const u32 b = ResolveSgpr(src.expr->b, ud, cache);
+        switch (src.expr->op) {
+        case SgprExpr::And: return a & b;
+        case SgprExpr::Or: return a | b;
+        case SgprExpr::Add: return a + b;
+        case SgprExpr::Mul: return a * b;
+        case SgprExpr::Lshl: return a << (b & 31u);
+        case SgprExpr::Lshr: return a >> (b & 31u);
+        case SgprExpr::Bfe: { // b: offset in [4:0], width in [22:16]
+            const u32 offset = b & 31u, width = (b >> 16) & 127u;
+            const u32 v = a >> offset;
+            return width == 0 ? 0 : width >= 32 ? v : v & ((1u << width) - 1u);
+        }
+        }
+        return 0;
+    }
     case SgprSource::PointerLoad: {
         const u64 base = (u64(ud[src.ud]) | (u64(ud[src.ud + 1]) << 32)) & 0xFFFFFFFFFFFFull;
         const u64 addr = base + src.offset;

@@ -112,6 +112,7 @@ struct MslOptions {
     bool debug_capture = false; // write positions to buffer(6) (debugging)
     bool points = false;          // point list: VsOut carries [[point_size]]
     bool vtx_point_size = false;  // PA_CL_VS_OUT_CNTL.USE_VTX_POINT_SIZE: POS1.x is the size
+    bool vtx_layer = false;       // USE_VTX_RENDER_TARGET_INDX on a layered target: POS1.z is the slice
     // Fetch loads the host does with a vertex descriptor: attribute k is the
     // load at vertex_attrs[k].pc (Program::vertex_inputs), read from
     // [[attribute(k)]] instead of guest memory.
