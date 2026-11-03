@@ -1114,7 +1114,7 @@ struct MetalRenderer::Impl {
                                               options:nil
                                                 error:&err];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    if (std::getenv("DC_DEBUG_FLAT")) {
+    if (std::getenv("DC_DEBUG_FLAT") || std::getenv("DC_TESS_FLAT")) { // DC_TESS_FLAT: tess draws only
       debug_fs = [lib newFunctionWithName:@"debug_fs"];
     }
     pd.vertexFunction = [lib newFunctionWithName:@"copy_vs"];
@@ -4711,6 +4711,8 @@ struct MetalRenderer::Impl {
     out.write(reinterpret_cast<const char *>(rgb.data()),
               static_cast<std::streamsize>(rgb.size()));
   }
+
+#include "gpu/metal/mtl_tess.inc"
 };
 
 void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
@@ -4745,6 +4747,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     const bool drawn = DrawGs(r, dc);
     if (trace && !drawn)
       DC_INFO("gpu:   skipped: gs not emulated");
+    return;
+  }
+  if ((r[Reg::VGT_SHADER_STAGES_EN] & 0x4) && DrawTess(r, dc)) {
     return;
   }
   CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
@@ -4842,8 +4847,12 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
               r[Reg::SPI_SHADER_PGM_RSRC2_VS], config, config & 0xFF, (config >> 8) & 0x3F,
               (config >> 14) & 0x3F, r[Reg::VGT_TF_PARAM], r[Reg::VGT_HOS_MIN_TESS_LEVEL],
               r[Reg::VGT_HOS_MAX_TESS_LEVEL]);
+      DC_INFO("gpu:   tess pipeline: tf_ring_size %#x hs_offchip %#x tf_mem_base %#x "
+              "vs rsrc1 %#x vgt_hos_cntl %#x",
+              r[0xC24E], r[0xC24F], r[0xC250], r[Reg::SPI_SHADER_PGM_RSRC1_VS], r[0xA285]);
       for (const auto &[name, ud0] : {std::pair{"ls", Reg::SPI_SHADER_USER_DATA_LS_0},
-                                      std::pair{"hs", Reg::SPI_SHADER_USER_DATA_HS_0}}) {
+                                      std::pair{"hs", Reg::SPI_SHADER_USER_DATA_HS_0},
+                                      std::pair{"vs", Reg::SPI_SHADER_USER_DATA_VS_0}}) {
         std::string w;
         for (u32 k = 0; k < 16; ++k) {
           char b[12];
@@ -5229,10 +5238,13 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.points = prim == PrimType::PointList;
   vo.vtx_point_size = vo.points && (r[Reg::PA_CL_VS_OUT_CNTL] & 1);
   vo.vtx_layer = draw_layers != 0;
-  const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
+  const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf && (!tess_draw || trace);
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
+  if (tess_draw) {
+    vo.tess = tess_draw->info;
+  }
   // User data as bound (pointers into CE dumps moved to their snapshots),
   // and the linear bases translated from it once. A commit before binding
   // retires the snapshots, so binding patches again if one happened.
@@ -5259,7 +5271,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   VertexBuffer vbufs[kMaxVertexBuffers];
   u32 nvbufs = 0;
   u64 vlayout = 0;
-  if (!sw_fetch && !rect && !vs->vertex_inputs.empty() &&
+  if (!sw_fetch && !rect && !tess_draw && !vs->vertex_inputs.empty() &&
       vs->vertex_inputs.size() <= kMaxVertexBuffers) {
     Shader::SgprReadCache rc;
     bool ok = true;
@@ -5305,6 +5317,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
   }
   vs_key = Hash(rect, vs_key);
+  if (tess_draw) {
+    vs_key = Fnv(&vo.tess, sizeof(vo.tess), vs_key);
+    vs_key = Hash(u64(tess_draw->partition) | u64(tess_draw->winding) << 8, vs_key);
+  }
   // A layered pipeline states its topology class, so that goes in the key too.
   const MTLPrimitiveTopologyClass layer_topology =
       prim == PrimType::PointList ? MTLPrimitiveTopologyClassPoint
@@ -5398,6 +5414,15 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       if (vo.vtx_layer) {
         d.inputPrimitiveTopology = layer_topology;
       }
+      if (tess_draw) {
+        d.tessellationPartitionMode = tess_draw->partition;
+        d.maxTessellationFactor = 64;
+        d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+        d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+        d.tessellationOutputWindingOrder = tess_draw->winding;
+        d.tessellationFactorScaleEnabled = NO;
+      }
       if (nvbufs) {
         MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
         for (u32 k = 0; k < nvbufs; ++k) {
@@ -5431,7 +5456,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         // (shadPS4 swaps SrcAlpha factors for One/Zero).
         const bool alpha_masked =
             !((r[Reg::CB_SHADER_MASK] >> (4 * k + 3)) & 1);
-        if ((b >> 30) & 1 && blendable && !debug_fs) {
+        if ((b >> 30) & 1 && blendable && !(debug_fs && (!tess_flat || tess_draw))) {
           ca.blendingEnabled = YES;
           auto fixa = [&](u32 f) {
             return !alpha_masked ? BlendFactor(f)
@@ -5460,7 +5485,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       pending.insert(pkey);
       std::string vsrc = MslSource(*vs, vo, vs_key);
       std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
-      const bool flat = debug_fs && ps && out_type[0] == OutType::Float;
+      const bool flat = debug_fs && (!tess_flat || tess_draw) && ps && out_type[0] == OutType::Float;
       const bool will_wait = sync_shaders || probe_slot >= 0;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
@@ -5802,6 +5827,36 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
             vertexStart:0
             vertexCount:(dc.count / 3) * 6
           instanceCount:instances];
+    return;
+  case static_cast<PrimType>(9): // DI_PT_PATCH: the domain pass of DrawTess
+    if (!tess_draw) {
+      ReportOnce("primitive type 9 not supported (tessellation off, DC_TESS=1)");
+      return;
+    }
+    if (static const bool nodepth = std::getenv("DC_TESS_NODEPTH") != nullptr; nodepth) {
+      static id<MTLDepthStencilState> always = [&] {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = NO;
+        return [device newDepthStencilStateWithDescriptor:dd];
+      }();
+      [enc setDepthStencilState:always];
+      bound.depth_state = nil;
+    }
+    if (static const bool nocull = std::getenv("DC_TESS_NOCULL") != nullptr; nocull) {
+      [enc setCullMode:MTLCullModeNone];
+      bound.cull = int(MTLCullModeNone);
+    }
+    [enc setVertexBuffer:tess_lds offset:0 atIndex:Shader::Binding::TessLds];
+    bound.buf[0][Shader::Binding::TessLds] = nil;
+    [enc setTessellationFactorBuffer:tess_draw->factors offset:0 instanceStride:0];
+    [enc drawPatches:0
+              patchStart:0
+              patchCount:tess_draw->patches
+        patchIndexBuffer:nil
+  patchIndexBufferOffset:0
+           instanceCount:1
+            baseInstance:0];
     return;
   default:
     ReportOnce("primitive type " + std::to_string(static_cast<u32>(prim)) +

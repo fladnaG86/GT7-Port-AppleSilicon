@@ -65,6 +65,31 @@ static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsign
         o.ring.index_size = static_cast<u32>(v);
         return true;
     }
+    // Tessellation (TessInfo): tess_stage=1 LS, 2 HS (with cs), 3 domain (with vs).
+    if (key == "tess_stage") {
+        o.tess.stage = static_cast<Gpu::Shader::TessStage>(v);
+        if (!o.tess.patches) {
+            o.tess.patches = 16, o.tess.cp_in = 16, o.tess.cp_out = 4, o.tess.lds_dwords = 4096;
+            o.tess.oc_bytes = 0x2000, o.tess.tf_bytes = 24;
+        }
+        return true;
+    }
+    if (key == "tf_sgpr") {
+        o.tess.tf_sgpr = static_cast<u8>(v);
+        return true;
+    }
+    if (key == "oc_sgpr") {
+        o.tess.oc_sgpr = v != 0;
+        return true;
+    }
+    if (key == "patches") {
+        o.tess.patches = static_cast<u32>(v);
+        return true;
+    }
+    if (key == "cp_out") {
+        o.tess.cp_out = static_cast<u32>(v);
+        return true;
+    }
     return false;
 }
 
