@@ -464,6 +464,7 @@ struct MetalRenderer::Impl {
     bool operator==(const PassState &) const = default;
   } pass;
   u32 draw_layers = 0; // slices the VS of the current draw picks among; 0 = one
+  u32 pass_draws = 0;  // draws recorded in the open render pass
   u32 pass_width = 0, pass_height = 0;
   std::vector<id<MTLBuffer>> chunks;
   id<MTLBuffer> chunk = nil;
@@ -3712,6 +3713,7 @@ struct MetalRenderer::Impl {
       last_end_ra = nullptr;
     }
     pass = ps;
+    pass_draws = 0;
     if (dump_passes && trace) {
       for (u32 k = 0; k < 8; ++k) {
         pass_tex[k] = colors[k] ? colors[k]->tex : nil;
@@ -3788,6 +3790,26 @@ struct MetalRenderer::Impl {
     std::vector<id<MTLTexture>> tex;
     std::vector<id<MTLSamplerState>> smp;
   };
+  // Whether a draw samples a color or depth attachment of the open pass. On
+  // the host's tile-based GPU such a read sees memory as of the pass's last
+  // store, not what the pass drew since: the fog draw (ps 0x9000f9d700)
+  // samples the scene and depth it draws into. Ending the pass stores the
+  // tiles first.
+  static bool SamplesAttachment(const Resources &res, RenderTarget *const colors[8],
+                                const RenderTarget *depth) {
+    for (id<MTLTexture> t : res.tex) {
+      id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
+      if (depth && base == depth->tex) {
+        return true;
+      }
+      for (u32 k = 0; k < 8; ++k) {
+        if (colors[k] && base == colors[k]->tex) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
   // Draw-time scratch, kept across draws so a draw does not allocate.
   std::vector<TextureType> draw_vs_types, draw_ps_types;
   Resources draw_vs_res, draw_ps_res;
@@ -5174,12 +5196,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     [b endEncoding];
     BeginPass(colors, depth, false, 1.0f);
     depth->bounds_seq = depth->written;
-  } else if (!enc || !(want == pass) || pending_clear) {
+  } else if (!enc || !(want == pass) || pending_clear ||
+             (pass_draws && (SamplesAttachment(ps_res, colors, depth) ||
+                             SamplesAttachment(vs_res, colors, depth)))) {
     BeginPass(colors, depth, false, 1.0f);
     if (depth && depth->bounds_seq && depth_bounds) {
       depth->bounds_seq = depth->written; // a new pass over unchanged depth
     }
   }
+
+  ++pass_draws;
 
   // ---- functions ----
   DrawLap(4);
