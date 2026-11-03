@@ -62,7 +62,7 @@ id<MTLComputePipelineState> TessKernel(Program *p, const Shader::MslOptions &o, 
 }
 
 bool RunTessKernel(const Shader::TessInfo &info, u64 addr, const u32 *ud, u32 rsrc2,
-                   u32 threads, u32 group, u64 index_va) {
+                   u32 threads, u32 group, u64 index_va, id<MTLBuffer> tf = nil) {
   Program *p = GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5), 2);
   if (!p) {
     ReportOnce("tess: program " + Hex(addr) + " cannot be decoded");
@@ -94,6 +94,9 @@ bool RunTessKernel(const Shader::TessInfo &info, u64 addr, const u32 *ud, u32 rs
   [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
   [e setBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
   [e setBuffer:tess_lds offset:0 atIndex:Shader::Binding::TessLds];
+  if (tf) {
+    [e setBuffer:tf offset:0 atIndex:Shader::Binding::TessFactors];
+  }
   for (u32 k = 0; k < res.tex.size(); ++k) {
     [e setTexture:res.tex[k] atIndex:k];
   }
@@ -114,44 +117,16 @@ bool RunTessKernel(const Shader::TessInfo &info, u64 addr, const u32 *ud, u32 rs
   return true;
 }
 
-// Guest address of the HS's tess-factor stores: the V# base of the first
-// buffer store whose soffset is the tf offset SGPR.
-u64 TessFactorBase(Program *hs, const u32 *ud, u32 tf_sgpr) {
-  for (const auto &i : hs->code) {
-    const bool buf = i.enc == Shader::Gcn::Enc::MUBUF || i.enc == Shader::Gcn::Enc::MTBUF;
-    if (!buf || i.soffset != tf_sgpr) {
-      continue;
-    }
-    const u32 k = hs->LinearBaseOf(i.pc);
-    if (k >= hs->linear_bases.size()) {
-      continue;
-    }
-    u64 va = 0, bytes = 0;
-    Shader::SgprReadCache cache;
-    const auto &b = hs->linear_bases[k];
-    // The base is what matters; the range check may refuse unbounded V#s.
-    u32 w[2];
-    for (u32 j = 0; j < 2; ++j) {
-      w[j] = Shader::ResolveSgpr(b.words[j], ud, &cache);
-    }
-    va = u64(w[0]) | (u64(w[1] & 0xFFF) << 32);
-    (void)bytes;
-    return va;
-  }
-  return 0;
-}
-
-bool TessFactors(u64 tf_va, u32 floats, u32 patches, float max_factor, id<MTLBuffer> out) {
+// The HS's float factors (Binding::TessFactors) as Metal's half factors.
+bool TessFactors(id<MTLBuffer> in, u32 floats, u32 patches, float max_factor, id<MTLBuffer> out) {
   if (!tess_tf_pso) {
     std::string src = Shader::kMslPrelude;
-    src += "kernel void tess_tf(device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
-           "device const DcMap& gmap [[buffer(3)]], constant ulong4& a [[buffer(4)]], "
+    src += "kernel void tess_tf(device const float* in [[buffer(1)]], constant uint4& a [[buffer(4)]], "
            "device half* out [[buffer(5)]], uint i [[thread_position_in_grid]]) {\n"
-           "  DcMem mem = {gm0, gm1, &gmap, {}, nullptr};\n"
-           "  if (i >= uint(a.z)) return;\n"
-           "  float mx = as_type<float>(uint(a.w));\n"
-           "  for (uint k = 0u; k < uint(a.y); ++k) {\n"
-           "    float f = as_type<float>(dc_ld(mem, a.x + ulong(i * uint(a.y) + k) * 4ul));\n"
+           "  if (i >= a.z) return;\n"
+           "  float mx = as_type<float>(a.w);\n"
+           "  for (uint k = 0u; k < a.y; ++k) {\n"
+           "    float f = in[i * a.y + k];\n"
            "    out[i * uint(a.y) + k] = half(isnan(f) ? 0.0f : min(f, mx));\n"
            "  }\n}\n";
     NSError *err = nil;
@@ -166,12 +141,10 @@ bool TessFactors(u64 tf_va, u32 floats, u32 patches, float max_factor, id<MTLBuf
   float mf = max_factor;
   u32 mfb;
   std::memcpy(&mfb, &mf, 4);
-  const u64 a[4] = {tf_va, floats, patches, mfb};
+  const u32 a[4] = {0, floats, patches, mfb};
   id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
   [e setComputePipelineState:tess_tf_pso];
-  [e setBuffer:mem[0] offset:0 atIndex:1];
-  [e setBuffer:mem[1] offset:0 atIndex:2];
-  [e setBuffer:mem_map offset:0 atIndex:3];
+  [e setBuffer:in offset:0 atIndex:1];
   [e setBytes:a length:sizeof(a) atIndex:4];
   [e setBuffer:out offset:0 atIndex:5];
   [e dispatchThreads:MTLSizeMake(patches, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -251,17 +224,19 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   }
   info.index_size = 0;
   info.stage = Shader::TessStage::Hull;
+  info.tf_sgpr = u8(Bits(rsrc2_hs, 1, 5) + (info.oc_sgpr ? 1 : 0));
   const u64 hs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_HS);
   const u32 *hs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_HS_0);
-  if (!RunTessKernel(info, hs_addr, hs_ud, rsrc2_hs, n * info.cp_out,
-                     info.patches * info.cp_out, 0)) {
-    return false;
+  // Factors of culled patches stay 0 (Metal then drops the patch, as GCN does).
+  const u64 tf_bytes = std::max<u64>(u64(groups) * info.patches * info.tf_bytes, 16);
+  id<MTLBuffer> tf_buf = [device newBufferWithLength:tf_bytes options:MTLResourceStorageModePrivate];
+  {
+    id<MTLBlitCommandEncoder> b = (EndPass(), EnsureCommandBuffer(), [cmd blitCommandEncoder]);
+    [b fillBuffer:tf_buf range:NSMakeRange(0, tf_bytes) value:0];
+    [b endEncoding];
   }
-  Program *hs = GetProgram(Stage::Compute, hs_addr, hs_ud, Bits(rsrc2_hs, 1, 5), 2);
-  const u32 tf_sgpr = Bits(rsrc2_hs, 1, 5) + (info.oc_sgpr ? 1 : 0);
-  const u64 tf_va = hs ? TessFactorBase(hs, hs_ud, tf_sgpr) : 0;
-  if (!tf_va) {
-    ReportOnce("tess: tess-factor V# of hs " + Hex(hs_addr) + " not found");
+  if (!RunTessKernel(info, hs_addr, hs_ud, rsrc2_hs, n * info.cp_out,
+                     info.patches * info.cp_out, 0, tf_buf)) {
     return false;
   }
   TessDraw t;
@@ -270,7 +245,7 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
                                   options:MTLResourceStorageModePrivate];
   float max_factor = r.F(Reg::VGT_HOS_MAX_TESS_LEVEL);
   max_factor = max_factor >= 1.0f && max_factor <= 64.0f ? max_factor : 64.0f;
-  if (!TessFactors(tf_va, info.tf_bytes / 4, n, max_factor, t.factors)) {
+  if (!TessFactors(tf_buf, info.tf_bytes / 4, n, max_factor, t.factors)) {
     return false;
   }
   static const MTLTessellationPartitionMode parts[4] = {
@@ -281,14 +256,10 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   info.stage = Shader::TessStage::Domain;
   t.info = info;
   if (trace) {
-    id<MTLBuffer> tb = nil;
-    u64 toff = 0;
-    DC_INFO("gpu:   tess factors at %#llx: %s", (unsigned long long)tf_va,
-            Locate(tf_va, u64(n) * info.tf_bytes, &tb, &toff) ? "gpu visible" : "NOT gpu visible");
     DC_INFO("gpu:   tess emulated: %u patches in %u groups of %u, cp %u->%u, lds %u dw, oc %u B/group "
-            "(sgpr %d), tf at %#llx, domain %u part %u",
+            "(sgpr %d), tf sgpr %u, domain %u part %u",
             n, groups, info.patches, info.cp_in, info.cp_out, info.lds_dwords, info.oc_bytes,
-            int(info.oc_sgpr), (unsigned long long)tf_va, info.domain, (tf >> 2) & 7);
+            int(info.oc_sgpr), info.tf_sgpr, info.domain, (tf >> 2) & 7);
   }
   auto copy = std::make_unique<RegFile>(r);
   (*copy)[Reg::VGT_SHADER_STAGES_EN] &= ~0x7u; // LS and HS done

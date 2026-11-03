@@ -31,6 +31,7 @@ constexpr u32 Gds = 5;      // device uint[16K]: the queue's 64 KB GDS partition
 constexpr u32 Linear = 8;   // constant uint[]: translated linear bases (MslOptions::linear_mask)
 constexpr u32 GsIndex = 9;  // device uint*: copy-VS indices a GS kernel writes (MslOptions::ring)
 constexpr u32 TessLds = 10; // device uint*: LS/HS LDS slices (MslOptions::tess)
+constexpr u32 TessFactors = 11; // device uint*: tess factors the HS stores (MslOptions::tess)
 } // namespace Binding
 
 // Geometry-shader emulation. Metal has no GS stage: the ES and the GS of a GS
@@ -74,6 +75,7 @@ struct TessInfo {
     u32 oc_bytes = 0;    // off-chip bytes per threadgroup (the oc offset SGPR)
     u32 tf_bytes = 0;    // HS: tess-factor bytes per patch (the tf offset SGPR)
     bool oc_sgpr = false; // RSRC2.OC_LDS_EN: the off-chip offset SGPR follows user data
+    u8 tf_sgpr = 0xFF;   // HS: the tf offset SGPR; dword stores with it as soffset go to Binding::TessFactors
     u8 index_size = 0;   // LS: bytes per index read from Binding::GsIndex; 0 = not indexed
     u8 domain = 2;       // VGT_TF_PARAM.TYPE: 1 tri, 2 quad
     bool operator==(const TessInfo&) const = default;

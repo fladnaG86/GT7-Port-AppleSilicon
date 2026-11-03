@@ -74,6 +74,10 @@ static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsign
         }
         return true;
     }
+    if (key == "tf_sgpr") {
+        o.tess.tf_sgpr = static_cast<u8>(v);
+        return true;
+    }
     if (key == "oc_sgpr") {
         o.tess.oc_sgpr = v != 0;
         return true;

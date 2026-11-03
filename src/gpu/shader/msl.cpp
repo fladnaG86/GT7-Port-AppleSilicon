@@ -1291,8 +1291,15 @@ void Emitter::EmitBuffer(const Inst& i) {
         const u32 n = i.op == static_cast<u16>(Mubuf::BUFFER_STORE_DWORD) ? 1
                     : i.op == static_cast<u16>(Mubuf::BUFFER_STORE_DWORDX2) ? 2
                     : i.op == static_cast<u16>(Mubuf::BUFFER_STORE_DWORDX3) ? 3 : 4;
+        // Emulated HS: its tess-factor stores (soffset = the tf offset SGPR) go to
+        // the host's factor buffer instead of the guest's TF ring.
+        const bool tf = o.tess.stage == TessStage::Hull && i.soffset == o.tess.tf_sgpr;
         for (u32 k = 0; k < n; ++k) {
-            Line("  " + store_guard() + "dc_st(" + M + ", a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
+            if (tf) {
+                Line(std::string(guard ? "  if (exec_lo != 0u) " : "  ") + "dc_tf[(off_ + " + N(4 * k) + "u) >> 2] = " + VName(i.vdata + k) + ";");
+            } else {
+                Line("  " + store_guard() + "dc_st(" + M + ", a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
+            }
         }
         break;
     }
@@ -2083,6 +2090,7 @@ std::string Emitter::Run() {
                mem_params + ", device uint* gds [[buffer(5)]], " +
                (tess_lds ? "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]"
                          : std::string("threadgroup uint* lds [[threadgroup(0)]]")) +
+               (o.tess.stage == TessStage::Hull ? ", device uint* dc_tf [[buffer(" + N(Binding::TessFactors) + ")]]" : "") +
                (o.tess.index_size ? std::string(", device const ") + (o.tess.index_size == 2 ? "ushort" : "uint") +
                                         "* dc_tsidx [[buffer(" + N(Binding::GsIndex) + ")]]"
                                   : "") +
