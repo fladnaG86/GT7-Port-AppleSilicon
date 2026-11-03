@@ -1157,6 +1157,13 @@ struct MetalRenderer::Impl {
     scan_loc_pipeline = [device
         newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_loc"]
                                       error:&err];
+    if (const char *e = std::getenv("DC_ZSTAT")) {
+      char *end = nullptr;
+      zstat_addr = std::strtoull(e, &end, 16);
+      if (*end == ',') {
+        zstat_every = std::max<u64>(1, std::strtoull(end + 1, nullptr, 10));
+      }
+    }
     if (const char *e = std::getenv("DC_SCAN_MAX")) {
       if (!std::strcmp(e, "*")) {
         scan_all = true;
@@ -1443,6 +1450,78 @@ struct MetalRenderer::Impl {
     if (trace && (scan_all || !scan_addrs.empty())) {
       ScanMax();
     }
+  }
+
+  // DC_ZSTAT=<addr>[,<every>]: every <every> flips (300), the depth surface
+  // at <addr>: draws that wrote it since the last report and its value range,
+  // read back on the GPU timeline (to tell an empty shadow map from a drawn one).
+  u64 zstat_addr = 0, zstat_every = 300, zstat_draws = 0;
+  void ZStat() {
+    auto it = depth_targets.find(zstat_addr);
+    const u64 draws = zstat_draws;
+    zstat_draws = 0;
+    if (it == depth_targets.end() || it->second.empty()) {
+      DC_INFO("gpu: zstat %#llx: no depth target (%llu draws)",
+              (unsigned long long)zstat_addr, (unsigned long long)draws);
+      return;
+    }
+    RenderTarget *z = it->second.back().get();
+    id<MTLTexture> tex = z->tex;
+    if (!tex || tex.pixelFormat != MTLPixelFormatDepth16Unorm || tex.textureType != MTLTextureType2D) {
+      DC_INFO("gpu: zstat %#llx: fmt %lu type %lu not read back (%llu draws)",
+              (unsigned long long)zstat_addr, (unsigned long)tex.pixelFormat,
+              (unsigned long)tex.textureType, (unsigned long long)draws);
+      return;
+    }
+    const u32 w = z->width, h = z->height;
+    id<MTLBuffer> b = [device newBufferWithLength:u64(w) * h * 2
+                                          options:MTLResourceStorageModeShared];
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> e = [cmd blitCommandEncoder];
+    [e copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:0
+        destinationBytesPerRow:w * 2 destinationBytesPerImage:u64(w) * h * 2];
+    [e endEncoding];
+    const u64 addr = zstat_addr, frame = frame_count, written = z->written;
+    const bool init = z->initialized, pend = z->clear_pending;
+    const double clear = z->clear_depth;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      const u16 *d = static_cast<const u16 *>(b.contents);
+      u32 lo = 0xFFFF, hi = 0;
+      u64 n_one = 0, n_zero = 0, sum = 0;
+      constexpr u32 kG = 8; // coverage of non-1.0 texels on an 8x8 grid
+      u64 cell[kG * kG] = {};
+      for (u32 y = 0; y < h; ++y) {
+        for (u32 x = 0; x < w; ++x) {
+          const u16 v = d[u64(y) * w + x];
+          lo = std::min<u32>(lo, v);
+          hi = std::max<u32>(hi, v);
+          sum += v;
+          n_one += v == 0xFFFF;
+          n_zero += v == 0;
+          if (v != 0xFFFF) {
+            ++cell[(y * kG / h) * kG + x * kG / w];
+          }
+        }
+      }
+      std::string grid;
+      const u64 per = u64(w / kG) * (h / kG);
+      for (u32 c = 0; c < kG * kG; ++c) {
+        grid += char('0' + std::min<u64>(9, cell[c] * 10 / std::max<u64>(1, per)));
+        if (c % kG == kG - 1 && c + 1 < kG * kG) {
+          grid += '/';
+        }
+      }
+      const double total = double(w) * h;
+      DC_INFO("gpu: zstat %#llx flip %llu %ux%u: %llu draws, written %llu init %d pending %d "
+              "clear %g: min %.5f max %.5f mean %.5f, at 1.0 %.1f%%, at 0 %.1f%%, "
+              "drawn per 1/64 (0-9) %s",
+              (unsigned long long)addr, (unsigned long long)frame, w, h,
+              (unsigned long long)draws, (unsigned long long)written, init, pend, clear,
+              lo / 65535.0, hi / 65535.0, sum / total / 65535.0, n_one * 100 / total,
+              n_zero * 100 / total, grid.c_str());
+    }];
   }
 
   void ScanMax() {
@@ -4886,6 +4965,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
                                  TexDim::Tex2DArray, std::max(first, last) + 1)
                     : &GetDepthTarget(zbase, depth_fmt, w, h);
       depth->bind_slice = array ? first : 0;
+      zstat_draws += zbase == zstat_addr;
       DepthFromColor(*depth);
       depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
       depth->clear_stencil = r[Reg::DB_STENCIL_CLEAR] & 0xFF;
@@ -6353,6 +6433,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   }
   if (trace_frame) {
     trace = frame_count == trace_frame;
+  }
+  if (zstat_addr && frame_count % zstat_every == 0) {
+    ZStat();
   }
   {
     const auto now = std::chrono::steady_clock::now();
