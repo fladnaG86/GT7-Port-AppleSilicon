@@ -1600,6 +1600,36 @@ struct MetalRenderer::Impl {
           std::snprintf(buf, sizeof(buf), ", at %u,%u: %.5f", x, y, d[u64(y) * w + x]);
           at = buf;
         }
+        // DC_ZSTAT_DUMP=<dir>: each slice as an 8-bit PGM, min..max of the drawn texels
+        // stretched to 0..255 (clear value white), to see what the light sees.
+        if (const char *dir = std::getenv("DC_ZSTAT_DUMP")) {
+          float dlo = 1e30f, dhi = -1e30f;
+          for (u64 i = 0; i < u64(w) * h; ++i) {
+            if (d[i] != clear && std::isfinite(d[i])) {
+              dlo = std::min(dlo, d[i]);
+              dhi = std::max(dhi, d[i]);
+            }
+          }
+          char path[512];
+          std::snprintf(path, sizeof(path), "%s/z_%llx_f%llu_s%u.pgm", dir,
+                        (unsigned long long)addr, (unsigned long long)frame, s);
+          if (FILE *f = std::fopen(path, "wb")) {
+            std::fprintf(f, "P5\n%u %u\n255\n", w, h);
+            std::vector<u8> row(w);
+            const float span = dhi > dlo ? dhi - dlo : 1.0f;
+            for (u32 y = 0; y < h; ++y) {
+              for (u32 x = 0; x < w; ++x) {
+                const float v = d[u64(y) * w + x];
+                row[x] = v == clear || !std::isfinite(v)
+                             ? 255
+                             : u8(std::clamp((v - dlo) / span, 0.0f, 1.0f) * 254.0f);
+              }
+              std::fwrite(row.data(), 1, w, f);
+            }
+            std::fclose(f);
+          }
+          DC_INFO("gpu: zstat dump %s range %.5f..%.5f", path, dlo, dhi);
+        }
         const double total = double(w) * h;
         DC_INFO("gpu: zstat %#llx flip %llu slice %u/%u %ux%u: %llu draws, written %llu init %d "
                 "pending %d clear %g: min %.5f max %.5f mean %.5f, at clear %.1f%%%s, drawn %s",
@@ -4916,6 +4946,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
             u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
             r[Reg::DB_Z_INFO], r[Reg::CB_BLEND0_CONTROL],
             r[Reg::SPI_SHADER_COL_FORMAT]);
+    DC_INFO("gpu:   index base %#llx offset %u size %u instances %u first_vertex %u indirect %#llx",
+            (unsigned long long)dc.index_base, dc.index_offset, dc.index_size, dc.instances,
+            dc.first_vertex, (unsigned long long)dc.indirect_args);
     // Geometry-shader pipeline (VGT_SHADER_STAGES_EN.GS_EN): ES and GS are not
     // run, only the copy VS. Log what emulating them needs and dump both
     // programs next to the other shaders.
