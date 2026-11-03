@@ -1443,6 +1443,9 @@ struct MetalRenderer::Impl {
     if (enc) {
       [enc endEncoding];
       enc = nil;
+      if (trace && PeekRt().addr) {
+        PeekPass();
+      }
       if (dump_passes && trace && dump_frames) {
         DumpPass();
       }
@@ -1568,9 +1571,39 @@ struct MetalRenderer::Impl {
     }();
     if (!tex || std::find(want.first.begin(), want.first.end(), addr & kGpuAddrMask) ==
                     want.first.end() ||
-        !dumped_bound.insert((addr & kGpuAddrMask) ^ (frame_count << 48)).second) {
+        !dumped_bound.insert(Hash(reinterpret_cast<uintptr_t>((__bridge void *)tex),
+                                  (addr & kGpuAddrMask) ^ (frame_count << 48)))
+             .second) {
       return;
     }
+    // Which surface the binding comes from: a render target (and when it was
+    // last written) or not, then guest memory.
+    std::string src = "not a target (guest memory or cache)";
+    {
+      id<MTLTexture> root = tex.parentTexture ? tex.parentTexture : tex;
+      for (TargetMap *m : {&color_targets, &depth_targets}) {
+        const auto it = m->find(addr & kGpuAddrMask);
+        if (it == m->end()) {
+          continue;
+        }
+        for (const auto &rt : it->second) {
+          id<MTLTexture> rroot = rt->tex.parentTexture ? rt->tex.parentTexture : rt->tex;
+          char b[160];
+          std::snprintf(b, sizeof(b), "%s%s target %ux%u layers %u levels %u written %llu",
+                        rroot == root ? "BOUND " : "other ", m == &depth_targets ? "depth" : "color",
+                        rt->width, rt->height, rt->depth_or_layers, rt->levels,
+                        (unsigned long long)rt->written);
+          src = (src.rfind("not a target", 0) == 0 ? std::string() : src + "; ") + b;
+        }
+      }
+      if (const auto f = memory_fills.find(addr & kGpuAddrMask); f != memory_fills.end()) {
+        src += "; memory fill at " + std::to_string(f->second);
+      }
+    }
+    DC_INFO("gpu: dump bound %#llx at draw %llu: type %lu layers %lu levels %lu, %s",
+            (unsigned long long)addr, (unsigned long long)draw_count,
+            (unsigned long)tex.textureType, (unsigned long)tex.arrayLength,
+            (unsigned long)tex.mipmapLevelCount, src.c_str());
     const MTLPixelFormat f = tex.pixelFormat;
     const u32 bpp = f == MTLPixelFormatRGBA16Float ? 8
                     : (f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGBA8Unorm ||
@@ -1862,6 +1895,116 @@ struct MetalRenderer::Impl {
   }
 
   // DC_DUMP_PASSES: small BGRA copies of the targets of the pass just ended.
+  // Clears every slice of a depth target now (a clear through memory, which
+  // no pass's load action carries).
+  void ClearDepthNow(RenderTarget &z, float depth_value) {
+    if (!z.tex || !(z.tex.pixelFormat == MTLPixelFormatDepth32Float ||
+                    z.tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ||
+                    z.tex.pixelFormat == MTLPixelFormatDepth16Unorm)) {
+      return;
+    }
+    if (!std::isfinite(depth_value)) {
+      depth_value = 0.0f;
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    const u32 slices = z.tex.textureType == MTLTextureType2DArray ? u32(z.tex.arrayLength) : 1;
+    for (u32 s = 0; s < slices; ++s) {
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.depthAttachment.texture = z.tex;
+      rp.depthAttachment.slice = s;
+      rp.depthAttachment.loadAction = MTLLoadActionClear;
+      rp.depthAttachment.clearDepth = std::clamp(depth_value, 0.0f, 1.0f);
+      rp.depthAttachment.storeAction = MTLStoreActionStore;
+      if (HasStencil(z.tex)) {
+        rp.stencilAttachment.texture = z.tex;
+        rp.stencilAttachment.slice = s;
+        rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+      }
+      [[cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
+    }
+    z.initialized = true;
+    z.clear_pending = false;
+    z.written = ++write_seq;
+  }
+
+  // DC_PEEK_RT=<hex addr>,<x>,<y>: in a traced flip, after every render pass
+  // with that colour attachment, texel x,y of level 0 in every slice as floats,
+  // with the pass's draw range: which draw wrote (or wiped) a surface.
+  struct PeekRtCfg {
+    u64 addr = 0;
+    u32 x = 0, y = 0;
+  };
+  static const PeekRtCfg &PeekRt() {
+    static const PeekRtCfg c = [] {
+      PeekRtCfg p;
+      if (const char *e = std::getenv("DC_PEEK_RT")) {
+        char *q = nullptr;
+        p.addr = std::strtoull(e, &q, 16) & kGpuAddrMask;
+        if (*q == ',') p.x = u32(std::strtoul(q + 1, &q, 10));
+        if (*q == ',') p.y = u32(std::strtoul(q + 1, &q, 10));
+      }
+      return p;
+    }();
+    return c;
+  }
+  u64 pass_first_draw = 0;
+  void PeekPass() {
+    const PeekRtCfg &c = PeekRt();
+    for (u32 k = 0; k < 8; ++k) {
+      id<MTLTexture> t = pass_tex[k];
+      if (!t || (pass_addr[k] & kGpuAddrMask) != c.addr) {
+        continue;
+      }
+      id<MTLTexture> root = t.parentTexture ? t.parentTexture : t;
+      const MTLPixelFormat f = root.pixelFormat;
+      const u32 bpp = f == MTLPixelFormatRGBA16Float ? 8 : 4;
+      const u32 slices = root.textureType == MTLTextureType2DArray ? u32(root.arrayLength) : 1;
+      if (c.x >= root.width || c.y >= root.height) {
+        continue;
+      }
+      id<MTLBuffer> b = [device newBufferWithLength:u64(bpp) * slices
+                                            options:MTLResourceStorageModeShared];
+      EnsureCommandBuffer();
+      id<MTLBlitCommandEncoder> e = [cmd blitCommandEncoder];
+      for (u32 s = 0; s < slices; ++s) {
+        [e copyFromTexture:root sourceSlice:s sourceLevel:0 sourceOrigin:MTLOriginMake(c.x, c.y, 0)
+                sourceSize:MTLSizeMake(1, 1, 1) toBuffer:b destinationOffset:u64(bpp) * s
+            destinationBytesPerRow:bpp destinationBytesPerImage:bpp];
+      }
+      [e endEncoding];
+      const u64 d0 = pass_first_draw, d1 = draw_count, addr = c.addr;
+      const u32 x = c.x, y = c.y;
+      const bool same = root == t;
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+        std::string line;
+        for (u32 s = 0; s < slices; ++s) {
+          const u8 *p = static_cast<const u8 *>(b.contents) + u64(bpp) * s;
+          float v[3] = {};
+          if (f == MTLPixelFormatRG11B10Float) {
+            u32 w;
+            std::memcpy(&w, p, 4);
+            v[0] = Small(w & 0x7FF, 6);
+            v[1] = Small((w >> 11) & 0x7FF, 6);
+            v[2] = Small(w >> 22, 5);
+          } else if (f == MTLPixelFormatRGBA16Float) {
+            const u16 *q = reinterpret_cast<const u16 *>(p);
+            for (int i = 0; i < 3; ++i) v[i] = Half(q[i]);
+          } else {
+            for (int i = 0; i < 3; ++i) v[i] = p[i] / 255.0f;
+          }
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), " s%u=(%.3g %.3g %.3g)", s, v[0], v[1], v[2]);
+          line += buf;
+        }
+        DC_INFO("gpu: peek rt %#llx %u,%u after draws %llu..%llu%s:%s", (unsigned long long)addr,
+                x, y, (unsigned long long)d0, (unsigned long long)d1,
+                same ? "" : " (via view)", line.c_str());
+      }];
+    }
+  }
+
   void DumpPass() {
     for (u32 k = 0; k < 9; ++k) {
       id<MTLTexture> t = pass_tex[k];
@@ -3034,6 +3177,35 @@ struct MetalRenderer::Impl {
           latest && fill != memory_fills.end() && fill->second > latest->written) {
         latest = nullptr;
       }
+      // A 2D T# over the first slice of an array or cube target (GT7's cs
+      // 0x9000e31f00 reads face 0 of the reflection cube 0x900b1b0000 as 2D to
+      // build its mip chain): a 2D view of that slice, not the guest memory,
+      // which never holds the GPU's picture.
+      if (!latest && tt.dim == TexDim::Tex2D) {
+        RenderTarget *a = Latest(color_targets, addr, TexDim::Tex2DArray, width, height,
+                                 fi.bytes_per_block);
+        if (a && a->width == width && a->height == height &&
+            a->tex.textureType == MTLTextureType2DArray &&
+            !(memory_fills.count(addr) && memory_fills[addr] > a->written)) {
+          const u32 lv0 = std::min(base_level, a->levels - 1);
+          const u32 nlv = std::clamp<u32>(last_level - base_level + 1, 1, a->levels - lv0);
+          MTLPixelFormat vf = a->tex.pixelFormat;
+          if (fi.format != MTLPixelFormatInvalid && PixelBytes(fi.format) == PixelBytes(vf) &&
+              !(fi.sample == TexSample::Float) == !(SampleKind(vf) == TexSample::Float)) {
+            vf = fi.format;
+          } else {
+            tt.sample = SampleKind(vf);
+            *type_out = tt;
+          }
+          return [a->tex newTextureViewWithPixelFormat:vf
+                                           textureType:MTLTextureType2D
+                                                levels:NSMakeRange(lv0, nlv)
+                                                slices:NSMakeRange(0, 1)
+                                               swizzle:MTLTextureSwizzleChannelsMake(
+                                                           Swizzle(swz), Swizzle(swz >> 3),
+                                                           Swizzle(swz >> 6), Swizzle(swz >> 9))];
+        }
+      }
       if (RenderTarget *rt = latest) {
         // An array read past the slices rendered so far: grow it (shadPS4 sizes
         // images from the T#), the new slices read as zero until written.
@@ -3993,7 +4165,8 @@ struct MetalRenderer::Impl {
     }
     pass = ps;
     pass_draws = 0;
-    if (dump_passes && trace) {
+    pass_first_draw = draw_count;
+    if ((dump_passes || PeekRt().addr) && trace) {
       for (u32 k = 0; k < 8; ++k) {
         pass_tex[k] = colors[k] ? colors[k]->tex : nil;
         pass_addr[k] = colors[k] ? colors[k]->addr : 0;
@@ -6312,6 +6485,27 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     if (color_targets.count(dst)) {
       memory_fills[dst] = ++write_seq;
       ++texture_epoch;
+    }
+    // The same memset over a depth surface clears it (GT7 clears its reflection
+    // cube depth 0x900b460000 to 0, reverse Z, this way each frame). The value
+    // is dword 0 of the constant buffer V# in ud[4..7] (dword 1 for odd
+    // dwords, the stencil half of a pair). Without it the cube's depth kept the
+    // 1.0 of its creation, every GEQUAL test failed and the reflection cube,
+    // its filtered copies and the cockpit's indirect light stayed black.
+    if (const auto it = depth_targets.find(dst); it != depth_targets.end()) {
+      const u64 cb = (u64(ud[4]) | (u64(ud[5] & 0xFFF) << 32)) & kGpuAddrMask;
+      u32 value = 0;
+      if (cb && Readable(cb, 4)) {
+        std::memcpy(&value, reinterpret_cast<const void *>(cb), 4);
+      }
+      float depth_value;
+      std::memcpy(&depth_value, &value, 4);
+      for (auto &z : it->second) {
+        ClearDepthNow(*z, depth_value);
+      }
+      if (trace) {
+        DC_INFO("gpu:   memset clears depth %#llx to %g", (unsigned long long)dst, depth_value);
+      }
     }
   }
   if (trace) {
