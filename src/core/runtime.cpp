@@ -133,6 +133,9 @@ void RelocateGt7PrtApertures(const Loader::Module& exe) {
         {0x335f08b, 0xbf, 0x3000000000}, // aperture 1 base as a T# address
     };
     constexpr u64 kMove = 0x8000000000;
+    if (std::getenv("DC_NO_PRT_MOVE")) { // debug: keep them where the game puts them
+        return;
+    }
     for (const Site& s : kSites) {
         const auto* code = reinterpret_cast<const u8*>(exe.Base() + s.offset);
         u64 imm;
