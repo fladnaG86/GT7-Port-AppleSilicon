@@ -1113,7 +1113,7 @@ struct MetalRenderer::Impl {
                                               options:nil
                                                 error:&err];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    if (std::getenv("DC_DEBUG_FLAT")) {
+    if (std::getenv("DC_DEBUG_FLAT") || std::getenv("DC_TESS_FLAT")) { // DC_TESS_FLAT: tess draws only
       debug_fs = [lib newFunctionWithName:@"debug_fs"];
     }
     pd.vertexFunction = [lib newFunctionWithName:@"copy_vs"];
@@ -5132,7 +5132,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.points = prim == PrimType::PointList;
   vo.vtx_point_size = vo.points && (r[Reg::PA_CL_VS_OUT_CNTL] & 1);
   vo.vtx_layer = draw_layers != 0;
-  const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
+  const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf && (!tess_draw || trace);
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
@@ -5350,7 +5350,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         // (shadPS4 swaps SrcAlpha factors for One/Zero).
         const bool alpha_masked =
             !((r[Reg::CB_SHADER_MASK] >> (4 * k + 3)) & 1);
-        if ((b >> 30) & 1 && blendable && !debug_fs) {
+        if ((b >> 30) & 1 && blendable && !(debug_fs && (!tess_flat || tess_draw))) {
           ca.blendingEnabled = YES;
           auto fixa = [&](u32 f) {
             return !alpha_masked ? BlendFactor(f)
@@ -5379,7 +5379,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       pending.insert(pkey);
       std::string vsrc = MslSource(*vs, vo, vs_key);
       std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
-      const bool flat = debug_fs && ps && out_type[0] == OutType::Float;
+      const bool flat = debug_fs && (!tess_flat || tess_draw) && ps && out_type[0] == OutType::Float;
       const bool will_wait = sync_shaders || probe_slot >= 0;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
@@ -5726,6 +5726,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     if (!tess_draw) {
       ReportOnce("primitive type 9 not supported (tessellation off, DC_TESS=1)");
       return;
+    }
+    if (static const bool nocull = std::getenv("DC_TESS_NOCULL") != nullptr; nocull) {
+      [enc setCullMode:MTLCullModeNone];
+      bound.cull = int(MTLCullModeNone);
     }
     [enc setVertexBuffer:tess_lds offset:0 atIndex:Shader::Binding::TessLds];
     bound.buf[0][Shader::Binding::TessLds] = nil;

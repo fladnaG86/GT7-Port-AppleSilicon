@@ -23,6 +23,7 @@ struct TessDraw {
   MTLWinding winding = MTLWindingClockwise;
 };
 const TessDraw *tess_draw = nullptr; // set while Draw() records the domain pass
+const bool tess_flat = std::getenv("DC_TESS_FLAT") != nullptr; // debug: magenta tess draws
 id<MTLBuffer> tess_lds = nil;
 id<MTLComputePipelineState> tess_tf_pso = nil;
 
@@ -229,7 +230,10 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   const u32 *hs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_HS_0);
   // Factors of culled patches stay 0 (Metal then drops the patch, as GCN does).
   const u64 tf_bytes = std::max<u64>(u64(groups) * info.patches * info.tf_bytes, 16);
-  id<MTLBuffer> tf_buf = [device newBufferWithLength:tf_bytes options:MTLResourceStorageModePrivate];
+  // Traced frames read the factors back (shared storage) and log a summary.
+  id<MTLBuffer> tf_buf = [device newBufferWithLength:tf_bytes
+                                             options:trace ? MTLResourceStorageModeShared
+                                                           : MTLResourceStorageModePrivate];
   {
     id<MTLBlitCommandEncoder> b = (EndPass(), EnsureCommandBuffer(), [cmd blitCommandEncoder]);
     [b fillBuffer:tf_buf range:NSMakeRange(0, tf_bytes) value:0];
@@ -239,12 +243,52 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
                      info.patches * info.cp_out, 0, tf_buf)) {
     return false;
   }
+  if (trace && dump_frames) { // LDS slices 0-1 after the HS, for offline inspection
+    const u64 bytes = std::min<u64>(u64(info.lds_dwords) * 4 * 2, tess_lds.length);
+    id<MTLBuffer> copy = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    [b copyFromBuffer:tess_lds sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
+    [b endEncoding];
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/lds_%llu_hs_%llx.bin", dump_frames,
+                  (unsigned long long)draw_count, (unsigned long long)hs_addr);
+    std::string file = path;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      std::ofstream(file, std::ios::binary).write(static_cast<const char *>(copy.contents),
+                                                   static_cast<std::streamsize>(copy.length));
+    }];
+  }
   TessDraw t;
   t.patches = n;
   t.factors = [device newBufferWithLength:u64(n) * info.tf_bytes / 2
                                   options:MTLResourceStorageModePrivate];
   float max_factor = r.F(Reg::VGT_HOS_MAX_TESS_LEVEL);
   max_factor = max_factor >= 1.0f && max_factor <= 64.0f ? max_factor : 64.0f;
+  // DC_TESS_FORCE=<f>: every factor f instead of the HS's (debugging the domain pass).
+  static const float force = std::getenv("DC_TESS_FORCE") ? std::strtof(std::getenv("DC_TESS_FORCE"), nullptr) : 0.0f;
+  if (force > 0.0f) {
+    std::vector<float> f(tf_bytes / 4, force);
+    tf_buf = [device newBufferWithBytes:f.data() length:tf_bytes options:MTLResourceStorageModeShared];
+  }
+  if (trace) {
+    const u32 floats = info.tf_bytes / 4, count = n;
+    const u64 hs_at = hs_addr;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      const float *f = static_cast<const float *>(tf_buf.contents);
+      u32 live = 0;
+      float mx = 0.0f;
+      for (u32 k = 0; k < count; ++k) {
+        bool any = false;
+        for (u32 j = 0; j < floats; ++j) {
+          any |= f[k * floats + j] > 0.0f;
+          mx = std::max(mx, f[k * floats + j]);
+        }
+        live += any;
+      }
+      DC_INFO("gpu: tess hs %#llx factors: %u of %u patches live, max %g, first %g %g %g %g %g %g",
+              (unsigned long long)hs_at, live, count, mx, f[0], f[1], f[2], f[3], f[4], f[5]);
+    }];
+  }
   if (!TessFactors(tf_buf, info.tf_bytes / 4, n, max_factor, t.factors)) {
     return false;
   }
@@ -252,7 +296,13 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
       MTLTessellationPartitionModeInteger, MTLTessellationPartitionModePow2,
       MTLTessellationPartitionModeFractionalOdd, MTLTessellationPartitionModeFractionalEven};
   t.partition = parts[std::min<u32>((tf >> 2) & 7, 3)];
-  t.winding = ((tf >> 5) & 7) == 3 ? MTLWindingCounterClockwise : MTLWindingClockwise;
+  // GCN's tessellator follows D3D (domain origin upper-left), Metal's has the
+  // origin lower-left (as MoltenVK notes), so the output winding flips.
+  t.winding = ((tf >> 5) & 7) == 3 ? MTLWindingClockwise : MTLWindingCounterClockwise;
+  static const bool wind_as_is = std::getenv("DC_TESS_WIND_ASIS") != nullptr;
+  if (wind_as_is) {
+    t.winding = t.winding == MTLWindingClockwise ? MTLWindingCounterClockwise : MTLWindingClockwise;
+  }
   info.stage = Shader::TessStage::Domain;
   t.info = info;
   if (trace) {

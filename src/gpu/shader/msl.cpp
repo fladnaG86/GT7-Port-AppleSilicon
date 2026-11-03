@@ -2037,11 +2037,13 @@ std::string Emitter::Run() {
                           : "    o = dc_run(vid, iid, " + args + ");\n";
         }
         if (o.debug_capture) {
-            src += "    if (vid < 32u) { dbg[vid * 2u] = o.pos; }\n";
+            src += domain ? "    uint dv_ = vid & 7u;\n    dbg[dv_ * 2u] = o.pos;\n"
+                          : "    if (vid < 32u) { dbg[vid * 2u] = o.pos; }\n";
         }
         src += "    o.pos = dc_viewport(o.pos, draw);\n";
         if (o.debug_capture) {
-            src += "    if (vid < 32u) { dbg[vid * 2u + 1u] = o.pos; }\n";
+            src += domain ? "    dbg[dv_ * 2u + 1u] = float4(dc_pos.xy, float(vid), 0.0f);\n"
+                          : "    if (vid < 32u) { dbg[vid * 2u + 1u] = o.pos; }\n";
         }
         src += "    return o;\n}\n";
     } else if (p.stage == Stage::Fragment) {
