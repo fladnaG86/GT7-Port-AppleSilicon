@@ -30,6 +30,7 @@ constexpr u32 Draw = 4;     // constant DcDraw (vertex stage)
 constexpr u32 Gds = 5;      // device uint[16K]: the queue's 64 KB GDS partition (compute stage)
 constexpr u32 Linear = 8;   // constant uint[]: translated linear bases (MslOptions::linear_mask)
 constexpr u32 GsIndex = 9;  // device uint*: copy-VS indices a GS kernel writes (MslOptions::ring)
+constexpr u32 TessLds = 10; // device uint*: LS/HS LDS slices (MslOptions::tess)
 } // namespace Binding
 
 // Geometry-shader emulation. Metal has no GS stage: the ES and the GS of a GS
@@ -54,6 +55,28 @@ struct RingInfo {
     u32 GsGroupBytes() const { return vert_itemsize * slots * 16 * 4; }
     // Copy-VS indices a GS thread writes: its strip as a triangle list.
     u32 IndicesPerPrim() const { return slots > 2 ? (slots - 2) * 3 : 0; }
+};
+
+// Tessellation emulation (VGT_SHADER_STAGES_EN.HS_EN). Metal's tessellator
+// has no LS/HS stages: the LS and HS run as compute kernels with LDS kept in
+// a device buffer (one slice per HS threadgroup, so the HS kernel finds what
+// the LS wrote), the HS writes tess factors and off-chip outputs to guest
+// memory through its V#s, and the VS runs as Metal's post-tessellation vertex
+// function. The system SGPRs / VGPRs the hardware would hand each stage are
+// built here from the threadgroup and patch ids, consistently between stages.
+enum class TessStage : u8 { None, Local, Hull, Domain };
+struct TessInfo {
+    TessStage stage = TessStage::None;
+    u32 patches = 0;     // patches per HS threadgroup (VGT_LS_HS_CONFIG.NUM_PATCHES)
+    u32 cp_in = 0;       // LS vertices per patch
+    u32 cp_out = 0;      // HS threads per patch
+    u32 lds_dwords = 0;  // LS/HS: LDS slice per threadgroup (Binding::TessLds)
+    u32 oc_bytes = 0;    // off-chip bytes per threadgroup (the oc offset SGPR)
+    u32 tf_bytes = 0;    // HS: tess-factor bytes per patch (the tf offset SGPR)
+    bool oc_sgpr = false; // RSRC2.OC_LDS_EN: the off-chip offset SGPR follows user data
+    u8 index_size = 0;   // LS: bytes per index read from Binding::GsIndex; 0 = not indexed
+    u8 domain = 2;       // VGT_TF_PARAM.TYPE: 1 tri, 2 quad
+    bool operator==(const TessInfo&) const = default;
 };
 
 // Host-side mirrors of the MSL structs in the prelude.
@@ -146,6 +169,8 @@ struct MslOptions {
     u32 linear_aligned = 0;
     // Compute only: this program is the ES or GS of a GS pipeline (RingInfo).
     RingInfo ring;
+    // LS / HS (compute) or domain VS (vertex) of a tessellation pipeline.
+    TessInfo tess;
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
     // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).
     bool depth_bounds = false;

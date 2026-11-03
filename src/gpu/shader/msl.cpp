@@ -1008,7 +1008,8 @@ void Emitter::EmitDs(const Inst& i) {
         SetV(i.dst, VName(i.vaddr));
         return;
     }
-    if (p.stage != Stage::Compute) {
+    // The domain VS reads the HS outputs its patch's threadgroup left in LDS.
+    if (p.stage != Stage::Compute && o.tess.stage != TessStage::Domain) {
         Unsupported(i);
         return;
     }
@@ -1817,6 +1818,17 @@ std::string Emitter::Run() {
             sinit[nud] = "dc_gid.x * " + N(o.ring.GsGroupBytes() / 16) + "u"; // gs2vs_offset
             sinit[nud + 1] = "dc_gid.x";                                       // gs_wave_id
         }
+        // Emulated HS: [off-chip offset (OC_LDS_EN)], tess-factor offset, per
+        // threadgroup, so its patches land contiguously in both buffers.
+        if (o.tess.stage == TessStage::Hull) {
+            u32 k2 = nud;
+            if (o.tess.oc_sgpr) {
+                sinit[k2++] = "dc_gid.x * " + N(o.tess.oc_bytes) + "u";
+            }
+            sinit[k2] = "dc_gid.x * " + N(o.tess.patches * o.tess.tf_bytes) + "u";
+        }
+    } else if (p.stage == Stage::Vertex && o.tess.stage == TessStage::Domain && o.tess.oc_sgpr) {
+        sinit[nud] = "(vid / " + N(o.tess.patches) + "u) * " + N(o.tess.oc_bytes) + "u"; // off-chip offset
     }
     for (u32 k = 0; k < std::max(max_sgpr, nud); ++k) {
         dl("uint s" + N(k) + " = " + sinit[k] + ";");
@@ -1824,7 +1836,21 @@ std::string Emitter::Run() {
     dl("uint vcc_lo = 0u, vcc_hi = 0u, exec_lo = 0xffffffffu, exec_hi = 0xffffffffu, m0r = 0u, dc_null = 0u;");
     dl("bool scc = false;");
     std::vector<std::string> vinit(max_vgpr, "0u");
-    if (p.stage == Stage::Vertex) {
+    if (p.stage == Stage::Vertex && o.tess.stage == TessStage::Domain) {
+        // u, v, relative patch id, patch id (vid is the Metal patch id).
+        const char* dv[4] = {"as_type<uint>(dc_uv.x)", "as_type<uint>(dc_uv.y)", "", "vid"};
+        const std::string rel = "(vid % " + N(o.tess.patches) + "u)";
+        for (u32 k = 0; k < 4 && k < vinit.size(); ++k) vinit[k] = k == 2 ? rel : dv[k];
+    } else if (p.stage == Stage::Compute && o.tess.stage == TessStage::Local) {
+        // Vertex index, relative vertex in the threadgroup, instance 0.
+        if (vinit.size() > 0) vinit[0] = o.tess.index_size ? "uint(dc_tsidx[dc_gtid.x])" : "dc_gtid.x";
+        if (vinit.size() > 1) vinit[1] = "dc_lidx";
+    } else if (p.stage == Stage::Compute && o.tess.stage == TessStage::Hull) {
+        // Patch id, then relative patch id | control point id << 8.
+        const std::string rel = "(dc_lidx / " + N(o.tess.cp_out) + "u)";
+        if (vinit.size() > 0) vinit[0] = "(dc_gid.x * " + N(o.tess.patches) + "u + " + rel + ")";
+        if (vinit.size() > 1) vinit[1] = "(" + rel + " | ((dc_lidx % " + N(o.tess.cp_out) + "u) << 8))";
+    } else if (p.stage == Stage::Vertex) {
         if (!vinit.empty()) vinit[0] = "vid";
         for (u32 k = 1; k <= 3 && k < vinit.size(); ++k) {
             if (k <= p.vgpr_comp_cnt) vinit[k] = "iid";
@@ -1912,6 +1938,15 @@ std::string Emitter::Run() {
         wrapped = body;
     }
 
+    const bool tess_lds = o.tess.stage != TessStage::None;
+    if (tess_lds) {
+        for (const auto& [from, to] : {std::pair<std::string, std::string>{"(threadgroup ", "(device "},
+                                       {"mem_flags::mem_threadgroup)", "mem_flags::mem_device)"}}) {
+            for (size_t at = 0; (at = wrapped.find(from, at)) != std::string::npos; at += to.size()) {
+                wrapped.replace(at, from.size(), to);
+            }
+        }
+    }
     std::string src = kMslPrelude;
     if (o.map_hoist) {
         for (const auto& [from, to] : {std::pair<std::string, std::string>{"((device const int*)(m.map + 1))", "m.mapl.entries"},
@@ -1950,12 +1985,18 @@ std::string Emitter::Run() {
             }
             src += "};\n\n";
         }
-        src += "static VsOut dc_run(uint vid, uint iid, constant uint* ud, thread const DcMem& mem" +
+        const bool domain = o.tess.stage == TessStage::Domain;
+        src += "static VsOut dc_run(uint vid, uint iid, " + std::string(domain ? "float2 dc_uv, device uint* lds, " : "") +
+               "constant uint* ud, thread const DcMem& mem" +
                std::string(stage_in ? ", thread const VsIn& in_" : "") + TexParams(false) +
                ") {\n    VsOut out = {};\n" + (o.points ? "    out.psize = 1.0f;\n" : "") + decl + wrapped + "}\n\n";
         const std::string args = "ud, mem" + std::string(stage_in ? ", in_" : "") + TexArgs();
-        src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " +
-               std::string(stage_in ? "VsIn in_ [[stage_in]], " : "") + mem_params +
+        src += domain ? std::string(o.tess.domain == 1 ? "[[patch(triangle)]] " : "[[patch(quad)]] ") +
+                            "vertex VsOut main0(uint vid [[patch_id]], " +
+                            (o.tess.domain == 1 ? "float3" : "float2") + " dc_pos [[position_in_patch]], uint iid [[instance_id]], " +
+                            "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]], "
+                      : std::string("vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], ");
+        src +=                std::string(stage_in ? "VsIn in_ [[stage_in]], " : "") + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
                TexParams(true) + ") {\n";
         src += "    " + MemInit() + "\n    VsOut o;\n";
@@ -1984,7 +2025,9 @@ std::string Emitter::Run() {
             }
             src += "        }\n    }\n";
         } else {
-            src += "    o = dc_run(vid, iid, " + args + ");\n";
+            src += domain ? "    o = dc_run(vid, iid, dc_pos.xy, dc_ldsm + (vid / " + N(o.tess.patches) + "u) * " +
+                                N(o.tess.lds_dwords) + "u, " + args + ");\n"
+                          : "    o = dc_run(vid, iid, " + args + ");\n";
         }
         if (o.debug_capture) {
             src += "    if (vid < 32u) { dbg[vid * 2u] = o.pos; }\n";
@@ -2037,13 +2080,22 @@ std::string Emitter::Run() {
         src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
                "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], "
                "uint3 dc_gtid [[thread_position_in_grid]], " +
-               mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
+               mem_params + ", device uint* gds [[buffer(5)]], " +
+               (tess_lds ? "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]"
+                         : std::string("threadgroup uint* lds [[threadgroup(0)]]")) +
+               (o.tess.index_size ? std::string(", device const ") + (o.tess.index_size == 2 ? "ushort" : "uint") +
+                                        "* dc_tsidx [[buffer(" + N(Binding::GsIndex) + ")]]"
+                                  : "") +
+               probe_param + TexParams(true) +
                (o.ring.stage == RingStage::Geometry ? ", device uint* dc_gsidx [[buffer(" + N(Binding::GsIndex) + ")]]" : "") +
                (o.ring.index_size ? std::string(", device const ") + (o.ring.index_size == 2 ? "ushort" : "uint") +
                                         "* dc_esidx [[buffer(" + N(Binding::GsIndex) + ")]]"
                                   : "") +
                ") {\n";
         src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
+        if (tess_lds) {
+            src += "    device uint* lds = dc_ldsm + dc_gid.x * " + N(o.tess.lds_dwords) + "u;\n";
+        }
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
         if (o.ring.stage != RingStage::None) {
             // One thread per vertex / primitive exactly (dispatchThreads).
