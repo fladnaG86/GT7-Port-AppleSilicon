@@ -1468,6 +1468,11 @@ struct MetalRenderer::Impl {
     }
     RenderTarget *z = it->second.back().get();
     id<MTLTexture> tex = z->tex;
+    if (tex && (tex.pixelFormat == MTLPixelFormatDepth32Float ||
+                tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)) {
+      ZStat32(*z, draws);
+      return;
+    }
     if (!tex || tex.pixelFormat != MTLPixelFormatDepth16Unorm || tex.textureType != MTLTextureType2D) {
       DC_INFO("gpu: zstat %#llx: fmt %lu type %lu not read back (%llu draws)",
               (unsigned long long)zstat_addr, (unsigned long)tex.pixelFormat,
@@ -1522,6 +1527,86 @@ struct MetalRenderer::Impl {
               (unsigned long long)draws, (unsigned long long)written, init, pend, clear,
               lo / 65535.0, hi / 65535.0, sum / total / 65535.0, n_one * 100 / total,
               n_zero * 100 / total, grid.c_str());
+    }];
+  }
+
+  // ZStat for 32-bit float depth, every slice of an array (shadow cascades).
+  // DC_ZSTAT_UV=u,v also prints the texel there in each slice.
+  void ZStat32(RenderTarget &z, u64 draws) {
+    id<MTLTexture> tex = z.tex;
+    const u32 w = z.width, h = z.height;
+    const u32 slices = tex.textureType == MTLTextureType2DArray ? u32(tex.arrayLength) : 1;
+    const u64 slice_bytes = u64(w) * h * 4;
+    id<MTLBuffer> b = [device newBufferWithLength:slice_bytes * slices
+                                          options:MTLResourceStorageModeShared];
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> e = [cmd blitCommandEncoder];
+    const MTLBlitOption opt = tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8
+                                  ? MTLBlitOptionDepthFromDepthStencil
+                                  : MTLBlitOptionNone;
+    for (u32 s = 0; s < slices; ++s) {
+      [e copyFromTexture:tex sourceSlice:s sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:slice_bytes * s
+          destinationBytesPerRow:w * 4 destinationBytesPerImage:slice_bytes options:opt];
+    }
+    [e endEncoding];
+    static const std::pair<float, float> uv = [] {
+      std::pair<float, float> p{-1.0f, -1.0f};
+      if (const char *e = std::getenv("DC_ZSTAT_UV")) {
+        char *q = nullptr;
+        p.first = std::strtof(e, &q);
+        p.second = *q == ',' ? std::strtof(q + 1, nullptr) : 0.0f;
+      }
+      return p;
+    }();
+    const u64 addr = zstat_addr, frame = frame_count, written = z.written;
+    const bool init = z.initialized, pend = z.clear_pending;
+    const float clear = z.clear_depth;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      for (u32 s = 0; s < slices; ++s) {
+        const float *d = static_cast<const float *>(b.contents) + u64(w) * h * s;
+        float lo = 1e30f, hi = -1e30f;
+        double sum = 0;
+        u64 n_clear = 0;
+        constexpr u32 kG = 8;
+        u64 cell[kG * kG] = {};
+        for (u32 y = 0; y < h; ++y) {
+          for (u32 x = 0; x < w; ++x) {
+            const float v = d[u64(y) * w + x];
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+            sum += v;
+            if (v == clear) {
+              ++n_clear;
+            } else {
+              ++cell[(y * kG / h) * kG + x * kG / w];
+            }
+          }
+        }
+        std::string grid;
+        const u64 per = u64(w / kG) * (h / kG);
+        for (u32 c = 0; c < kG * kG; ++c) {
+          grid += char('0' + std::min<u64>(9, cell[c] * 10 / std::max<u64>(1, per)));
+          if (c % kG == kG - 1 && c + 1 < kG * kG) {
+            grid += '/';
+          }
+        }
+        std::string at;
+        if (uv.first >= 0) {
+          const u32 x = std::min<u32>(w - 1, u32(uv.first * w)),
+                    y = std::min<u32>(h - 1, u32(uv.second * h));
+          char buf[96];
+          std::snprintf(buf, sizeof(buf), ", at %u,%u: %.5f", x, y, d[u64(y) * w + x]);
+          at = buf;
+        }
+        const double total = double(w) * h;
+        DC_INFO("gpu: zstat %#llx flip %llu slice %u/%u %ux%u: %llu draws, written %llu init %d "
+                "pending %d clear %g: min %.5f max %.5f mean %.5f, at clear %.1f%%%s, drawn %s",
+                (unsigned long long)addr, (unsigned long long)frame, s, slices, w, h,
+                (unsigned long long)draws, (unsigned long long)written, init, pend, clear, lo, hi,
+                sum / total, n_clear * 100 / total, at.c_str(), grid.c_str());
+      }
     }];
   }
 
@@ -2840,6 +2925,21 @@ struct MetalRenderer::Impl {
                      ? rt->tex
                      : TargetView(*rt, 0, rt->levels, MTLPixelFormatInvalid, 0,
                                   1, swz);
+        }
+      }
+      if (tt.dim == TexDim::Tex2DArray) {
+        // Shadow cascades: a layered depth surface (DB_DEPTH_VIEW) read back
+        // as a 2D array, GT7's sun cascades 0x900da10000. Guest memory never
+        // holds it, so falling through samples zeros: everything shadowed.
+        RenderTarget *rt = Latest(depth_targets, addr, tt.dim, width, height);
+        if (rt && rt->width == width && rt->height == height) {
+          if (rt->depth_or_layers < base_array + slice_count) { // as for color
+            rt = &GetTarget(depth_targets, addr, rt->tex.pixelFormat, width, height,
+                            true, rt->levels, TexDim::Tex2DArray,
+                            base_array + slice_count);
+          }
+          return TargetView(*rt, 0, rt->levels, MTLPixelFormatInvalid, base_array,
+                            slice_count, swz);
         }
       }
     }
@@ -4759,6 +4859,25 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   ++work_since_commit;
   const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
   const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
+  // DC_TRACE_PS=<hex ps>,<frames>: trace the flip after the n-th one that runs
+  // that pixel shader, for scenes whose flip numbers vary between replays.
+  static const u64 trace_ps =
+      std::getenv("DC_TRACE_PS") ? std::strtoull(std::getenv("DC_TRACE_PS"), nullptr, 16) : 0;
+  if (trace_ps && ps_addr == trace_ps && !trace_frame) {
+    static const u32 want = [] {
+      const char *c = std::strchr(std::getenv("DC_TRACE_PS"), ',');
+      return c ? u32(std::atoi(c + 1)) : 1u;
+    }();
+    static u64 last_frame = ~0ull;
+    static u32 frames = 0;
+    if (last_frame != frame_count) {
+      last_frame = frame_count;
+      if (++frames >= want) {
+        trace_frame = frame_count + 1;
+        DC_INFO("gpu: DC_TRACE_PS: tracing flip %llu", (unsigned long long)trace_frame);
+      }
+    }
+  }
   if (edr_armed) {
     EdrCapture();
   }
@@ -4896,6 +5015,19 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }();
   if (!skip_ps.empty() && std::find(skip_ps.begin(), skip_ps.end(), ps_addr) !=
                               skip_ps.end()) { // debug: drop these pixel shaders' draws
+    return;
+  }
+  // DC_SKIP_DRAW=<hex ps>:<count>: drop only that shader's draws of that index count.
+  static const std::pair<u64, u32> skip_draw = [] {
+    std::pair<u64, u32> p{0, 0};
+    if (const char *e = std::getenv("DC_SKIP_DRAW")) {
+      char *q = nullptr;
+      p.first = std::strtoull(e, &q, 16);
+      p.second = *q == ':' ? u32(std::strtoul(q + 1, nullptr, 10)) : 0;
+    }
+    return p;
+  }();
+  if (skip_draw.first && ps_addr == skip_draw.first && dc.count == skip_draw.second) {
     return;
   }
 
@@ -6515,7 +6647,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   if (trace_frame) {
     trace = frame_count == trace_frame;
   }
-  if (zstat_addr && frame_count % zstat_every == 0) {
+  // Also right after a traced flip: the surface its probes sampled.
+  if (zstat_addr && (frame_count % zstat_every == 0 ||
+                     (trace_frame && frame_count == trace_frame + 1))) {
     ZStat();
   }
   {
