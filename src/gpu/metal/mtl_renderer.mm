@@ -5727,6 +5727,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       ReportOnce("primitive type 9 not supported (tessellation off, DC_TESS=1)");
       return;
     }
+    if (static const bool nodepth = std::getenv("DC_TESS_NODEPTH") != nullptr; nodepth) {
+      static id<MTLDepthStencilState> always = [&] {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = NO;
+        return [device newDepthStencilStateWithDescriptor:dd];
+      }();
+      [enc setDepthStencilState:always];
+      bound.depth_state = nil;
+    }
     if (static const bool nocull = std::getenv("DC_TESS_NOCULL") != nullptr; nocull) {
       [enc setCullMode:MTLCullModeNone];
       bound.cull = int(MTLCullModeNone);
