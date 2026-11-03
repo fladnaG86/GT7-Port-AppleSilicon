@@ -147,8 +147,9 @@ s32 sceKernelBatchMap2(BatchMapEntry* entries, int count, int* done, int flags) 
             break;
         }
         if (result != ORBIS_OK) {
-            DC_WARN("batch map entry %d op %d at %p len %#llx failed: %#x (from %s)", applied, e.op,
-                    e.start, e.len, result,
+            DC_WARN("batch map entry %d/%d op %d at %p phys %#llx len %#llx prot %#x type %d "
+                    "flags %#x failed: %#x (from %s)",
+                    applied, count, e.op, e.start, e.phys, e.len, e.prot, e.type, flags, result,
                     Core::Loader::Linker::Instance()
                         ->Describe(reinterpret_cast<u64>(__builtin_return_address(0)))
                         .c_str());
@@ -174,7 +175,9 @@ s32 sceKernelSetVirtualRangeName(void* addr, u64 len, const char* name) {
     return ORBIS_OK;
 }
 
-s32 sceKernelSetPrtAperture(int, void*, u64) {
+// PRT apertures only change how the real GPU treats unmapped pages.
+s32 sceKernelSetPrtAperture(int id, void* addr, u64 len) {
+    DC_INFO("prt aperture %d at %p len %#llx", id, addr, len);
     return ORBIS_OK;
 }
 

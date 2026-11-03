@@ -115,6 +115,45 @@ bool RelocateGt7Arenas(const Loader::Module& exe) {
     return true;
 }
 
+// GT7 v1.00 places its two PRT apertures (sceKernelSetPrtAperture 0: the
+// sun shadow map, 4 GB at 0x2900000000; 1: a virtual texture pool, 8 GB at
+// 0x3000000000) inside the Rosetta hole too, so every batch map of their tiles
+// failed with EINVAL. Tile and T# addresses all derive from these movabs, so
+// setting bit 39 moves the apertures the same way as the arenas above.
+void RelocateGt7PrtApertures(const Loader::Module& exe) {
+    struct Site {
+        u64 offset;
+        u8 opcode; // movabs into this register
+        u64 imm;
+    };
+    static constexpr Site kSites[] = {
+        {0x33ae662, 0xbb, 0x2900000000}, // aperture 0 base
+        {0x33ae6a4, 0xbf, 0x2980000000}, // its upper 2 GB
+        {0x335e86c, 0xbe, 0x3000000000}, // aperture 1 base
+        {0x335f08b, 0xbf, 0x3000000000}, // aperture 1 base as a T# address
+    };
+    constexpr u64 kMove = 0x8000000000;
+    for (const Site& s : kSites) {
+        const auto* code = reinterpret_cast<const u8*>(exe.Base() + s.offset);
+        u64 imm;
+        std::memcpy(&imm, code + 2, sizeof(imm));
+        if (code[0] != 0x48 || code[1] != s.opcode || imm != s.imm) {
+            DC_WARN("gt7 prt apertures: unexpected code at %#llx, not moved", s.offset);
+            return;
+        }
+    }
+    for (const Site& s : kSites) {
+        auto* code = reinterpret_cast<u8*>(exe.Base() + s.offset);
+        const VAddr page = reinterpret_cast<VAddr>(code) & ~0xFFFull;
+        mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+        const u64 imm = s.imm | kMove;
+        std::memcpy(code + 2, &imm, sizeof(imm));
+        mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
+    }
+    DC_INFO("gt7 prt apertures: 0x2900000000 -> %#llx, 0x3000000000 -> %#llx",
+            0x2900000000ull | kMove, 0x3000000000ull | kMove);
+}
+
 // GT7's logger buffers its file output, so the last lines before a hang never
 // reach it. DC_GAME_LOG sends every line to our log as it is emitted.
 extern "C" void DcGt7Log(void*, int level, void*, void*, const char* file, int line,
@@ -156,6 +195,7 @@ void HookGt7Log(const Loader::Module& exe) {
 
 void RelocateFixedHeap(const Loader::Module& exe) {
     if (RelocateGt7Arenas(exe)) {
+        RelocateGt7PrtApertures(exe);
         HookGt7Log(exe);
         GuestTrace::Start(exe.Base());
         return;
