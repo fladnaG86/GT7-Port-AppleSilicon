@@ -180,7 +180,8 @@ constexpr u16 Vgpr0 = 256;
     X(BUFFER_ATOMIC_ADD, 50) X(BUFFER_ATOMIC_SUB, 51) X(BUFFER_ATOMIC_SMIN, 53)                    \
     X(BUFFER_ATOMIC_UMIN, 54) X(BUFFER_ATOMIC_SMAX, 55) X(BUFFER_ATOMIC_UMAX, 56)                  \
     X(BUFFER_ATOMIC_AND, 57) X(BUFFER_ATOMIC_OR, 58) X(BUFFER_ATOMIC_XOR, 59)                      \
-    X(BUFFER_ATOMIC_INC, 60) X(BUFFER_ATOMIC_DEC, 61) X(BUFFER_WBINVL1_SC, 112)                    \
+    X(BUFFER_ATOMIC_INC, 60) X(BUFFER_ATOMIC_DEC, 61) X(BUFFER_ATOMIC_FCMPSWAP, 62)               \
+    X(BUFFER_ATOMIC_FMIN, 63) X(BUFFER_ATOMIC_FMAX, 64) X(BUFFER_WBINVL1_SC, 112)                 \
     X(BUFFER_WBINVL1, 113)
 
 #define GCN_MTBUF(X)                                                                               \

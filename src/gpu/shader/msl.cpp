@@ -1087,6 +1087,21 @@ void Emitter::EmitDs(const Inst& i) {
         Line("}");
         return;
     }
+    // Pixel shaders get no LDS on Metal. GT7's forward shaders use it as a
+    // per-lane slot (address = lane * 4 from mbcnt, write then read back by
+    // the same lane) for the light index of the cluster loop: a private array
+    // per thread, indexed by the immediate offset only.
+    if (p.stage == Stage::Fragment &&
+        (static_cast<Ds>(i.op) == Ds::DS_WRITE_B32 || static_cast<Ds>(i.op) == Ds::DS_READ_B32)) {
+        const u32 off16 = (u32(i.offset1) << 8) | i.offset0;
+        const std::string slot = "dc_plds[" + N((off16 >> 2) & 15) + "]";
+        if (static_cast<Ds>(i.op) == Ds::DS_WRITE_B32) {
+            Line(std::string(guard ? "if (exec_lo != 0u) " : "") + slot + " = " + VName(i.data0) + ";");
+        } else {
+            SetV(i.dst, slot);
+        }
+        return;
+    }
     // The domain VS reads the HS outputs its patch's threadgroup left in LDS.
     if (p.stage != Stage::Compute && o.tess.stage != TessStage::Domain) {
         Unsupported(i);
@@ -1392,6 +1407,23 @@ void Emitter::EmitBuffer(const Inst& i) {
     case Mubuf::BUFFER_ATOMIC_OR: atomic("atomic_fetch_or_explicit", false); break;
     case Mubuf::BUFFER_ATOMIC_XOR: atomic("atomic_fetch_xor_explicit", false); break;
     case Mubuf::BUFFER_ATOMIC_SWAP: atomic("atomic_exchange_explicit", false); break;
+    // Sea Islands float min/max (GT7 builds its Hi-Z occlusion depth with
+    // FMAX): a compare-exchange loop on the bits, Metal has no float min/max.
+    case Mubuf::BUFFER_ATOMIC_FMIN:
+    case Mubuf::BUFFER_ATOMIC_FMAX: {
+        const char* f = static_cast<Mubuf>(i.op) == Mubuf::BUFFER_ATOMIC_FMIN ? "fmin" : "fmax";
+        Line("  device uint* p_ = oob_ ? nullptr : dc_ptr(" + M + ", a_);");
+        Line("  uint r_ = 0u; " + std::string(guard ? "if (p_ && exec_lo != 0u) " : "if (p_) ") +
+             "{ device atomic_uint* q_ = (device atomic_uint*)p_; uint o_ = atomic_load_explicit(q_, "
+             "memory_order_relaxed); for (;;) { const uint n_ = as_type<uint>(" + std::string(f) +
+             "(as_type<float>(o_), as_type<float>(" + VName(i.vdata) + "))); if (n_ == o_ || "
+             "atomic_compare_exchange_weak_explicit(q_, &o_, n_, memory_order_relaxed, "
+             "memory_order_relaxed)) break; } r_ = o_; }");
+        if (i.glc) {
+            SetV(i.vdata, "r_");
+        }
+        break;
+    }
     case Mubuf::BUFFER_WBINVL1:
     case Mubuf::BUFFER_WBINVL1_SC:
         break;
@@ -2176,6 +2208,7 @@ std::string Emitter::Run() {
         }
         src += "    " + MemInit() + "\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
+        src += "    uint dc_plds[16] = {}; (void)dc_plds;\n";
         src += "    (void)mem; (void)dc_qlane;\n";
         src += decl + wrapped + "}\n";
     } else {
