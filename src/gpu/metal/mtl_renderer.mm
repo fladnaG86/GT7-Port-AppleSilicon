@@ -606,6 +606,7 @@ struct MetalRenderer::Impl {
   struct MipAlias {
     u64 parent = 0;
     u32 level = 0;
+    u32 slice = 0; // array slice (cube face) of that level the address starts
     u32 width = 0, height = 0;
     MTLPixelFormat fmt = MTLPixelFormatInvalid;
   };
@@ -1615,7 +1616,13 @@ struct MetalRenderer::Impl {
               (unsigned long)f);
       return;
     }
-    const u32 w = u32(tex.width), h = u32(tex.height);
+    // DC_DUMP_BOUND_LEVEL=<n>: that mip level instead of 0 (filters reading low mips).
+    static const u32 level_want = [] {
+      const char *e = std::getenv("DC_DUMP_BOUND_LEVEL");
+      return e ? u32(std::strtoul(e, nullptr, 10)) : 0u;
+    }();
+    const u32 level = std::min<u32>(level_want, u32(tex.mipmapLevelCount) - 1);
+    const u32 w = std::max(1u, u32(tex.width) >> level), h = std::max(1u, u32(tex.height) >> level);
     const u32 slices = tex.textureType == MTLTextureType2DArray ||
                                tex.textureType == MTLTextureTypeCubeArray ||
                                tex.textureType == MTLTextureTypeCube
@@ -1628,7 +1635,7 @@ struct MetalRenderer::Impl {
     EnsureCommandBuffer();
     id<MTLBlitCommandEncoder> e = [cmd blitCommandEncoder];
     for (u32 s = 0; s < slices; ++s) {
-      [e copyFromTexture:tex sourceSlice:s sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+      [e copyFromTexture:tex sourceSlice:s sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0)
               sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:slice_bytes * s
           destinationBytesPerRow:w * bpp destinationBytesPerImage:slice_bytes];
     }
@@ -3125,6 +3132,8 @@ struct MetalRenderer::Impl {
         PixelBytes(fi.format) == PixelBytes(it->second.fmt)) {
       if (RenderTarget *p = MipParent(addr, it->second.fmt, width, height)) {
         const u32 lv = it->second.level;
+        const u32 sl = it->second.slice + (tt.dim == TexDim::Tex2DArray ? base_array : 0);
+        const bool as2d = tt.dim == TexDim::Tex2D;
         if (storage) {
           p->initialized = true;
           p->clear_pending = false;
@@ -3132,12 +3141,12 @@ struct MetalRenderer::Impl {
           NoteTargetWritten(*p);
           type_out->ufloat = p->tex.pixelFormat == MTLPixelFormatRG11B10Float;
           return TargetView(*p, lv + base_level, 1, MTLPixelFormatInvalid,
-                            base_array, slice_count);
+                            sl, slice_count, kIdentitySwizzle, as2d);
         }
         tt.sample = SampleKind(p->tex.pixelFormat);
         *type_out = tt;
         return TargetView(*p, lv + base_level, last_level - base_level + 1,
-                          MTLPixelFormatInvalid, base_array, slice_count, swz);
+                          MTLPixelFormatInvalid, sl, slice_count, swz, as2d);
       }
     }
 
@@ -3921,9 +3930,15 @@ struct MetalRenderer::Impl {
   id<MTLTexture> TargetView(RenderTarget &rt, u32 base, u32 count,
                             MTLPixelFormat fmt = MTLPixelFormatInvalid,
                             u32 sbase = 0, u32 scount = ~0u,
-                            u32 swz = kIdentitySwizzle) {
+                            u32 swz = kIdentitySwizzle, bool as2d = false) {
     if (fmt == MTLPixelFormatInvalid) {
       fmt = rt.tex.pixelFormat;
+    }
+    // One slice of an array seen through a 2D descriptor (a face or mip
+    // level of a cube written or read as a plain image): a 2D view.
+    as2d = as2d && rt.tex.textureType == MTLTextureType2DArray;
+    if (as2d) {
+      scount = 1;
     }
     base = std::min(base, rt.levels - 1);
     count = std::clamp<u32>(count, 1, rt.levels - base);
@@ -3933,20 +3948,20 @@ struct MetalRenderer::Impl {
     sbase = std::min(sbase, total - 1);
     scount = std::clamp<u32>(scount, 1, total - sbase);
     swz &= 0xFFF;
-    if (base == 0 && count == rt.levels && sbase == 0 && scount == total &&
+    if (!as2d && base == 0 && count == rt.levels && sbase == 0 && scount == total &&
         fmt == rt.tex.pixelFormat && swz == kIdentitySwizzle) {
       return rt.tex;
     }
     u64 key = Hash(base | (u64(count) << 8) | (u64(fmt) << 16) |
                    (u64(sbase) << 32) | (u64(scount) << 46));
-    key = Hash(swz, key);
+    key = Hash(swz | (u64(as2d) << 32), key);
     auto it = rt.views.find(key);
     if (it != rt.views.end()) {
       return it->second;
     }
     id<MTLTexture> v = [rt.tex
         newTextureViewWithPixelFormat:fmt
-                          textureType:rt.tex.textureType
+                          textureType:as2d ? MTLTextureType2D : rt.tex.textureType
                                levels:NSMakeRange(base, count)
                                slices:NSMakeRange(sbase, scount)
                               swizzle:MTLTextureSwizzleChannelsMake(
@@ -4426,9 +4441,22 @@ struct MetalRenderer::Impl {
     Tiling::MipLevel mips[16];
     Tiling::MipLayout(tiling, pitch, rt.height, layers, levels, bytes_per_el,
                       false, pow2, mips);
-    for (u32 m = 1; m < levels; ++m) {
-      const u64 a = rt.addr + mips[m].offset;
-      MipAlias alias{rt.addr, m, std::max(rt.width >> m, 1u),
+    // Every (level, slice) of the image starts at its own address: GT7 writes
+    // the faces of its reflection cube's mips one by one as 2D storage images
+    // (cs 0x9000e31f00 at 0x900b3b0000, 0x900b3c0000, ...) and reads faces of
+    // level 0 as 2D. Each is an alias of that slice of that level.
+    const u32 alias_slices =
+        rt.dim == TexDim::Tex2DArray ? std::min<u32>(layers, rt.depth_or_layers) : 1;
+    for (u32 m = 0; m < levels; ++m) {
+     for (u32 k = 0; k < alias_slices; ++k) {
+      if (m == 0 && k == 0) {
+        continue; // the image itself
+      }
+      if (k && !mips[m].slice_size) {
+        break;
+      }
+      const u64 a = rt.addr + mips[m].offset + u64(k) * mips[m].slice_size;
+      MipAlias alias{rt.addr, m, k, std::max(rt.width >> m, 1u),
                      std::max(rt.height >> m, 1u), rt.tex.pixelFormat};
       auto [it, added] = mip_alias.try_emplace(a, alias);
       if (!added) {
@@ -4448,10 +4476,10 @@ struct MetalRenderer::Impl {
           ++i;
           continue;
         }
-        if (c.initialized) {
+        const u32 dst_slices = rt.dim == TexDim::Tex2DArray ? rt.depth_or_layers : 1;
+        if (c.initialized && k < dst_slices) {
           const u32 n = std::min<u32>(
-              c.dim == TexDim::Tex2DArray ? c.depth_or_layers : 1,
-              rt.dim == TexDim::Tex2DArray ? rt.depth_or_layers : 1);
+              c.dim == TexDim::Tex2DArray ? c.depth_or_layers : 1, dst_slices - k);
           EndPass();
           EnsureCommandBuffer();
           id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
@@ -4459,15 +4487,15 @@ struct MetalRenderer::Impl {
                    sourceSlice:0
                    sourceLevel:0
                      toTexture:rt.tex
-              destinationSlice:0
+              destinationSlice:k
               destinationLevel:m
                     sliceCount:n
                     levelCount:1];
           [b endEncoding];
           rt.written = std::max(rt.written, c.written);
         }
-        DC_INFO("gpu: target %#llx %ux%u is level %u of %#llx", a, c.width,
-                c.height, m, rt.addr);
+        DC_INFO("gpu: target %#llx %ux%u is level %u slice %u of %#llx", a, c.width,
+                c.height, m, k, rt.addr);
         retired.push_back(std::move(v[i]));
         v.erase(v.begin() + i);
         ++texture_epoch; // surfaces went away: descriptors at `a` change
@@ -4475,6 +4503,7 @@ struct MetalRenderer::Impl {
       if (v.empty()) {
         color_targets.erase(list);
       }
+     }
     }
   }
 
@@ -4499,7 +4528,7 @@ struct MetalRenderer::Impl {
     const u32 view = r.ColorTarget(k, Reg::CB_VIEW);
     const u32 slice_start = view & 0x7FF, slice_max = (view >> 13) & 0x7FF;
     if (RenderTarget *p = MipParent(base, cf.format, width, height)) {
-      p->bind_slice = slice_start;
+      p->bind_slice = slice_start + mip_alias[base].slice;
       p->bind_level = mip_alias[base].level;
       p->clear_color = ClearColor(info, r.ColorTarget(k, Reg::CB_CLEAR_WORD0),
                                   r.ColorTarget(k, Reg::CB_CLEAR_WORD1));
