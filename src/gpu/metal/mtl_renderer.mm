@@ -2748,6 +2748,11 @@ struct MetalRenderer::Impl {
       const u32 size = Shader::Gcn::ProgramSize(code);
       std::ofstream(path, std::ios::binary)
           .write(reinterpret_cast<const char *>(code), size);
+      if (prog->fetch_address && prog->fetch_bytes) { // its inlined fetch subroutine
+        std::snprintf(path, sizeof(path), "%s/fetch_%llx.bin", dump_dir, (unsigned long long)prog->fetch_address);
+        std::ofstream(path, std::ios::binary)
+            .write(reinterpret_cast<const char *>(prog->fetch_address), prog->fetch_bytes);
+      }
     }
     ShaderEntry e;
     u32 bytes = 16;
@@ -5706,14 +5711,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     DC_INFO("gpu: draw #%llu prim=%#x count=%u idx=%d vs=%#llx ps=%#llx "
             "cb_mode=%u db_render=%#x "
             "db_ctl=%#x cb0=%#llx info=%#x mask=%#x z=%#llx/%#llx zinfo=%#x "
-            "blend0=%#x colfmt=%#x",
+            "blend0=%#x colfmt=%#x a2m=%#x",
             draw_count, static_cast<u32>(prim), dc.count, dc.indexed, vs_addr,
             ps_addr, cb_mode, db_render, db_control,
             u64(r.ColorTarget(0, Reg::CB_BASE)) << 8,
             r.ColorTarget(0, Reg::CB_INFO), r[Reg::CB_TARGET_MASK],
             u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
             r[Reg::DB_Z_INFO], r[Reg::CB_BLEND0_CONTROL],
-            r[Reg::SPI_SHADER_COL_FORMAT]);
+            r[Reg::SPI_SHADER_COL_FORMAT], r[Reg::DB_ALPHA_TO_MASK]);
     DC_INFO("gpu:   index base %#llx offset %u size %u instances %u first_vertex %u indirect %#llx",
             (unsigned long long)dc.index_base, dc.index_offset, dc.index_size, dc.instances,
             dc.first_vertex, (unsigned long long)dc.indirect_args);
@@ -6312,6 +6317,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.textures = ps_types; // borrowed, like vo.textures
     fo.depth_target = depth != nullptr;
     fo.depth_bounds = depth_bounds;
+    // DC_NO_A2M=1: ignore DB_ALPHA_TO_MASK (A/B).
+    static const bool no_a2m = std::getenv("DC_NO_A2M") != nullptr;
+    fo.alpha_to_mask = !no_a2m && (r[Reg::DB_ALPHA_TO_MASK] & 1);
     if (probe_slot >= 0) {
       fo.probe_pc = probe.pc;
       fo.probe_x = probe.x;
@@ -6321,6 +6329,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     ps_key = Hash(fo.probe_pc, ps_key);
     ps_key = Hash(fo.depth_target, ps_key);
     ps_key = Hash(fo.depth_bounds, ps_key);
+    ps_key = Hash(fo.alpha_to_mask, ps_key);
     ps_key = Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), ps_key);
     ps_key = Hash(fo.vs_param_mask, ps_key);
     ps_key = Hash(fo.ps_input_addr, ps_key);
@@ -6454,7 +6463,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         done_cv.notify_all();
       }, will_wait);
     }
-    if (!sync_shaders && probe_slot < 0) { // probed draws must run: wait
+    // Probed draws must run, and so must fused GS draws (text glyphs: each
+    // ES+GS+VS combination is its own pipeline, skipping it loses letters).
+    if (!sync_shaders && probe_slot < 0 && !fused_pending.on) {
       if (trace)
         DC_INFO("gpu:   skipped: pipeline compiling");
       return;

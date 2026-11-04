@@ -244,6 +244,9 @@ private:
     }
     void End() {
         if (p.stage == Stage::Fragment) {
+            if (o.alpha_to_mask && (p.mrt_mask & 1u) && (o.col_format & 0xFu) && o.mrt_type[0] == OutType::Float) {
+                Line("if (dc_exported && out.c0.w < 0.5f) discard_fragment();"); // DB_ALPHA_TO_MASK
+            }
             Line("if (!dc_exported) discard_fragment();");
         }
         if (o.ring.stage == RingStage::Geometry && o.ring.slots > 2) {

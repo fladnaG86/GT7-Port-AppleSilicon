@@ -102,6 +102,7 @@ constexpr u32 CB_BLEND0_CONTROL = 0xA1E0; // 8 entries
 constexpr u32 DB_DEPTH_CONTROL = 0xA200;
 constexpr u32 CB_COLOR_CONTROL = 0xA202;
 constexpr u32 DB_SHADER_CONTROL = 0xA203;
+constexpr u32 DB_ALPHA_TO_MASK = 0xA2DC; // bit 0 enable; alpha to coverage (one sample: an alpha test)
 constexpr u32 PA_CL_CLIP_CNTL = 0xA204;
 constexpr u32 PA_SU_SC_MODE_CNTL = 0xA205;
 constexpr u32 PA_CL_VTE_CNTL = 0xA206;

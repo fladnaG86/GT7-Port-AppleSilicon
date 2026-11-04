@@ -310,6 +310,29 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
             "(sgpr %d), tf sgpr %u, domain %u part %u",
             n, groups, info.patches, info.cp_in, info.cp_out, info.lds_dwords, info.oc_bytes,
             int(info.oc_sgpr), info.tf_sgpr, info.domain, (tf >> 2) & 7);
+    // The LS's fetch subroutine and vertex table: what the control points are.
+    const u32 *lud = r.UserData(Reg::SPI_SHADER_USER_DATA_LS_0);
+    const u64 table = u64(lud[2]) | (u64(lud[3]) << 32);
+    DC_INFO("gpu:   tess ls ud %08x %08x %08x %08x (fetch %#llx, table %#llx)", lud[0], lud[1], lud[2], lud[3],
+            (unsigned long long)(u64(lud[0]) | (u64(lud[1]) << 32)), (unsigned long long)table);
+    DC_INFO("gpu:   tess ls %#llx hs %#llx", (unsigned long long)r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_LS),
+            (unsigned long long)r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_HS));
+    if (Readable(table, 64)) {
+      const u32 *v = reinterpret_cast<const u32 *>(table);
+      // The first control points of V#0 as floats (12-byte records).
+      const u64 vb = (u64(v[0]) | (u64(v[1] & 0xFFF) << 32)) & kGpuAddrMask;
+      if (Readable(vb, 96)) {
+        const float *f = reinterpret_cast<const float *>(vb);
+        DC_INFO("gpu:   tess ls V#0 data: (%g %g %g) (%g %g %g) (%g %g %g) (%g %g %g)", f[0], f[1], f[2], f[3], f[4],
+                f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+      }
+      for (u32 k = 0; k < 4; ++k) {
+        DC_INFO("gpu:   tess ls vtx V#%u %08x %08x %08x %08x: base %#llx stride %u records %u dfmt %u nfmt %u", k,
+                v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3],
+                (unsigned long long)(u64(v[4 * k]) | (u64(v[4 * k + 1] & 0xFFF) << 32)), (v[4 * k + 1] >> 16) & 0x3FFF,
+                v[4 * k + 2], (v[4 * k + 3] >> 15) & 15, (v[4 * k + 3] >> 12) & 7);
+      }
+    }
   }
   auto copy = std::make_unique<RegFile>(r);
   (*copy)[Reg::VGT_SHADER_STAGES_EN] &= ~0x7u; // LS and HS done

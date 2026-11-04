@@ -165,6 +165,9 @@ struct MslOptions {
     std::array<OutType, 8> mrt_type{};
     u32 mrt_ufloat = 0; // MRTs stored as unsigned small floats (R11G11B10)
     bool depth_target = true; // false drops depth exports (no depth attachment)
+    // DB_ALPHA_TO_MASK on a single-sample target: MRT0 alpha below 0.5
+    // discards the fragment (GT7's foliage cut-outs).
+    bool alpha_to_mask = false;
     // Dual-source blending: the MRT1 export is the second blend source,
     // [[color(0), index(1)]], declared even when the shader never writes it.
     bool dual_source = false;
