@@ -11,7 +11,8 @@ using namespace metal;
 // the page's (phys - va) in 16 KB units (INT_MIN = unmapped).
 struct DcMap { ulong base; ulong pages; ulong split; uint shift; uint pad; ulong limit;
                ulong fva; ulong fsize; ulong foff; uint fhi; uint pad2; };
-struct DcDraw { float4 vp_scale; float4 vp_offset; float2 rt_scale; uint vte; uint pad; };
+struct DcDraw { float4 vp_scale; float4 vp_offset; float2 rt_scale; uint vte; uint pad;
+                ulong esgs_base; ulong esgs_bias; ulong gsvs_base; ulong gsvs_bias; };
 // DcMap's header copied into registers once per invocation (MslOptions::map_hoist).
 struct DcMapL { ulong base; ulong pages; ulong split; ulong limit; uint shift; device const int* entries;
                 ulong fva; ulong fsize; ulong foff; uint fhi; };

@@ -4959,6 +4959,169 @@ struct MetalRenderer::Impl {
   void Dispatch(const RegFile &r, u32 x, u32 y, u32 z);
   u64 indirect_args = 0; // guest address of the group counts (DispatchIndirect)
 
+  // An ES or GS run inside the copy VS's render pass as a vertex function
+  // (MslOptions::ring_vertex): queued by DrawGs, run by Draw once the pass is
+  // open, each followed by a vertex->vertex buffer barrier. Running them as
+  // compute kernels split the pass per GS draw (144 times a GT7 race frame,
+  // each a store and reload of the 1080p targets: 10 fps, 30 without them).
+  struct RingReq {
+    Shader::RingInfo ring;
+    u64 addr = 0;
+    u32 ud[16] = {};
+    u32 num_user_sgprs = 0;
+    u32 threads = 0;
+    u64 index_va = 0;
+  };
+  std::vector<RingReq> ring_pending;
+
+  // The ES and GS fused into the copy VS (MslOptions::FusedRing): no
+  // barriers, which cost ~0.7 ms per GS draw as separate vertex functions
+  // (35 ms of a race frame). Set by DrawGs for the copy draw that follows.
+  struct FusedPending {
+    bool on = false;
+    Shader::MslOptions::FusedRing fused;
+    u64 key = 0; // of the ES, GS and ring layout: part of the VS pipeline key
+    u64 es_addr = 0, gs_addr = 0;
+    u32 es_ud[16] = {}, gs_ud[16] = {};
+    u64 es_index_va = 0; // ES vertex indices (base vertex folded in), or 0
+    // The guest's ring bases and the offsets to this draw's arena copies.
+    u64 esgs_base = 0, esgs_bias = 0, gsvs_base = 0, gsvs_bias = 0;
+  } fused_pending;
+  std::unordered_map<u64, std::string> fused_src; // dc_es / dc_gs sources by their keys
+
+  // Whether `p` can run as a vertex function: no LDS, barriers or cross-lane
+  // ops (a vertex function has no threadgroup). DC_GS_COMPUTE=1 keeps the
+  // compute path for every ring program.
+  bool RingAsVertex(const Program *p) const {
+    static const bool compute = std::getenv("DC_GS_COMPUTE") != nullptr;
+    return p && !compute && p->images.empty() && !p->uses_lds && !p->uses_barrier && !p->cross_lane;
+  }
+  // Fused into the copy VS: as above, and nothing that must run once per
+  // thread (every vertex of a primitive runs its ES and GS again).
+  bool RingAsFused(const Program *p) const {
+    static const bool vertex = std::getenv("DC_GS_VERTEX") != nullptr; // the separate-draw path instead
+    return RingAsVertex(p) && !vertex && !p->uses_atomic;
+  }
+
+  // Draws the queued ring programs (RingReq) in the open pass, with the
+  // pass's attachment formats in their pipelines. False: a pipeline failed,
+  // the copy VS must not draw.
+  bool RunRingPending(RenderTarget *const colors[8], const MTLPixelFormat color_fmt[8],
+                      MTLPixelFormat depth_fmt) {
+    UpdateMemMap();
+    for (const RingReq &q : ring_pending) {
+      Program *p = GetProgram(Stage::Compute, q.addr, q.ud, q.num_user_sgprs, 0);
+      if (!p) {
+        return false;
+      }
+      Shader::MslOptions o;
+      o.map_hoist = map_hoist;
+      o.ring = q.ring;
+      o.ring_vertex = true;
+      u64 key = Hash(p->hash);
+      key = Hash(o.map_hoist, key);
+      key = Hash(u64(q.ring.stage) | u64(q.ring.esgs_itemsize) << 8 |
+                     u64(q.ring.vert_itemsize) << 24 | u64(q.ring.slots) << 40 |
+                     u64(q.ring.input_verts) << 48 | u64(q.ring.index_size) << 52 | 1ull << 56,
+                 key);
+      u64 pkey = key;
+      for (u32 k = 0; k < 8; ++k) {
+        pkey = Hash(colors[k] ? u64(color_fmt[k]) + 1 : 0, pkey);
+      }
+      pkey = Hash(u64(depth_fmt), pkey);
+      TakeCompiled();
+      auto it = pipelines.find(pkey);
+      if (it == pipelines.end()) {
+        if (!pending.count(pkey)) {
+          pending.insert(pkey);
+          MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+          d.rasterizationEnabled = NO;
+          // A layered pass (renderTargetArrayLength) needs the topology set.
+          d.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+          for (u32 k = 0; k < 8; ++k) {
+            if (colors[k]) {
+              d.colorAttachments[k].pixelFormat = color_fmt[k];
+            }
+          }
+          d.depthAttachmentPixelFormat = depth_fmt;
+          if (depth_fmt == MTLPixelFormatDepth32Float_Stencil8) {
+            d.stencilAttachmentPixelFormat = depth_fmt;
+          }
+          compiler->Submit([this, d, src = MslSource(*p, o, key), key, pkey, addr = q.addr] {
+            id<MTLRenderPipelineState> pso = nil;
+            if (id<MTLFunction> fn = compiler->Function(key, src, addr)) {
+              d.vertexFunction = fn;
+              NSError *err = nil;
+              pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+              if (!pso) {
+                DC_ERROR("gpu: ring vertex pipeline %#llx: %s", addr,
+                         err ? err.localizedDescription.UTF8String : "?");
+              }
+            }
+            {
+              std::scoped_lock lk(done_lock);
+              done_render.emplace_back(pkey, pso);
+            }
+            done_cv.notify_all();
+          }, /*urgent=*/true);
+        }
+        WaitCompiled(pkey);
+        it = pipelines.find(pkey);
+      }
+      id<MTLRenderPipelineState> pso = it == pipelines.end() ? nil : it->second;
+      if (!pso) {
+        ReportOnce("gs emulation: no vertex pipeline for ring program " + Hex(q.addr));
+        return false;
+      }
+      u32 cud[16];
+      std::memcpy(cud, q.ud, sizeof(cud));
+      PatchUserData(cud);
+      [enc setRenderPipelineState:pso];
+      [enc setVertexBytes:cud length:64 atIndex:Shader::Binding::UserData];
+      [enc setVertexBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
+      [enc setVertexBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
+      [enc setVertexBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+      [enc setVertexBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
+      if (q.index_va) {
+        id<MTLBuffer> ib = nil;
+        u64 ioff = 0;
+        if (!Locate(q.index_va, 4, &ib, &ioff)) {
+          return false;
+        }
+        [enc setVertexBuffer:ib offset:ioff atIndex:Shader::Binding::GsIndex];
+      }
+      [enc drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:q.threads];
+      // The next stage (GS, or the copy VS) reads what this one wrote.
+      // DC_RING_NOBARRIER=1: measure the barriers' cost (wrong output).
+      static const bool no_barrier = std::getenv("DC_RING_NOBARRIER") != nullptr;
+      if (!no_barrier) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers
+                        afterStages:MTLRenderStageVertex
+                       beforeStages:MTLRenderStageVertex];
+      }
+      if (trace) {
+        DC_INFO("gpu:   ring vertex %s %#llx: %u threads, index buffer %#llx",
+                q.ring.stage == Shader::RingStage::Export ? "es" : "gs", (unsigned long long)q.addr,
+                q.threads, (unsigned long long)q.index_va);
+        if (q.ring.stage == Shader::RingStage::Geometry && q.index_va) {
+          // Once the GPU ran it: did the GS write its indices?
+          const u64 va = q.index_va, n = u64(q.threads) * q.ring.IndicesPerPrim();
+          [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+            const u32 *d = reinterpret_cast<const u32 *>(va);
+            u64 nz = 0;
+            for (u64 i = 0; i < n; ++i) {
+              nz += d[i] != 0;
+            }
+            DC_INFO("gpu: ring vertex gs indices at %#llx: %llu of %llu non-zero", (unsigned long long)va,
+                    (unsigned long long)nz, (unsigned long long)n);
+          }];
+        }
+      }
+    }
+    bound = {}; // the copy VS rebinds everything
+    return true;
+  }
+
   // Runs the ES or GS of a GS pipeline as a compute kernel, one thread per
   // vertex / primitive (Shader::RingInfo). Ring programs only touch memory
   // (no textures). `index_va`: where a GS writes the copy-VS indices.
@@ -5106,7 +5269,8 @@ struct MetalRenderer::Impl {
     // that do not fit are dropped. The guest does not set VGT_*_RING_SIZE in its
     // command buffers, so the sizes come from the ring V#s: the one the GS's
     // first buffer access with a known base reads (ESGS) and the copy VS's (GSVS).
-    auto ring_bytes = [&](Program *p, const u32 *ud) -> u64 {
+    // `base_out`: the ring V#'s 48-bit base as the shader sees it (dc_vbase).
+    auto ring_bytes = [&](Program *p, const u32 *ud, u64 *base_out) -> u64 {
       for (const auto &i : p ? p->code : std::vector<Shader::Gcn::Inst>{}) {
         if (i.enc != Shader::Gcn::Enc::MUBUF) {
           continue;
@@ -5117,7 +5281,10 @@ struct MetalRenderer::Impl {
         }
         u64 va = 0, bytes = 0;
         Shader::SgprReadCache cache;
-        return Shader::LinearBaseRange(p->linear_bases[k], ud, &cache, &va, &bytes) ? bytes : 0;
+        const Shader::LinearBase &b = p->linear_bases[k];
+        const u32 w0 = Shader::ResolveSgpr(b.words[0], ud, &cache), w1 = Shader::ResolveSgpr(b.words[1], ud, &cache);
+        *base_out = u64(w0) | (u64(w1 & 0xFFF) << 32);
+        return Shader::LinearBaseRange(b, ud, &cache, &va, &bytes) ? bytes : 0;
       }
       return 0;
     };
@@ -5126,8 +5293,11 @@ struct MetalRenderer::Impl {
                               Bits(r[Reg::SPI_SHADER_PGM_RSRC2_GS], 1, 5), 0);
     u64 esgs_bytes = u64(r[Reg::VGT_ESGS_RING_SIZE]) << 8;
     u64 gsvs_bytes = u64(r[Reg::VGT_GSVS_RING_SIZE]) << 8;
-    esgs_bytes = esgs_bytes ? esgs_bytes : ring_bytes(gsp, gs_ud);
-    gsvs_bytes = gsvs_bytes ? gsvs_bytes : ring_bytes(vs, r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0));
+    u64 esgs_va = 0, gsvs_va = 0;
+    const u64 esgs_probe = ring_bytes(gsp, gs_ud, &esgs_va);
+    const u64 gsvs_probe = ring_bytes(vs, r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0), &gsvs_va);
+    esgs_bytes = esgs_bytes ? esgs_bytes : esgs_probe;
+    gsvs_bytes = gsvs_bytes ? gsvs_bytes : gsvs_probe;
     if (!esgs_bytes || !gsvs_bytes) {
       ReportOnce("gs emulation: ring sizes not set");
       return false;
@@ -5173,17 +5343,99 @@ struct MetalRenderer::Impl {
       es_index_va = va;
       ring.index_size = 4;
     }
-    if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_ES),
-                 r.UserData(Reg::SPI_SHADER_USER_DATA_ES_0),
-                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5), es_verts, 64, es_index_va)) {
-      return false;
-    }
-    ring.stage = Shader::RingStage::Geometry;
-    ring.index_size = 0;
-    if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS),
-                 r.UserData(Reg::SPI_SHADER_USER_DATA_GS_0),
-                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_GS], 1, 5), n, 16, index_va)) {
-      return false;
+    const u64 es_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_ES);
+    const u32 *es_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_ES_0);
+    const u32 es_nus = Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5);
+    const u64 gs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS);
+    const u32 gs_nus = Bits(r[Reg::SPI_SHADER_PGM_RSRC2_GS], 1, 5);
+    // Inside the pass as vertex functions when both programs allow it (see
+    // RingReq); the copy VS's Draw runs them once its pass is open.
+    ring_pending.clear();
+    fused_pending = {};
+    Program *esp = GetProgram(Stage::Compute, es_addr, es_ud, es_nus, 0);
+    Program *gsp2 = GetProgram(Stage::Compute, gs_addr, gs_ud, gs_nus, 0);
+    auto ring_key = [](const Shader::RingInfo &q, u64 key) {
+      return Hash(u64(q.stage) | u64(q.esgs_itemsize) << 8 | u64(q.vert_itemsize) << 24 | u64(q.slots) << 40 |
+                      u64(q.input_verts) << 48 | u64(q.index_size) << 52 | 2ull << 56,
+                  key);
+    };
+    bool fused = false;
+    // This draw's own rings in the arena: draws in flight at once must not
+    // share the guest's (the fused VS of a later draw would overwrite them
+    // while an earlier draw's vertices still read).
+    const u64 esgs_used = u64((es_verts + 63) / 64) * ring.EsWaveBytes();
+    const u64 gsvs_used = u64((n + 15) / 16) * ring.GsGroupBytes();
+    u64 esgs_region = 0, gsvs_region = 0;
+    if (RingAsFused(esp) && RingAsFused(gsp2) && esgs_va && gsvs_va && (esgs_region = ArenaAlloc(esgs_used)) &&
+        (gsvs_region = ArenaAlloc(gsvs_used))) {
+      // Both fused into the copy VS (FusedPending): sources of dc_es / dc_gs.
+      Shader::MslOptions oe;
+      oe.map_hoist = map_hoist;
+      oe.ring = ring;
+      oe.ring_fused = true;
+      const u64 ke = ring_key(ring, Hash(oe.map_hoist, Hash(esp->hash)));
+      Shader::RingInfo gring = ring;
+      gring.stage = Shader::RingStage::Geometry;
+      gring.index_size = 0;
+      Shader::MslOptions og;
+      og.map_hoist = map_hoist;
+      og.ring = gring;
+      og.ring_fused = true;
+      const u64 kg = ring_key(gring, Hash(og.map_hoist, Hash(gsp2->hash)));
+      FusedPending &f = fused_pending;
+      f.on = true;
+      f.fused.on = true;
+      f.fused.input_verts = ring.input_verts;
+      f.fused.ipp = ring.IndicesPerPrim();
+      f.fused.es_index_size = static_cast<u8>(ring.index_size);
+      auto cached = [&](u64 key, const Program &p, const Shader::MslOptions &opt) -> const std::string & {
+        auto it = fused_src.find(key);
+        if (it == fused_src.end()) {
+          it = fused_src.emplace(key, MslSource(p, opt, key)).first;
+        }
+        return it->second;
+      };
+      f.fused.es_src = cached(ke, *esp, oe);
+      f.fused.gs_src = cached(kg, *gsp2, og);
+      f.key = Hash(ke, kg);
+      f.es_addr = es_addr;
+      f.gs_addr = gs_addr;
+      std::memcpy(f.es_ud, es_ud, sizeof(f.es_ud));
+      std::memcpy(f.gs_ud, gs_ud, sizeof(f.gs_ud));
+      f.es_index_va = es_index_va;
+      f.esgs_base = esgs_va;
+      f.esgs_bias = esgs_region - esgs_va;
+      f.gsvs_base = gsvs_va;
+      f.gsvs_bias = gsvs_region - gsvs_va;
+      fused = true;
+    } else if (RingAsVertex(esp) && RingAsVertex(gsp2)) {
+      RingReq es;
+      es.ring = ring;
+      es.addr = es_addr;
+      std::memcpy(es.ud, es_ud, sizeof(es.ud));
+      es.num_user_sgprs = es_nus;
+      es.threads = es_verts;
+      es.index_va = es_index_va;
+      ring_pending.push_back(es);
+      RingReq gs;
+      ring.stage = Shader::RingStage::Geometry;
+      ring.index_size = 0;
+      gs.ring = ring;
+      gs.addr = gs_addr;
+      std::memcpy(gs.ud, gs_ud, sizeof(gs.ud));
+      gs.num_user_sgprs = gs_nus;
+      gs.threads = n;
+      gs.index_va = index_va;
+      ring_pending.push_back(gs);
+    } else {
+      if (!RunRing(ring, es_addr, es_ud, es_nus, es_verts, 64, es_index_va)) {
+        return false;
+      }
+      ring.stage = Shader::RingStage::Geometry;
+      ring.index_size = 0;
+      if (!RunRing(ring, gs_addr, gs_ud, gs_nus, n, 16, index_va)) {
+        return false;
+      }
     }
     if (trace) {
       DC_INFO("gpu:   gs emulated: %u of %u points, %u slots, esgs %u of %llu B, gsvs %u of %llu B, "
@@ -5205,7 +5457,16 @@ struct MetalRenderer::Impl {
     d.index_offset = 0;
     d.index_size = 4;
     d.indirect_args = 0; // the count is the GS output's, not the guest's args
+    if (fused) {
+      // No index buffer: the fused VS takes its ring index from the GS it runs.
+      d.indexed = false;
+      d.index_base = 0;
+      d.index_offset = 0;
+      d.first_vertex = 0;
+    }
     Draw(*copy, d);
+    ring_pending.clear(); // a draw that returned early leaves them unrun
+    fused_pending = {};
     return true;
   }
 
@@ -5929,7 +6190,12 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
   const u64 patched_at = commits;
   u32 vlin[Shader::kMaxLinearBases], plin[Shader::kMaxLinearBases];
-  vo.linear_mask = LinearTable(*vs, vud, vlin, &vo.linear_aligned);
+  // A fused copy VS reads its draw's arena copy of the GSVS ring through the
+  // biased address: no host-translated bases for it.
+  vo.linear_mask = fused_pending.on ? 0 : LinearTable(*vs, vud, vlin, &vo.linear_aligned);
+  if (fused_pending.on) {
+    vo.linear_aligned = 0;
+  }
   // Vertex fetch by Metal for the fetch loads it can do (all or none): the
   // V# words resolved here give each one a vertex buffer and a format.
   // DC_SW_FETCH keeps every load in the shader.
@@ -5943,7 +6209,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   VertexBuffer vbufs[kMaxVertexBuffers];
   u32 nvbufs = 0;
   u64 vlayout = 0;
-  if (!sw_fetch && !rect && !tess_draw && !vs->vertex_inputs.empty() &&
+  if (!sw_fetch && !rect && !tess_draw && !fused_pending.on && !vs->vertex_inputs.empty() &&
       vs->vertex_inputs.size() <= kMaxVertexBuffers) {
     Shader::SgprReadCache rc;
     bool ok = true;
@@ -5982,6 +6248,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     vo.vertex_attrs = draw_vattrs;
   }
   u64 vs_key = Hash(vs->hash);
+  if (fused_pending.on) { // the copy VS of a GS pipeline, ES and GS fused in
+    vo.fused = fused_pending.fused;
+    vs_key = Hash(fused_pending.key, vs_key);
+  }
   vs_key = Hash(vo.map_hoist, vs_key);
   vs_key = Hash(vo.linear_mask, vs_key);
   vs_key = Hash(vo.linear_aligned, vs_key);
@@ -6228,6 +6498,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   if (sc.x1 <= sc.x0 || sc.y1 <= sc.y0) {
     return;
   }
+  // The ES and GS of this copy-VS draw, in the pass just opened (RingReq).
+  if (!ring_pending.empty()) {
+    const bool ok = RunRingPending(colors, color_fmt, depth_fmt);
+    ring_pending.clear();
+    if (!ok) {
+      if (trace)
+        DC_INFO("gpu:   skipped: ring vertex pipeline");
+      return;
+    }
+  }
 
   // Each set below is skipped when `enc` already has that value (see
   // BoundState): ~10 Objective-C calls per draw otherwise.
@@ -6360,6 +6640,12 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   consts.rt_scale[0] = 2.0f / static_cast<float>(pass_width);
   consts.rt_scale[1] = 2.0f / static_cast<float>(pass_height);
   consts.vte = vte;
+  if (fused_pending.on) {
+    consts.esgs_base = fused_pending.esgs_base;
+    consts.esgs_bias = fused_pending.esgs_bias;
+    consts.gsvs_base = fused_pending.gsvs_base;
+    consts.gsvs_bias = fused_pending.gsvs_bias;
+  }
 
   // ---- bindings ----
   DrawLap(7);
@@ -6390,7 +6676,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
   }
   UpdateMemMap();
-  static_assert(sizeof(consts) <= 64);
+  static_assert(sizeof(consts) <= 96);
   BindBytes(0, 0, vud, 64, Shader::Binding::UserData);
   BindBuffer(0, mem[0], 0, Shader::Binding::Mem0);
   BindBuffer(0, mem[1], 0, Shader::Binding::Mem1);
@@ -6402,6 +6688,31 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     BindBuffer(0, vbufs[k].buf, vbufs[k].off, kVertexBufferBase + k);
   }
   BindBytes(0, 1, &consts, sizeof(consts), Shader::Binding::Draw);
+  if (fused_pending.on) {
+    u32 eud[16], gud[16];
+    std::memcpy(eud, fused_pending.es_ud, sizeof(eud));
+    std::memcpy(gud, fused_pending.gs_ud, sizeof(gud));
+    PatchUserData(eud);
+    PatchUserData(gud);
+    [enc setVertexBytes:eud length:64 atIndex:Shader::Binding::RingEsUd];
+    [enc setVertexBytes:gud length:64 atIndex:Shader::Binding::RingGsUd];
+    bound.buf[0][Shader::Binding::RingEsUd] = bound.buf[0][Shader::Binding::RingGsUd] = nil;
+    BindBuffer(0, gds, Gpu::GdsBase(), Shader::Binding::Gds);
+    if (fused_pending.es_index_va) {
+      id<MTLBuffer> ib = nil;
+      u64 ioff = 0;
+      if (!Locate(fused_pending.es_index_va, 4, &ib, &ioff)) {
+        if (trace)
+          DC_INFO("gpu:   skipped: fused ES index buffer not mapped");
+        return;
+      }
+      BindBuffer(0, ib, ioff, Shader::Binding::GsIndex);
+    }
+    if (trace) {
+      DC_INFO("gpu:   fused ES %#llx + GS %#llx into the copy VS, %u vertices",
+              (unsigned long long)fused_pending.es_addr, (unsigned long long)fused_pending.gs_addr, dc.count);
+    }
+  }
   for (u32 k = 0; k < vs_res.tex.size(); ++k) {
     BindTexture(0, vs_res.tex[k], k);
   }

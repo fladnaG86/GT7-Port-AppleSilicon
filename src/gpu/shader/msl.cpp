@@ -251,8 +251,10 @@ private:
             // emitted vertex n sits at ring dword gs2vs/4 + n*16 + lane. Missing
             // triangles (fewer emits, or across a CUT) are degenerate.
             const u32 group_dwords = o.ring.GsGroupBytes() / 4;
-            Line("{ uint gb_ = dc_gid.x * " + N(group_dwords) + "u + dc_lidx; device uint* ix_ = dc_gsidx + dc_gtid.x * " +
-                 N(o.ring.IndicesPerPrim()) + "u; uint st_ = 0u;");
+            Line("{ uint gb_ = dc_gid.x * " + N(group_dwords) + "u + dc_lidx; " +
+                 (o.ring_fused ? std::string("thread uint* ix_ = dc_gsidx;")
+                               : "device uint* ix_ = dc_gsidx + dc_gtid.x * " + N(o.ring.IndicesPerPrim()) + "u;") +
+                 " uint st_ = 0u;");
             Line("  for (uint t_ = 0u; t_ + 2u < " + N(o.ring.slots) + "u; ++t_) {");
             Line("    if ((gs_cut_ >> t_) & 1ul) st_ = t_;");
             Line("    bool ok_ = t_ + 2u < gs_emit_ && ((gs_cut_ >> (t_ + 1u)) & 3ul) == 0ul;");
@@ -1310,8 +1312,14 @@ void Emitter::EmitBuffer(const Inst& i) {
         // whenever ADD_TID is set, as the ES's ring V# relies on it).
         Line("  ulong a_; if ((" + r3 + " >> 23) & 1u) { oob_ = false; a_ = base_ + dc_swizzled(idx_ + dc_lane, off_, stride_, " +
              r3 + "); } else { a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_); }");
+        if (o.ring_fused) { // this draw's own copies of the rings (FusedRing)
+            Line("  if (base_ == dc_esgs) a_ += dc_esgs_bias; else if (base_ == dc_gsvs) a_ += dc_gsvs_bias;");
+        }
     } else {
         Line("  ulong a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_);");
+        if (o.fused.on) { // the copy VS reads this draw's own GSVS ring
+            Line("  if (base_ == dc_gsvs) a_ += dc_gsvs_bias;");
+        }
     }
     // A base the host translated: the access needs no page-table walk.
     const std::string M = Linear(i.pc) ? "lm_" : "mem";
@@ -2119,7 +2127,8 @@ std::string Emitter::Run() {
             }
         }
     }
-    std::string src = kMslPrelude;
+    // A fused ES / GS is pasted into the copy VS's source, after its prelude.
+    std::string src = o.ring_fused ? std::string() : kMslPrelude;
     if (o.map_hoist) {
         for (const auto& [from, to] : {std::pair<std::string, std::string>{"((device const int*)(m.map + 1))", "m.mapl.entries"},
                                        {"m.map->", "m.mapl."}}) {
@@ -2158,11 +2167,15 @@ std::string Emitter::Run() {
             src += "};\n\n";
         }
         const bool domain = o.tess.stage == TessStage::Domain;
+        if (o.fused.on) {
+            src += o.fused.es_src + "\n" + o.fused.gs_src + "\n";
+        }
         src += "static VsOut dc_run(uint vid, uint iid, " + std::string(domain ? "float2 dc_uv, device uint* lds, " : "") +
-               "constant uint* ud, thread const DcMem& mem" +
+               std::string(o.fused.on ? "ulong dc_gsvs, ulong dc_gsvs_bias, " : "") + "constant uint* ud, thread const DcMem& mem" +
                std::string(stage_in ? ", thread const VsIn& in_" : "") + TexParams(false) +
                ") {\n    VsOut out = {};\n" + (o.points ? "    out.psize = 1.0f;\n" : "") + decl + wrapped + "}\n\n";
-        const std::string args = "ud, mem" + std::string(stage_in ? ", in_" : "") + TexArgs();
+        const std::string args = std::string(o.fused.on ? "draw.gsvs_base, draw.gsvs_bias, " : "") + "ud, mem" +
+                                 std::string(stage_in ? ", in_" : "") + TexArgs();
         src += domain ? std::string(o.tess.domain == 1 ? "[[patch(triangle)]] " : "[[patch(quad)]] ") +
                             "vertex VsOut main0(uint vid [[patch_id]], " +
                             (o.tess.domain == 1 ? "float3" : "float2") + " dc_pos [[position_in_patch]], uint iid [[instance_id]], " +
@@ -2170,8 +2183,26 @@ std::string Emitter::Run() {
                       : std::string("vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], ");
         src +=                std::string(stage_in ? "VsIn in_ [[stage_in]], " : "") + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
+               (o.fused.on ? ", constant uint* dc_ud_es [[buffer(" + N(Binding::RingEsUd) + ")]], constant uint* dc_ud_gs [[buffer(" +
+                                 N(Binding::RingGsUd) + ")]], device uint* gds [[buffer(" + N(Binding::Gds) + ")]]" +
+                                 (o.fused.es_index_size ? std::string(", device const ") + (o.fused.es_index_size == 2 ? "ushort" : "uint") +
+                                                              "* dc_esidx [[buffer(" + N(Binding::GsIndex) + ")]]"
+                                                        : "")
+                           : "") +
                TexParams(true) + ") {\n";
         src += "    " + MemInit() + "\n    VsOut o;\n";
+        if (o.fused.on) {
+            // This vertex's primitive: run its ES (per input vertex) and GS,
+            // then read the ring like the copy VS would through the index the
+            // GS's strip gives this corner (FusedRing).
+            src += "    { uint p_ = vid / " + N(o.fused.ipp) + "u;\n";
+            const std::string rings = "draw.esgs_base, draw.esgs_bias, draw.gsvs_base, draw.gsvs_bias, ";
+            src += "      for (uint v_ = 0u; v_ < " + N(o.fused.input_verts) + "u; ++v_) dc_es(dc_ud_es, mem, gds, " +
+                   std::string(o.fused.es_index_size ? "dc_esidx, " : "") + rings + "p_ * " + N(o.fused.input_verts) + "u + v_);\n";
+            src += "      uint ix_[" + N(o.fused.ipp) + "]; for (uint k_ = 0u; k_ < " + N(o.fused.ipp) + "u; ++k_) ix_[k_] = 0u;\n";
+            src += "      dc_gs(dc_ud_gs, mem, gds, ix_, " + rings + "p_);\n";
+            src += "      vid = ix_[vid % " + N(o.fused.ipp) + "u]; }\n";
+        }
         if (o.rect_list) {
             // As shadPS4's rect list TCS: the vertex whose x matches one neighbour and y
             // the other is the right-angle corner; the 4th vertex is opposite it. Triangles:
@@ -2252,12 +2283,35 @@ std::string Emitter::Run() {
         src += "    (void)mem; (void)dc_qlane;\n";
         src += decl + wrapped + "}\n";
     } else {
-        src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
-               "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], "
-               "uint3 dc_gtid [[thread_position_in_grid]], uint3 dc_tpg3 [[threads_per_threadgroup]], " +
-               mem_params + ", device uint* gds [[buffer(5)]], " +
-               (tess_lds ? "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]"
-                         : std::string("threadgroup uint* lds [[threadgroup(0)]]")) +
+        // MslOptions::ring_vertex: the ES / GS as a vertex function, vertex id
+        // = thread id; the group is the ES wave (64) or the GS group (16).
+        const bool ring_vertex = o.ring.stage != RingStage::None && o.ring_vertex;
+        if (o.ring.stage != RingStage::None && o.ring_fused) {
+            // MslOptions::ring_fused: a plain function the fused copy VS calls
+            // per thread id (see FusedRing); memory comes in, no prelude.
+            const bool gs = o.ring.stage == RingStage::Geometry;
+            const u32 group = gs ? 16 : 64;
+            src += std::string("static void ") + (gs ? "dc_gs" : "dc_es") +
+                   "(constant uint* ud, thread const DcMem& mem, device uint* gds" + (gs ? ", thread uint* dc_gsidx" : "") +
+                   (o.ring.index_size ? std::string(", device const ") + (o.ring.index_size == 2 ? "ushort" : "uint") + "* dc_esidx"
+                                      : "") +
+                   ", ulong dc_esgs, ulong dc_esgs_bias, ulong dc_gsvs, ulong dc_gsvs_bias, uint dc_vid) {\n";
+            src += "    uint dc_lidx = dc_vid % " + N(group) + "u; uint3 dc_gid = uint3(dc_vid / " + N(group) +
+                   "u, 0u, 0u); uint3 dc_gtid = uint3(dc_vid, 0u, 0u); uint3 dc_tid = uint3(dc_lidx, 0u, 0u);\n"
+                   "    uint dc_lds_[4] = {}; thread uint* lds = dc_lds_; (void)dc_gid; (void)dc_gtid; (void)dc_tid;\n"
+                   "    uint dc_lane = dc_lidx & 63u; (void)mem; (void)dc_lane; (void)lds; (void)gds;\n"
+                   "    uint gs_emit_ = 0u; ulong gs_cut_ = 0ul; (void)gs_emit_; (void)gs_cut_;\n";
+            src += decl + wrapped + "}\n";
+            return src;
+        }
+        src += (ring_vertex ? std::string("vertex void main0(uint dc_vid [[vertex_id]], ")
+                            : std::string("kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
+                                          "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], "
+                                          "uint3 dc_gtid [[thread_position_in_grid]], uint3 dc_tpg3 [[threads_per_threadgroup]], ")) +
+               mem_params + ", device uint* gds [[buffer(5)]]" +
+               (ring_vertex ? std::string()
+                : tess_lds  ? ", device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]"
+                            : std::string(", threadgroup uint* lds [[threadgroup(0)]]")) +
                (o.tess.stage == TessStage::Hull ? ", device uint* dc_tf [[buffer(" + N(Binding::TessFactors) + ")]]" : "") +
                (o.tess.index_size ? std::string(", device const ") + (o.tess.index_size == 2 ? "ushort" : "uint") +
                                         "* dc_tsidx [[buffer(" + N(Binding::GsIndex) + ")]]"
@@ -2268,6 +2322,12 @@ std::string Emitter::Run() {
                                         "* dc_esidx [[buffer(" + N(Binding::GsIndex) + ")]]"
                                   : "") +
                ") {\n";
+        if (ring_vertex) {
+            const u32 group = o.ring.stage == RingStage::Export ? 64 : 16;
+            src += "    uint dc_lidx = dc_vid % " + N(group) + "u; uint3 dc_gid = uint3(dc_vid / " + N(group) +
+                   "u, 0u, 0u); uint3 dc_gtid = uint3(dc_vid, 0u, 0u); uint3 dc_tid = uint3(dc_lidx, 0u, 0u);\n"
+                   "    uint dc_lds_[4] = {}; thread uint* lds = dc_lds_; (void)dc_gid; (void)dc_gtid; (void)dc_tid;\n";
+        }
         src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
         // Wave64 lane exchange for V_READLANE of a lane in the other 32-lane
         // half (see the emitter): one dword per thread of the group.

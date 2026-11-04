@@ -114,6 +114,9 @@ struct Program {
     // Reads other lanes (ds_swizzle, readlane, readfirstlane, mbcnt, s_bcnt1 /
     // s_ff1 on a 64-bit mask): its EXECZ/VCCZ branches must be wave-uniform.
     bool cross_lane = false;
+    bool uses_lds = false;     // any DS instruction
+    bool uses_barrier = false; // S_BARRIER
+    bool uses_atomic = false;  // buffer atomics (not idempotent: cannot run more than once)
     // Per instruction index: this lane is surely on before it (see LaneOn).
     std::vector<bool> lane_on;
 

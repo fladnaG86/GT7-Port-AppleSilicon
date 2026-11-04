@@ -32,6 +32,8 @@ constexpr u32 Linear = 8;   // constant uint[]: translated linear bases (MslOpti
 constexpr u32 GsIndex = 9;  // device uint*: copy-VS indices a GS kernel writes (MslOptions::ring)
 constexpr u32 TessLds = 10; // device uint*: LS/HS LDS slices (MslOptions::tess)
 constexpr u32 TessFactors = 11; // device uint*: tess factors the HS stores (MslOptions::tess)
+constexpr u32 RingEsUd = 12;    // constant uint[16]: the ES's user data (MslOptions::fused)
+constexpr u32 RingGsUd = 13;    // constant uint[16]: the GS's user data (MslOptions::fused)
 } // namespace Binding
 
 // Geometry-shader emulation. Metal has no GS stage: the ES and the GS of a GS
@@ -108,6 +110,10 @@ struct alignas(16) GpuDrawConsts {
     float rt_scale[2];  // 2 / render target size
     u32 vte;            // PA_CL_VTE_CNTL
     u32 pad;
+    // Fused GS pipeline (MslOptions::FusedRing): the guest's ESGS / GSVS ring
+    // bases and the offsets to this draw's own copies of them, so draws in
+    // flight at once do not share the rings (u64 wrap-around arithmetic).
+    u64 esgs_base, esgs_bias, gsvs_base, gsvs_bias;
 };
 
 enum class TexDim : u8 { Tex2D, Tex2DArray, Tex3D };
@@ -174,6 +180,26 @@ struct MslOptions {
     u32 linear_aligned = 0;
     // Compute only: this program is the ES or GS of a GS pipeline (RingInfo).
     RingInfo ring;
+    // The ES / GS as a vertex function with rasterization off (one vertex per
+    // thread) instead of a compute kernel: it runs inside the render pass
+    // that draws the copy VS, so no pass split. Needs no LDS, barriers or
+    // cross-lane ops in the program.
+    bool ring_vertex = false;
+    // The ES / GS as `static void dc_es(...)` / `dc_gs(...)` without prelude
+    // or entry point, for a fused copy VS (FusedRing).
+    bool ring_fused = false;
+    // Copy VS of a GS pipeline with the ES and GS fused in: each copy-VS
+    // vertex runs the ES for its primitive's input vertices, the GS for the
+    // primitive (both write the guest rings as the compute path would, every
+    // vertex of a primitive writing the same values), and takes its ring
+    // index from the GS's strip. No barriers, no index buffer, no pass split.
+    struct FusedRing {
+        bool on = false;
+        u32 input_verts = 1;
+        u32 ipp = 0;          // copy-VS indices per primitive (RingInfo::IndicesPerPrim)
+        u8 es_index_size = 0; // ES reads its vertex index from Binding::GsIndex (0: thread id)
+        std::string es_src, gs_src;
+    } fused;
     // LS / HS (compute) or domain VS (vertex) of a tessellation pipeline.
     TessInfo tess;
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at

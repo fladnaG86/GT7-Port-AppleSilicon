@@ -910,6 +910,10 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
         }
         p->writes_exec |= WritesExec(i);
         p->cross_lane |= CrossLane(i);
+        p->uses_lds |= i.enc == Enc::DS;
+        p->uses_barrier |= i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_BARRIER;
+        p->uses_atomic |= i.enc == Enc::MUBUF && static_cast<Mubuf>(i.op) >= Mubuf::BUFFER_ATOMIC_SWAP &&
+                          static_cast<Mubuf>(i.op) <= Mubuf::BUFFER_ATOMIC_FMAX;
 
         switch (i.enc) {
         case Enc::EXP:
