@@ -578,6 +578,13 @@ struct MetalRenderer::Impl {
   // Target address -> write_seq of a compute memset over it. GT7 clears transient
   // images that way, and a host target there keeps the pixels of the last surface.
   std::unordered_map<u64, u64> memory_fills;
+  // Linear images in GT7's per-frame memory, filled from the guest memory
+  // buffer on the GPU timeline at each bind (see GetTexture).
+  std::unordered_map<u64, id<MTLTexture>> gpu_linear_tex;
+  // dispatch_seq when each of them was last copied: no compute since, no copy
+  // (a copy per bind split the render pass at every draw: 25 -> 77 ms/frame).
+  std::unordered_map<u64, std::pair<u64, u64>> gpu_linear_copied; // key -> (dispatch_seq, frame)
+  u64 dispatch_seq = 0;
 
   void NoteTargetWritten(const RenderTarget &rt) {
     auto c = color_targets.find(rt.addr);
@@ -1570,8 +1577,15 @@ struct MetalRenderer::Impl {
       }
       return p;
     }();
-    if (!tex || std::find(want.first.begin(), want.first.end(), addr & kGpuAddrMask) ==
-                    want.first.end() ||
+    // DC_DUMP_BOUND_FMT=<MTLPixelFormat>: any binding of that format (per-frame
+    // ring buffers whose address changes every flip).
+    static const u64 want_fmt = [] {
+      const char *e = std::getenv("DC_DUMP_BOUND_FMT");
+      return e ? std::strtoull(e, nullptr, 10) : 0ull;
+    }();
+    const bool by_fmt = tex && want_fmt && u64(tex.pixelFormat) == want_fmt;
+    if (!tex || (!by_fmt && std::find(want.first.begin(), want.first.end(),
+                                       addr & kGpuAddrMask) == want.first.end()) ||
         !dumped_bound.insert(Hash(reinterpret_cast<uintptr_t>((__bridge void *)tex),
                                   (addr & kGpuAddrMask) ^ (frame_count << 48)))
              .second) {
@@ -1606,7 +1620,7 @@ struct MetalRenderer::Impl {
             (unsigned long)tex.textureType, (unsigned long)tex.arrayLength,
             (unsigned long)tex.mipmapLevelCount, src.c_str());
     const MTLPixelFormat f = tex.pixelFormat;
-    const u32 bpp = f == MTLPixelFormatRGBA16Float ? 8
+    const u32 bpp = f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRG32Uint ? 8
                     : (f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGBA8Unorm ||
                        f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatR32Float)
                         ? 4
@@ -1658,6 +1672,13 @@ struct MetalRenderer::Impl {
         } else if (f == MTLPixelFormatR32Float) {
           std::memcpy(&out[0], p, 4);
           out[1] = out[2] = out[0];
+          out[3] = 1;
+        } else if (f == MTLPixelFormatRG32Uint) { // integer lists: values as floats
+          u32 q[2];
+          std::memcpy(q, p, 8);
+          out[0] = float(q[0]);
+          out[1] = float(q[1]);
+          out[2] = 0;
           out[3] = 1;
         } else {
           const bool bgra = f == MTLPixelFormatBGRA8Unorm;
@@ -3405,6 +3426,71 @@ struct MetalRenderer::Impl {
     if (!Readable(addr, size)) {
       ReportOnce("texture memory not mapped");
       return Dummy(tt);
+    }
+
+    // GT7's per-frame memory (0x200000000..0x208800000) holds images its async
+    // compute fills with buffer stores on the GPU, e.g. the clustered light
+    // grid (30x17x16 RG32) the forward shaders read. An upload reads guest
+    // memory when the draw is encoded, before the GPU has run those
+    // dispatches: the grid read as zeros, no light or probe reached any
+    // cluster and the cockpit's indirect light was black. Linear images there
+    // are copied from the guest memory buffer on the GPU timeline instead,
+    // at the point of the bind, every time (no cache). DC_NO_GPU_LINEAR=1: off.
+    static const bool gpu_linear = std::getenv("DC_NO_GPU_LINEAR") == nullptr;
+    if (gpu_linear && !storage && Tiling::IsLinear(tiling) && !fi.compressed &&
+        tt.dim != TexDim::Tex3D && levels == 1 && addr >= 0x200000000ull &&
+        addr + size <= 0x208800000ull && size <= (16ull << 20)) {
+      id<MTLBuffer> buf = nil;
+      u64 off = 0;
+      const u64 row = u64(mips[0].pitch_el) * fi.bytes_per_block;
+      if (Locate(addr, size, &buf, &off) && !(off % fi.bytes_per_block) &&
+          !(row % fi.bytes_per_block)) {
+        u64 gkey = Hash(addr);
+        for (u32 k = 1; k < 6; ++k) {
+          gkey = Hash(t[k], gkey);
+        }
+        id<MTLTexture> gt = gpu_linear_tex[gkey];
+        if (!gt) {
+          MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+          d.textureType = tt.dim == TexDim::Tex2DArray ? MTLTextureType2DArray
+                                                       : MTLTextureType2D;
+          d.pixelFormat = fi.format;
+          d.width = width;
+          d.height = height;
+          if (tt.dim == TexDim::Tex2DArray) {
+            d.arrayLength = layers;
+          }
+          d.usage = MTLTextureUsageShaderRead;
+          d.storageMode = MTLStorageModePrivate;
+          d.swizzle = MTLTextureSwizzleChannelsMake(Swizzle(swz), Swizzle(swz >> 3),
+                                                    Swizzle(swz >> 6), Swizzle(swz >> 9));
+          gt = [device newTextureWithDescriptor:d];
+          gpu_linear_tex[gkey] = gt;
+        }
+        if (gt) {
+          auto &last = gpu_linear_copied[gkey];
+          if (last.first == dispatch_seq && last.second == frame_count) {
+            return gt; // no compute ran since the last copy this frame
+          }
+          last = {dispatch_seq, frame_count};
+          EndPass();
+          EnsureCommandBuffer();
+          id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+          for (u32 l = 0; l < layers; ++l) {
+            [b copyFromBuffer:buf
+                       sourceOffset:off + mips[0].offset + mips[0].slice_size * l
+                  sourceBytesPerRow:row
+                sourceBytesPerImage:mips[0].slice_size
+                         sourceSize:MTLSizeMake(width, height, 1)
+                          toTexture:gt
+                   destinationSlice:tt.dim == TexDim::Tex2DArray ? l : 0
+                   destinationLevel:0
+                  destinationOrigin:MTLOriginMake(0, 0, 0)];
+          }
+          [b endEncoding];
+          return gt;
+        }
+      }
     }
 
     u64 key = Hash(addr);
@@ -6584,6 +6670,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     return;
   }
   ++stat_dispatches;
+  ++dispatch_seq;
   if (trace && (scan_all || !scan_addrs.empty())) {
     scan_label = "dispatch cs " + Hex(addr);
   }
@@ -7052,6 +7139,35 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   }
   if (trace_frame) {
     trace = frame_count == trace_frame;
+  }
+  // DC_PEEK_MEM=<hex addr>,<bytes>: right after a traced flip, once the GPU
+  // has run everything encoded so far, how many dwords there are non-zero
+  // (guest memory the GPU fills with buffer stores, e.g. GT7's light grid).
+  if (trace_frame && frame_count == trace_frame + 1) {
+    if (const char *e = std::getenv("DC_PEEK_MEM")) {
+      char *q = nullptr;
+      const u64 a = std::strtoull(e, &q, 16) & kGpuAddrMask;
+      const u64 n = *q == ',' ? std::strtoull(q + 1, nullptr, 0) : 4096;
+      if (Readable(a, n)) {
+        EndPass();
+        EnsureCommandBuffer();
+        const u64 frame = trace_frame;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          const u32 *d = reinterpret_cast<const u32 *>(a);
+          u64 nz = 0, first = ~0ull;
+          for (u64 i = 0; i < n / 4; ++i) {
+            if (d[i]) {
+              ++nz;
+              first = std::min(first, i);
+            }
+          }
+          DC_INFO("gpu: peek mem %#llx after flip %llu: %llu of %llu dwords non-zero, first at +%#llx = %08x",
+                  (unsigned long long)a, (unsigned long long)frame, (unsigned long long)nz,
+                  (unsigned long long)(n / 4), (unsigned long long)(first == ~0ull ? 0 : first * 4),
+                  first == ~0ull ? 0u : d[first]);
+        }];
+      }
+    }
   }
   // Also right after a traced flip: the surface its probes sampled.
   if (zstat_addr && (frame_count % zstat_every == 0 ||
