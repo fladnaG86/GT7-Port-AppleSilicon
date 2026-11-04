@@ -6693,10 +6693,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     }
   }
   if (trace) {
-    DC_INFO("gpu: dispatch q%u cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x "
+    DC_INFO("gpu: dispatch q%u cs=%#llx groups %ux%ux%u%s threads %ux%ux%u rsrc2=%#x "
             "ud=%08x %08x %08x %08x %08x %08x %08x "
             "%08x %08x %08x %08x %08x %08x %08x %08x %08x",
-            Gpu::t_queue, addr, gx, gy, gz, tx, ty, tz, rsrc2, ud[0], ud[1], ud[2], ud[3],
+            Gpu::t_queue, addr, gx, gy, gz, indirect_args ? " (indirect)" : "", tx, ty, tz,
+            rsrc2, ud[0], ud[1], ud[2], ud[3],
             ud[4], ud[5], ud[6], ud[7], ud[8], ud[9], ud[10], ud[11], ud[12],
             ud[13], ud[14], ud[15]);
     FindRefs(ud, 16, 0, "ud", "cs", addr);

@@ -1108,12 +1108,23 @@ void Emitter::EmitDs(const Inst& i) {
         return;
     }
     // LDS: `lds` is the threadgroup memory as dwords; addresses are bytes.
+    // GDS (the GDS bit): the queue's global data share instead, a device
+    // buffer shared by every dispatch; M0[31:16] is the byte base. GT7's GPU
+    // occlusion pipeline keeps its list counters there (ds_add_u32,
+    // ds_add_rtn_u32, ds_read_b32 with M0 = 400) and sizes the next
+    // dispatches from them.
     const std::string a = VName(i.vaddr);
     const u32 off16 = (u32(i.offset1) << 8) | i.offset0;
     const std::string lane_guard = guard ? "if (exec_lo != 0u) " : "";
-    auto at = [&](u32 byte_off) { return "lds[(" + a + " + " + N(byte_off) + "u) >> 2]"; };
+    auto at = [&](u32 byte_off) {
+        if (i.gds) {
+            return "gds[((((m0r >> 16) + " + a + " + " + N(byte_off) + "u) >> 2) & " + N(Gpu::kGdsIndexMask) + "u)]";
+        }
+        return "lds[(" + a + " + " + N(byte_off) + "u) >> 2]";
+    };
     auto atomic = [&](const char* fn, bool rtn, bool sign) {
-        const std::string ty = sign ? "threadgroup atomic_int*" : "threadgroup atomic_uint*";
+        const std::string ty = i.gds ? (sign ? "device atomic_int*" : "device atomic_uint*")
+                                     : (sign ? "threadgroup atomic_int*" : "threadgroup atomic_uint*");
         const std::string val = sign ? "int(" + VName(i.data0) + ")" : VName(i.data0);
         const std::string call = std::string(fn) + "((" + ty + ")&" + at(off16) + ", " + val + ", memory_order_relaxed)";
         if (rtn) {
