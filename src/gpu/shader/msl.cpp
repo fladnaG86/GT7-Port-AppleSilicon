@@ -10,6 +10,16 @@
 #include "gpu/gds.h"
 #include "gpu/shader/msl_prelude.h"
 
+// DC_WAVE_OFF=<list>: debug, turn off wave-wide lowerings of compute shaders
+// (bcnt, ff1, rfl = readfirstlane, rl = readlane, swz = ds_swizzle, lshl).
+static bool WaveOn(const char* k) {
+    static const std::string off = [] {
+        const char* e = std::getenv("DC_WAVE_OFF");
+        return std::string(e ? e : "");
+    }();
+    return off.find(k) == std::string::npos;
+}
+
 namespace Gpu::Shader {
 
 using namespace Gcn;
@@ -427,7 +437,16 @@ void Emitter::EmitSop2(const Inst& i) {
     case Sop2::S_XNOR_B32: r32("~(" + a + " ^ " + b + ")"); break;
     case Sop2::S_XNOR_B64: r64("~(" + a64 + " ^ " + b64 + ")"); break;
     case Sop2::S_LSHL_B32: r32(a + " << (" + b + " & 31u)"); break;
-    case Sop2::S_LSHL_B64: r64(a64 + " << (" + b + " & 63u)"); break;
+    case Sop2::S_LSHL_B64:
+        // Compute: `1 << s_ff1(exec)` builds the mask of one lane (GT7's
+        // light culling lets only that lane do the wave's atomic). Lane masks
+        // are this lane's bit here, so it becomes "that lane is me".
+        if (p.stage == Stage::Compute && i.src[0] == Operand::Zero + 1 && WaveOn("lshl")) {
+            r64("((" + b + " & 63u) == (dc_lidx & 31u) ? ~0ul : 0ul)");
+            break;
+        }
+        r64(a64 + " << (" + b + " & 63u)");
+        break;
     case Sop2::S_LSHR_B32: r32(a + " >> (" + b + " & 31u)"); break;
     case Sop2::S_LSHR_B64: r64(a64 + " >> (" + b + " & 63u)"); break;
     case Sop2::S_ASHR_I32: r32("uint(int(" + a + ") >> (" + b + " & 31u))"); break;
@@ -504,7 +523,16 @@ void Emitter::EmitSop1(const Inst& i) {
     case Sop1::S_BREV_B32: SetS(i.dst, "reverse_bits(" + a + ")"); break;
     case Sop1::S_BCNT0_I32_B32: r32("32u - popcount(" + a + ")"); break;
     case Sop1::S_BCNT1_I32_B32: r32("popcount(" + a + ")"); break;
-    case Sop1::S_BCNT1_I32_B64: r32("uint(popcount(" + a64 + "))"); break;
+    // Compute: a lane mask counts / finds the wave's active lanes (the append
+    // idiom of GT7's clustered light culling); other values as plain bits.
+    case Sop1::S_BCNT1_I32_B64:
+        r32(p.stage == Stage::Compute && WaveOn("bcnt") ? "dc_wave_bcnt1(" + a64 + ")" : "uint(popcount(" + a64 + "))");
+        break;
+    case Sop1::S_FF1_I32_B64:
+        SetS(i.dst, p.stage == Stage::Compute && WaveOn("ff1")
+                        ? "dc_wave_ff1(" + a64 + ")"
+                        : "(" + a64 + " == 0ul ? 0xffffffffu : uint(ctz(" + a64 + ")))");
+        break;
     case Sop1::S_FF0_I32_B32: SetS(i.dst, "dc_ffbl(~" + a + ")"); break;
     case Sop1::S_FF1_I32_B32: SetS(i.dst, "dc_ffbl(" + a + ")"); break;
     case Sop1::S_FLBIT_I32_B32: SetS(i.dst, "dc_ffbh_u(" + a + ")"); break;
@@ -718,7 +746,37 @@ void Emitter::EmitVop(const Inst& i) {
         }
         SetV(i.dst, "(" + Mask(i.src[2]) + " ? " + u(1) + " : " + u(0) + ")");
         break;
-    case Vop::V_READLANE_B32: SetS(i.dst, u(0)); break;
+    case Vop::V_READLANE_B32: // compute: that lane of the SIMD group (lane mod 32)
+        // Not in the LS/HS run as compute for tessellation: their lanes are
+        // laid out per patch there, not as the guest wave, and reading
+        // another thread gave hull shaders other patches' data (tess factors
+        // blew up: 0.8 fps race load).
+        {
+            const bool wave_ok = p.stage == Stage::Compute && o.tess.stage == TessStage::None && WaveOn("rl");
+            // A constant lane outside loops (GT7's wave64 reductions read lanes
+            // 31 and 63 for the two halves' sums): every thread of the group
+            // passes, so the value goes through threadgroup memory and the
+            // other 32-lane half of the wave is seen too. Elsewhere the lane of
+            // this SIMD group.
+            bool in_loop = false;
+            for (const auto& [h, e] : loop_end) {
+                in_loop = in_loop || (h <= cur && cur <= e);
+            }
+            // VOP2 V_READLANE: the VSRC1 field holds a scalar operand (SGPR,
+            // M0 or inline constant), which the decoder reads as a VGPR.
+            const u16 lane_op = i.src[1] >= Operand::Vgpr0 ? u16(i.src[1] - Operand::Vgpr0) : i.src[1];
+            const bool const_lane = lane_op >= Operand::Zero && lane_op <= Operand::IntPosMax;
+            const std::string lane_val = Src(lane_op, i.literal);
+            if (wave_ok && const_lane && !in_loop && WaveOn("rlx")) {
+                const u32 lane = lane_op - Operand::Zero;
+                Line("threadgroup_barrier(mem_flags::mem_threadgroup); dc_wx[dc_lidx] = " + u(0) +
+                     "; threadgroup_barrier(mem_flags::mem_threadgroup);");
+                SetS(i.dst, "dc_wx[(dc_lidx & ~63u) + " + N(lane & 63) + "u]");
+            } else {
+                SetS(i.dst, wave_ok ? "simd_shuffle(" + u(0) + ", ushort(" + lane_val + " & 31u))" : u(0));
+            }
+        }
+        break;
     case Vop::V_WRITELANE_B32: SetV(i.dst, u(0)); break;
     case Vop::V_ADD_F32: SetVF(i, f(0) + " + " + f(1)); break;
     case Vop::V_SUB_F32: SetVF(i, f(0) + " - " + f(1)); break;
@@ -886,7 +944,9 @@ void Emitter::EmitVop(const Inst& i) {
         SetV(i.dst, u(0));
         break;
     case Vop::V_READFIRSTLANE_B32:
-        SetS(i.dst, p.stage == Stage::Compute ? "simd_broadcast_first(" + u(0) + ")" : u(0));
+        // The first lane with its EXEC bit set: every thread runs here, so
+        // simd_broadcast_first picked lane 0 even when the guest had it off.
+        SetS(i.dst, p.stage == Stage::Compute && WaveOn("rfl") ? "dc_readfirstlane(" + u(0) + ", exec_lo != 0u)" : u(0));
         break;
     case Vop::V_CVT_F32_I32: SetVF(i, "float(" + s(0) + ")"); break;
     case Vop::V_CVT_F32_U32: SetVF(i, "float(" + u(0) + ")"); break;
@@ -1002,10 +1062,25 @@ void Emitter::EmitDs(const Inst& i) {
         }
     }
     if (static_cast<Ds>(i.op) == Ds::DS_SWIZZLE_B32 && p.stage == Stage::Compute) {
-        // Reads another lane of the wave (GT7's bloom sums a 2x2 of lanes). Metal
-        // threads have no such lanes, so each keeps its own value: same mean,
-        // less filtering. Skipping it left stale registers in the sum.
-        SetV(i.dst, VName(i.vaddr));
+        // Reads another lane of the wave: offset bit 15 = quad permute, else
+        // bitmask mode over 32 lanes ((lane & and) | or) ^ xor. The SIMD group
+        // is 32 lanes like the bitmask mode's group. Every thread shuffles,
+        // then the guarded write keeps inactive lanes' values.
+        if (!WaveOn("swz")) {
+            SetV(i.dst, VName(i.vaddr));
+            return;
+        }
+        const u32 off = (u32(i.offset1) << 8) | i.offset0;
+        std::string lane;
+        if (off & 0x8000) {
+            lane = "((dc_lidx & 28u) | ((" + Hex(off & 0xFF) + "u >> ((dc_lidx & 3u) * 2u)) & 3u))";
+        } else {
+            const u32 and_m = off & 0x1F, or_m = (off >> 5) & 0x1F, xor_m = (off >> 10) & 0x1F;
+            lane = "((((dc_lidx & 31u) & " + N(and_m) + "u) | " + N(or_m) + "u) ^ " + N(xor_m) + "u)";
+        }
+        Line("{ uint sw_ = simd_shuffle(" + VName(i.vaddr) + ", ushort(" + lane + "));");
+        SetV(i.dst, "sw_");
+        Line("}");
         return;
     }
     // The domain VS reads the HS outputs its patch's threadgroup left in LDS.
@@ -2103,6 +2178,11 @@ std::string Emitter::Run() {
                                   : "") +
                ") {\n";
         src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
+        // Wave64 lane exchange for V_READLANE of a lane in the other 32-lane
+        // half (see the emitter): one dword per thread of the group.
+        if (wrapped.find("dc_wx[") != std::string::npos) {
+            src += "    threadgroup uint dc_wx[1024];\n";
+        }
         if (tess_lds) {
             src += "    device uint* lds = dc_ldsm + dc_gid.x * " + N(o.tess.lds_dwords) + "u;\n";
         }

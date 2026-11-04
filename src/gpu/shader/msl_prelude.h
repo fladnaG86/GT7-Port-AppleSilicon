@@ -247,6 +247,31 @@ static inline uint dc_sbfe_i(uint v, uint off, uint w) {
 }
 static inline uint dc_ffbh_u(uint v) { return v == 0u ? 0xffffffffu : clz(v); }
 static inline uint dc_ffbl(uint v) { return v == 0u ? 0xffffffffu : ctz(v); }
+
+// ---- wave-wide operations on lane masks (compute) ----
+// A guest lane mask lives here as this lane's bit, all ones or zero in both
+// halves. SALU ops that read a mask as a number (count, first set bit) need
+// the whole wave's bits; the SIMD group stands in for the wave. Every lane
+// calls these unconditionally (SIMD group functions need every thread), then
+// a value that is not a lane mask keeps its plain meaning.
+static inline bool dc_is_mask(ulong x) { return x == 0ul || x == ~0ul; }
+static inline ulong dc_ballot(bool b) {
+    return ulong(simd_vote::vote_t(simd_ballot(b)));
+}
+static inline uint dc_wave_bcnt1(ulong x) {
+    const uint n = simd_sum(x != 0ul ? 1u : 0u);
+    return dc_is_mask(x) ? n : uint(popcount(x));
+}
+static inline uint dc_wave_ff1(ulong x) {
+    const ulong b = dc_ballot(x != 0ul);
+    const ulong v = dc_is_mask(x) ? b : x;
+    return v == 0ul ? 0xffffffffu : uint(ctz(v));
+}
+// V_READFIRSTLANE: the first lane whose EXEC bit is set.
+static inline uint dc_readfirstlane(uint v, bool active) {
+    const ulong b = dc_ballot(active);
+    return simd_shuffle(v, ushort(b == 0ul ? 0u : uint(ctz(b))));
+}
 static inline uint dc_ffbh_i(uint v) { uint t = int(v) < 0 ? ~v : v; return t == 0u ? 0xffffffffu : clz(t); }
 static inline uint dc_cvt_u32(float f) {
     if (isnan(f) || f <= 0.0f) return 0u;
