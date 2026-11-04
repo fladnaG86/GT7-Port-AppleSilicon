@@ -267,6 +267,31 @@ static inline uint dc_wave_ff1(ulong x) {
     const ulong v = dc_is_mask(x) ? b : x;
     return v == 0ul ? 0xffffffffu : uint(ctz(v));
 }
+// S_CBRANCH_EXECZ / VCCZ: the wave jumps only when no lane of the 64 has the
+// bit (GT7's Hi-Z occlusion test sums per-cell votes with ds_swizzle and
+// readlane 31/63 under such a branch: per-lane skipping lost the sum, ryGT7
+// FIX-190). This SIMD group votes with simd_all; in a 64-thread group the two
+// halves exchange their votes through threadgroup memory tagged with a
+// generation, spinning (capped) instead of a barrier so a half that already
+// left cannot hang the other. A mask used as a plain number is uniform, so
+// the answer is the same.
+static inline bool dc_wave_zero(uint v, threadgroup atomic_uint* wz, uint lidx, uint tg, thread uint& gen) {
+    const bool zero_ = simd_all(v == 0u);
+    if (tg != 64u) return zero_;
+    const uint g = ++gen;
+    const uint h = (lidx >> 5) & 1u;
+    uint other = 0u;
+    if (simd_is_first()) {
+        atomic_store_explicit(&wz[h], (g << 1) | (zero_ ? 0u : 1u), memory_order_relaxed);
+        for (uint spin = 0u; spin < 8192u; ++spin) {
+            other = atomic_load_explicit(&wz[h ^ 1u], memory_order_relaxed);
+            if ((other >> 1) >= g) break;
+        }
+    }
+    other = simd_broadcast_first(other);
+    if ((other >> 1) != g) return zero_; // the other half left or diverged: this half alone
+    return zero_ && (other & 1u) == 0u;
+}
 // V_READFIRSTLANE: the first lane whose EXEC bit is set.
 static inline uint dc_readfirstlane(uint v, bool active) {
     const ulong b = dc_ballot(active);

@@ -564,6 +564,25 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
     p.linear_base_by_pc.emplace_back(i.pc, slot);
 }
 
+// Reads other lanes of the wave (see Program::cross_lane).
+bool CrossLane(const Inst& i) {
+    switch (i.enc) {
+    case Enc::DS: return static_cast<Ds>(i.op) == Ds::DS_SWIZZLE_B32;
+    case Enc::SOP1: {
+        const auto op = static_cast<Sop1>(i.op);
+        return op == Sop1::S_BCNT1_I32_B64 || op == Sop1::S_FF1_I32_B64;
+    }
+    case Enc::VOP1:
+    case Enc::VOP2:
+    case Enc::VOP3: {
+        const auto op = static_cast<Vop>(i.op);
+        return op == Vop::V_READLANE_B32 || op == Vop::V_READFIRSTLANE_B32 || op == Vop::V_MBCNT_LO_U32_B32 ||
+               op == Vop::V_MBCNT_HI_U32_B32;
+    }
+    default: return false;
+    }
+}
+
 bool WritesExec(const Inst& i) {
     auto is_exec = [](u16 code) { return code == Operand::ExecLo || code == Operand::ExecHi; };
     switch (i.enc) {
@@ -890,6 +909,7 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
             p->labels.push_back(BranchTarget(i));
         }
         p->writes_exec |= WritesExec(i);
+        p->cross_lane |= CrossLane(i);
 
         switch (i.enc) {
         case Enc::EXP:

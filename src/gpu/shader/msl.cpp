@@ -11,7 +11,8 @@
 #include "gpu/shader/msl_prelude.h"
 
 // DC_WAVE_OFF=<list>: debug, turn off wave-wide lowerings of compute shaders
-// (bcnt, ff1, rfl = readfirstlane, rl = readlane, swz = ds_swizzle, lshl).
+// (bcnt, ff1, rfl = readfirstlane, rl = readlane, swz = ds_swizzle, lshl,
+// execz = wave-uniform EXECZ/VCCZ branches).
 static bool WaveOn(const char* k) {
     static const std::string off = [] {
         const char* e = std::getenv("DC_WAVE_OFF");
@@ -227,6 +228,20 @@ private:
         const u32 t = index_of.at(target);
         Line(t <= cur ? "{ " + LoopGuard() + "tgt_ = " + N(t) + "u; continue; }" : "tgt_ = " + N(t) + "u;");
     }
+    // "no lane has the bit" for S_CBRANCH_EXECZ/VCCZ: wave-uniform in compute
+    // programs that read other lanes (dc_wave_zero in the prelude), this
+    // lane's bit elsewhere (cheaper, and what every shader ran with so far).
+    // DC_WAVE_EXECZ=1 opts in: with it GT7 stalled on the boot logo 2 runs of
+    // 3 and Driveclub's race lost ~12% GPU time (2026-11-05), while the GDS
+    // fix alone already lit the cockpit; kept for the Hi-Z vote sums (ryGT7
+    // FIX-190) once the stall is understood.
+    std::string WaveZero(const std::string& mask) {
+        static const bool opt_in = std::getenv("DC_WAVE_EXECZ") != nullptr;
+        if (opt_in && p.stage == Stage::Compute && o.tess.stage == TessStage::None && p.cross_lane && WaveOn("execz")) {
+            return "dc_wave_zero(" + mask + ", dc_wz, dc_lidx, dc_tpg, dc_zg)";
+        }
+        return mask + " == 0u";
+    }
     void End() {
         if (p.stage == Stage::Fragment) {
             Line("if (!dc_exported) discard_fragment();");
@@ -245,6 +260,9 @@ private:
             Line("    ix_[t_ * 3u] = ok_ ? gb_ + a_ * 16u : gb_; ix_[t_ * 3u + 1u] = ok_ ? gb_ + b_ * 16u : gb_;");
             Line("    ix_[t_ * 3u + 2u] = ok_ ? gb_ + (t_ + 2u) * 16u : gb_;");
             Line("  } }");
+        }
+        if (p.stage == Stage::Compute) {
+            Line("DC_WAVE_GONE"); // Run(): this half leaves (dc_wave_zero stops waiting for it)
         }
         Line(p.stage == Stage::Compute ? "return;" : "return out;");
     }
@@ -588,10 +606,10 @@ void Emitter::EmitSopp(const Inst& i) {
     case Sopp::S_BRANCH: Jump(BranchTarget(i)); break;
     case Sopp::S_CBRANCH_SCC0: Line("if (!scc)"); Jump(BranchTarget(i)); break;
     case Sopp::S_CBRANCH_SCC1: Line("if (scc)"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_VCCZ: Line("if (vcc_lo == 0u)"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_VCCNZ: Line("if (vcc_lo != 0u)"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_EXECZ: Line("if (exec_lo == 0u)"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_EXECNZ: Line("if (exec_lo != 0u)"); Jump(BranchTarget(i)); break;
+    case Sopp::S_CBRANCH_VCCZ: Line("if (" + WaveZero("vcc_lo") + ")"); Jump(BranchTarget(i)); break;
+    case Sopp::S_CBRANCH_VCCNZ: Line("if (!" + WaveZero("vcc_lo") + ")"); Jump(BranchTarget(i)); break;
+    case Sopp::S_CBRANCH_EXECZ: Line("if (" + WaveZero("exec_lo") + ")"); Jump(BranchTarget(i)); break;
+    case Sopp::S_CBRANCH_EXECNZ: Line("if (!" + WaveZero("exec_lo") + ")"); Jump(BranchTarget(i)); break;
     case Sopp::S_BARRIER:
         if (p.stage == Stage::Compute) {
             Line("threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);");
@@ -2080,6 +2098,17 @@ std::string Emitter::Run() {
     } else {
         wrapped = body;
     }
+    // A half-wave that leaves tells dc_wave_zero so the other half does not
+    // wait for it (see End()); no wave-uniform branches, nothing to tell.
+    {
+        const bool wave_zero = wrapped.find("dc_wave_zero(") != std::string::npos;
+        const std::string gone = wave_zero ? "if (simd_is_first()) atomic_store_explicit(&dc_wz[(dc_lidx >> 5) & 1u], "
+                                             "0xffffffffu, memory_order_relaxed);"
+                                           : "";
+        for (size_t at = wrapped.find("DC_WAVE_GONE"); at != std::string::npos; at = wrapped.find("DC_WAVE_GONE", at + gone.size())) {
+            wrapped.replace(at, 12, gone);
+        }
+    }
 
     const bool tess_lds = o.tess.stage != TessStage::None;
     if (tess_lds) {
@@ -2225,7 +2254,7 @@ std::string Emitter::Run() {
     } else {
         src += "kernel void main0(uint3 dc_tid [[thread_position_in_threadgroup]], "
                "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], "
-               "uint3 dc_gtid [[thread_position_in_grid]], " +
+               "uint3 dc_gtid [[thread_position_in_grid]], uint3 dc_tpg3 [[threads_per_threadgroup]], " +
                mem_params + ", device uint* gds [[buffer(5)]], " +
                (tess_lds ? "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]"
                          : std::string("threadgroup uint* lds [[threadgroup(0)]]")) +
@@ -2244,6 +2273,14 @@ std::string Emitter::Run() {
         // half (see the emitter): one dword per thread of the group.
         if (wrapped.find("dc_wx[") != std::string::npos) {
             src += "    threadgroup uint dc_wx[1024];\n";
+        }
+        // Wave-uniform EXECZ/VCCZ (dc_wave_zero): the two halves' vote slots,
+        // zeroed before any thread can leave (a barrier is uniform here).
+        if (wrapped.find("dc_wave_zero(") != std::string::npos) {
+            src += "    uint dc_tpg = dc_tpg3.x * dc_tpg3.y * dc_tpg3.z; uint dc_zg = 0u;\n"
+                   "    threadgroup atomic_uint dc_wz[2];\n"
+                   "    if (dc_lidx < 2u) atomic_store_explicit(&dc_wz[dc_lidx], 0u, memory_order_relaxed);\n"
+                   "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         }
         if (tess_lds) {
             src += "    device uint* lds = dc_ldsm + dc_gid.x * " + N(o.tess.lds_dwords) + "u;\n";
