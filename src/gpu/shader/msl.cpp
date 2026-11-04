@@ -752,7 +752,11 @@ void Emitter::EmitVop(const Inst& i) {
         // another thread gave hull shaders other patches' data (tess factors
         // blew up: 0.8 fps race load).
         {
-            const bool wave_ok = p.stage == Stage::Compute && o.tess.stage == TessStage::None && WaveOn("rl");
+            // DC_WAVE_TESS=1: also in LS/HS (experiment: the 0.8 fps came from
+            // the lane operand read as v159 = lane 0, fixed since).
+            static const bool wave_tess = std::getenv("DC_WAVE_TESS") != nullptr;
+            const bool wave_ok = p.stage == Stage::Compute &&
+                                 (o.tess.stage == TessStage::None || wave_tess) && WaveOn("rl");
             // A constant lane outside loops (GT7's wave64 reductions read lanes
             // 31 and 63 for the two halves' sums): every thread of the group
             // passes, so the value goes through threadgroup memory and the
