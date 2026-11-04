@@ -660,6 +660,13 @@ struct MetalRenderer::Impl {
     const char *v = std::getenv("DC_TEX_MAX_AGE");
     return v ? std::strtoull(v, nullptr, 10) : 600ull;
   }();
+  // DC_TEX_HOT_MB=<MB>: textures at least this big are hashed in full on
+  // every use from the start (debug: GPU-or-CPU rewritten pools such as the
+  // GT7 lighting probe atlases would otherwise lag by size/64 KB frames).
+  const u64 kTextureHotBytes = [] {
+    const char *v = std::getenv("DC_TEX_HOT_MB");
+    return v ? std::strtoull(v, nullptr, 10) << 20 : ~0ull;
+  }();
   const u64 kTextureBudget = [] {
     if (const char *v = std::getenv("DC_TEX_BUDGET_MB")) {
       return std::strtoull(v, nullptr, 10) << 20;
@@ -788,7 +795,13 @@ struct MetalRenderer::Impl {
       nil; // DC_DEBUG_FLAT: every pixel shader outputs magenta
   bool trace = false;
   bool gds_readback = false; // DC_GDS_READBACK: log GDS->memory copies in the traced frame
+  // Linear per-frame images bound in the traced flip: re-counted at the next
+  // flips (does their producer run after their consumer?).
+  struct LinearWatch { const u8 *src; u64 n; u64 addr; };
+  std::vector<LinearWatch> linear_watch;
+  std::vector<std::pair<u64, std::vector<std::tuple<u32, u64, u64>>>> peek_cs_table_pending;
   u64 find_addr = 0;         // DC_FIND_ADDR (see FindRefs)
+  u64 find_size_min = 0, find_size_max = 0; // DC_FIND_SIZE (see FindRefs)
   u64 peek_vs = 0;           // DC_PEEK_VS (see Draw)
   // DC_RAIN_DIAG: one F12/P in the rain traces two flips. The first peeks
   // the rain drop VS; its buffer holding only FLT_MAX (the drop colors, white
@@ -988,6 +1001,11 @@ struct MetalRenderer::Impl {
     gds_readback = std::getenv("DC_GDS_READBACK") != nullptr;
     if (const char *e = std::getenv("DC_FIND_ADDR")) {
       find_addr = std::strtoull(e, nullptr, 16);
+    }
+    if (const char *e = std::getenv("DC_FIND_SIZE")) { // <min>-<max> bytes
+      char *q = nullptr;
+      find_size_min = std::strtoull(e, &q, 0);
+      find_size_max = *q == '-' ? std::strtoull(q + 1, nullptr, 0) : find_size_min;
     }
     rain_diag = std::getenv("DC_RAIN_DIAG") != nullptr;
     if (const char *e = std::getenv("DC_PEEK_VS")) {
@@ -3488,6 +3506,18 @@ struct MetalRenderer::Impl {
                   destinationOrigin:MTLOriginMake(0, 0, 0)];
           }
           [b endEncoding];
+          if (trace) { // non-zero dwords of the copied range, as the GPU saw it
+            const u8 *src = static_cast<const u8 *>(buf.contents) + off + mips[0].offset;
+            const u64 n = mips[0].slice_size * layers / 4, a = addr;
+            linear_watch.push_back({src, n, a});
+            [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+              u64 nz = 0;
+              const u32 *d = reinterpret_cast<const u32 *>(src);
+              for (u64 i = 0; i < n; ++i) nz += d[i] != 0;
+              DC_INFO("gpu: linear copy %#llx: %llu of %llu dwords non-zero",
+                      (unsigned long long)a, (unsigned long long)nz, (unsigned long long)n);
+            }];
+          }
           return gt;
         }
       }
@@ -3629,6 +3659,9 @@ struct MetalRenderer::Impl {
     e.frame = frame_count;
     e.addr = addr;
     e.size = size;
+    if (size >= kTextureHotBytes) {
+      e.hot = true;
+    }
     TexturePressure();
     return view();
   }
@@ -5181,15 +5214,20 @@ struct MetalRenderer::Impl {
   // that address (finds the shaders reading or writing a buffer).
   void FindRefs(const u32 *d, u32 n, int depth, const std::string &path,
                 const char *who, u64 shader) {
+    // DC_FIND_SIZE=<min>-<max>: V#s of that byte size instead (buffers in
+    // GT7's per-frame ring move every run, so no fixed address finds them).
     const u64 find = find_addr;
-    if (!find) {
+    if (!find && !find_size_min) {
       return;
     }
     for (u32 k = 0; k + 4 <= n; ++k) {
       const u64 base = (u64(d[k]) | (u64(d[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
       const u32 stride = (d[k + 1] >> 16) & 0x3FFF;
       const u64 size = stride ? u64(d[k + 2]) * stride : d[k + 2];
-      if (base && find >= base && find < base + std::max<u64>(size, 16)) {
+      const bool hit = find ? find >= base && find < base + std::max<u64>(size, 16)
+                            : size >= find_size_min && size <= find_size_max &&
+                                  (d[k + 3] & 0xFFF) != 0; // dst_sel set: a V#
+      if (base && hit) {
         DC_INFO("gpu: find %#llx: %s %#llx %s[%u] = %08x %08x %08x %08x",
                 (unsigned long long)find, who, (unsigned long long)shader,
                 path.c_str(), k, d[k], d[k + 1], d[k + 2], d[k + 3]);
@@ -5202,7 +5240,8 @@ struct MetalRenderer::Impl {
       const u64 p = (u64(d[k]) | (u64(d[k + 1]) << 32)) & kGpuAddrMask;
       id<MTLBuffer> b = nil;
       u64 off = 0;
-      if (p > 0x7000000000ull && !(p & 3) && Locate(p, 256, &b, &off)) {
+      const bool ring = p >= 0x200000000ull && p < 0x208800000ull; // GT7 per-frame
+      if ((p > 0x7000000000ull || ring) && !(p & 3) && Locate(p, 256, &b, &off)) {
         FindRefs(reinterpret_cast<const u32 *>(p), 64, depth + 1,
                  path + "[" + std::to_string(k) + "]->", who, shader);
       }
@@ -5341,6 +5380,17 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
   CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
   DrawLap(0);
+  // DC_PEEK_RT_EACH=1: with DC_PEEK_RT, every draw into the peeked target
+  // ends its pass, so the peek names the single draw that wrote the texel.
+  static const bool peek_each = std::getenv("DC_PEEK_RT_EACH") != nullptr;
+  if (peek_each && trace && enc && PeekRt().addr) {
+    for (u32 k = 0; k < 8; ++k) {
+      if (pass_tex[k] && (pass_addr[k] & kGpuAddrMask) == PeekRt().addr) {
+        EndPass();
+        break;
+      }
+    }
+  }
   ++draw_count;
   ++stat_draws;
   ++work_since_commit;
@@ -6693,6 +6743,34 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   if (trace && (scan_all || !scan_addrs.empty())) {
     scan_label = "dispatch cs " + Hex(addr);
   }
+  // DC_PEEK_CS_TABLE=<hex cs>,...: in the traced flip, the V#s in the table
+  // at that dispatch's ud[0..1] (64 dwords), each with its non-zero dword
+  // count once the GPU has run the dispatch (where its outputs go).
+  if (trace && std::getenv("DC_PEEK_CS_TABLE")) {
+    static const std::vector<u64> want = [] {
+      std::vector<u64> v;
+      char *q = const_cast<char *>(std::getenv("DC_PEEK_CS_TABLE"));
+      do v.push_back(std::strtoull(q, &q, 16)); while (*q == ',' && *++q);
+      return v;
+    }();
+    const u64 table = (u64(ud[0]) | (u64(ud[1] & 0xFFFF) << 32)) & kGpuAddrMask;
+    if (std::find(want.begin(), want.end(), addr) != want.end() && Readable(table, 256)) {
+      const u32 *t = reinterpret_cast<const u32 *>(table);
+      std::vector<std::tuple<u32, u64, u64>> vs;
+      for (u32 k = 0; k + 4 <= 64; k += 4) {
+        const u64 base = (u64(t[k]) | (u64(t[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
+        const u32 stride = (t[k + 1] >> 16) & 0x3FFF;
+        const u64 size = stride ? u64(t[k + 2]) * stride : t[k + 2];
+        if (base && (t[k + 3] & 0xFFF) && size && size <= (64ull << 20) && Readable(base, size)) {
+          vs.emplace_back(k, base, size);
+          DC_INFO("gpu: cs %#llx table %#llx [%u] V# %08x %08x %08x %08x base %#llx size %llu",
+                  (unsigned long long)addr, (unsigned long long)table, k, t[k], t[k + 1],
+                  t[k + 2], t[k + 3], (unsigned long long)base, (unsigned long long)size);
+        }
+      }
+      peek_cs_table_pending.push_back({addr, std::move(vs)});
+    }
+  }
   if (trace) {
     static const u64 peek_cs =
         std::getenv("DC_PEEK_CS")
@@ -7125,6 +7203,32 @@ bool MetalRenderer::Impl::BeginCapture(const std::string &path) {
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   CpuTimer t(cpu_profile ? &cpu_flip_s : nullptr);
   ++frame_count;
+  if (!linear_watch.empty() && trace_frame && frame_count > trace_frame + 1) {
+    const u64 age = frame_count - trace_frame;
+    for (const auto &w : linear_watch) {
+      u64 nz = 0;
+      const u32 *d = reinterpret_cast<const u32 *>(w.src);
+      for (u64 i = 0; i < w.n; ++i) nz += d[i] != 0;
+      DC_INFO("gpu: linear watch %#llx +%llu flips: %llu of %llu non-zero",
+              (unsigned long long)w.addr, (unsigned long long)age,
+              (unsigned long long)nz, (unsigned long long)w.n);
+    }
+    if (age >= 8) linear_watch.clear();
+  }
+  if (!peek_cs_table_pending.empty() && trace_frame && frame_count > trace_frame + 1) {
+    Commit(true); // everything encoded so far has run
+    for (const auto &[cs, vs] : peek_cs_table_pending) {
+      for (const auto &[k, base, size] : vs) {
+        u64 nz = 0;
+        const u32 *d = reinterpret_cast<const u32 *>(base);
+        for (u64 i = 0; i < size / 4; ++i) nz += d[i] != 0;
+        DC_INFO("gpu: cs %#llx table [%u] %#llx: %llu of %llu dwords non-zero",
+                (unsigned long long)cs, k, (unsigned long long)base,
+                (unsigned long long)nz, (unsigned long long)(size / 4));
+      }
+    }
+    peek_cs_table_pending.clear();
+  }
   if (frame_count % kTextureSweepEvery == 0) {
     EvictTextures(kTextureMaxAge);
   }
