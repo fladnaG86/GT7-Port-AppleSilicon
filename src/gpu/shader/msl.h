@@ -119,6 +119,9 @@ struct TextureType {
     u8 compare = 3; // depth-compare sampling: S# DEPTH_COMPARE_FUNC (ref <op> texel), default LEQUAL
     bool cube = false; // a cube (Tex2DArray of faces) sampled with V_CUBE* coordinates
     bool ufloat = false; // unsigned small-float storage (R11G11B10): writes clamp like the CB does
+    // S# FORCE_UNNORMALIZED: coordinates in texels of the level sampled (an explicit
+    // LOD addresses that mip, GT7's hull shaders read their Hi-Z pyramid so).
+    bool unnorm = false;
     bool operator==(const TextureType&) const = default;
 };
 

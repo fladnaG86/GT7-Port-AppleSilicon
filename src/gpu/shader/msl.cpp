@@ -1550,6 +1550,20 @@ void Emitter::EmitImage(const Inst& i) {
         coord = "float2(" + s + ", " + tc + ")";
     }
     Line("{");
+    if (tt.unnorm && !tt.cube && op != Mimg::IMAGE_GET_LOD) {
+        // Texel coordinates of level 0, except in hull shaders, whose explicit
+        // LOD addresses that mip in its own texels (ryGT7 FIX-228 applies it to
+        // hull shaders only; elsewhere it whited out GT7's race view).
+        const std::string lv = l && o.tess.stage == TessStage::Hull ? "uint(max(" + lod + ", 0.0f))" : "0u";
+        if (tt.dim == TexDim::Tex3D) {
+            Line("  float3 un_ = float3(" + t + ".get_width(" + lv + "), " + t + ".get_height(" + lv + "), " + t +
+                 ".get_depth(" + lv + "));");
+            coord = "(" + coord + " / un_)";
+        } else {
+            Line("  float2 un_ = float2(" + t + ".get_width(" + lv + "), " + t + ".get_height(" + lv + "));");
+            coord = "(" + coord + " / un_)";
+        }
+    }
     if (!offset.empty() && tt.dim != TexDim::Tex3D) {
         Line("  float2 o_ = float2(int(" + offset + " << 26) >> 26, int(" + offset + " << 18) >> 26) / float2(" + t +
              ".get_width(), " + t + ".get_height());");

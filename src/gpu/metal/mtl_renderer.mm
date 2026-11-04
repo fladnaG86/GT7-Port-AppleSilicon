@@ -3663,8 +3663,21 @@ struct MetalRenderer::Impl {
                     : border == 1 ? MTLSamplerBorderColorOpaqueBlack
                                   : MTLSamplerBorderColorOpaqueWhite;
     // FORCE_UNNORMALIZED: coordinates in texels (GT7's glyphs). Metal allows
-    // this only without mips or anisotropy, clamped, with one filter.
-    if ((s[0] >> 15) & 1) {
+    // this only without mips or anisotropy, clamped, with one filter. Shaders
+    // now normalize such coordinates themselves by the sampled level's size
+    // (TextureType::unnorm), which also reads mips at an explicit LOD (GT7's
+    // hull shaders sample their Hi-Z pyramid so, ryGT7 FIX-228); the sampler
+    // keeps the edge clamps. DC_NO_UNNORM_SHADER=1: the old Metal sampler.
+    static const bool unnorm_shader = std::getenv("DC_NO_UNNORM_SHADER") == nullptr;
+    if (unnorm_shader && ((s[0] >> 15) & 1)) {
+      const auto clamp_mode = [](u32 clamp) {
+        return (clamp & 7) >= 4 ? MTLSamplerAddressModeClampToZero
+                                : MTLSamplerAddressModeClampToEdge;
+      };
+      d.sAddressMode = clamp_mode(s[0]);
+      d.tAddressMode = clamp_mode(s[0] >> 3);
+      d.rAddressMode = clamp_mode(s[0] >> 6);
+    } else if ((s[0] >> 15) & 1) {
       d.normalizedCoordinates = NO;
       // Borders stay transparent: smearing the edge texel fills whole quads.
       const auto pixel_clamp = [](u32 clamp) {
@@ -4452,6 +4465,12 @@ struct MetalRenderer::Impl {
                 (unsigned long)tex.pixelFormat, t[5] & 0x1FFF,
                 (t[5] >> 13) & 0x1FFF);
         DumpBound(tex, (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8);
+      }
+      // S# FORCE_UNNORMALIZED: the shader turns texel coordinates of the level
+      // it samples into normalized ones (its sampler stays normalized, with mips).
+      static const bool unnorm_shader = std::getenv("DC_NO_UNNORM_SHADER") == nullptr;
+      if (unnorm_shader && img.has_sampler && img.sampler_index < ssharps_.size()) {
+        tt.unnorm = (ssharps_[img.sampler_index][0] >> 15) & 1;
       }
       if (img.compare && img.has_sampler &&
           img.sampler_index < ssharps_.size()) {
