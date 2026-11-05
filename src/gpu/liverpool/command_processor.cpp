@@ -872,9 +872,22 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             // DrawIndirect args: vertex count, instances, first vertex, first instance.
             // DrawIndexIndirect: index count, instances, first index, base vertex, first instance.
             const bool indexed = op == Op::DrawIndexIndirect;
+            // DC_INDIRECT_SYNC=1: wait for the host GPU before reading the args
+            // (they may be written by a culling compute still in flight).
+            // DC_INDIRECT_LOG=1: log every indirect draw's CP-read counts.
+            static const bool indirect_sync = std::getenv("DC_INDIRECT_SYNC") != nullptr;
+            static const bool indirect_log = std::getenv("DC_INDIRECT_LOG") != nullptr;
+            if (indirect_sync) {
+                SyncRenderer();
+            }
             const u32* a = IndirectArgs(body[0], indexed ? 5 : 4);
             if (!a) {
                 break;
+            }
+            if (indirect_log) {
+                DC_INFO("gpu: indirect draw count=%u instances=%u args %p (vs %#llx ps %#llx)", a[0], a[1],
+                        (const void*)a, (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS),
+                        (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS));
             }
             const u32 base_vtx_loc = body[1] & 0xFFFF;
             const u32 start_inst_loc = body[2] & 0xFFFF;
@@ -949,7 +962,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         }
 
         default:
-            if (trace) {
+            { // once per opcode: a skipped packet can drop draws silently
                 static std::atomic<u64> seen[4]{};
                 const u64 bit = 1ull << (op & 63);
                 if (!(seen[op >> 6].fetch_or(bit) & bit)) {

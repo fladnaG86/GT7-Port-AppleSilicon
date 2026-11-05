@@ -1140,7 +1140,7 @@ struct MetalRenderer::Impl {
                                               options:nil
                                                 error:&err];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    if (std::getenv("DC_DEBUG_FLAT") || std::getenv("DC_TESS_FLAT")) { // DC_TESS_FLAT: tess draws only
+    if (std::getenv("DC_DEBUG_FLAT") || std::getenv("DC_TESS_FLAT") || std::getenv("DC_DEBUG_FLAT_RT")) { // DC_TESS_FLAT: tess draws only
       debug_fs = [lib newFunctionWithName:@"debug_fs"];
     }
     pd.vertexFunction = [lib newFunctionWithName:@"copy_vs"];
@@ -6358,7 +6358,13 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   pk.write_mask = target_mask;
   pk.shader_mask = r[Reg::CB_SHADER_MASK];
   pk.depth_fmt = static_cast<u32>(depth_fmt);
-  const u64 pkey = Hash(pk);
+  // DC_DEBUG_FLAT_RT=<addr>: magenta PS only for draws into that color target.
+  static const u64 flat_rt =
+      std::getenv("DC_DEBUG_FLAT_RT") ? std::strtoull(std::getenv("DC_DEBUG_FLAT_RT"), nullptr, 16) : 0;
+  const bool flat_draw = debug_fs && (tess_flat ? tess_draw != nullptr
+                                      : flat_rt ? (u64(r.ColorTarget(0, Reg::CB_BASE)) << 8) == flat_rt
+                                                : true);
+  const u64 pkey = flat_draw ? Hash(u64(0xF1A7), Hash(pk)) : Hash(pk);
   TakeCompiled();
   auto pit = pipelines.find(pkey);
   if (pit == pipelines.end()) {
@@ -6409,7 +6415,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         // (shadPS4 swaps SrcAlpha factors for One/Zero).
         const bool alpha_masked =
             !((r[Reg::CB_SHADER_MASK] >> (4 * k + 3)) & 1);
-        if ((b >> 30) & 1 && blendable && !(debug_fs && (!tess_flat || tess_draw))) {
+        if ((b >> 30) & 1 && blendable && !flat_draw) {
           ca.blendingEnabled = YES;
           auto fixa = [&](u32 f) {
             return !alpha_masked ? BlendFactor(f)
@@ -6438,7 +6444,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       pending.insert(pkey);
       std::string vsrc = MslSource(*vs, vo, vs_key);
       std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
-      const bool flat = debug_fs && (!tess_flat || tess_draw) && ps && out_type[0] == OutType::Float;
+      const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
       const bool will_wait = sync_shaders || probe_slot >= 0 || capture;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
@@ -6553,8 +6559,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     const u32 st_ops = r[Reg::DB_STENCIL_CONTROL];
     const u32 ref_f = r[Reg::DB_STENCILREFMASK],
               ref_b = r[Reg::DB_STENCILREFMASK_BF];
+    // DC_NO_STENCIL=1: stencil test off for every draw (debugging).
+    static const bool no_stencil = std::getenv("DC_NO_STENCIL") != nullptr;
     id<MTLDepthStencilState> ds = GetDepthState(
-        db_control, depth_clear, st, st_ops, ref_f, ref_b, stencil_clear);
+        no_stencil ? db_control & ~1u : db_control, depth_clear, st, st_ops, ref_f, ref_b, stencil_clear);
     if (!cache || bound.depth_state != ds) {
       bound.depth_state = ds;
       [enc setDepthStencilState:ds];

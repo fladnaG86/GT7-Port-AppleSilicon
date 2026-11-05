@@ -236,7 +236,19 @@ private:
     // fix alone already lit the cockpit; kept for the Hi-Z vote sums (ryGT7
     // FIX-190) once the stall is understood.
     std::string WaveZero(const std::string& mask) {
-        static const bool opt_in = std::getenv("DC_WAVE_EXECZ") != nullptr;
+        // DC_WAVE_EXECZ_AT=<hex>[,<hex>...]: only these compute programs.
+        static const bool all_in = std::getenv("DC_WAVE_EXECZ") != nullptr;
+        static const std::vector<u64> only_at = [] {
+            std::vector<u64> v;
+            if (const char* e = std::getenv("DC_WAVE_EXECZ_AT")) {
+                for (char* q = const_cast<char*>(e); *q;) {
+                    v.push_back(std::strtoull(q, &q, 16));
+                    if (*q == ',') ++q; else break;
+                }
+            }
+            return v;
+        }();
+        const bool opt_in = all_in || std::find(only_at.begin(), only_at.end(), p.address) != only_at.end();
         if (opt_in && p.stage == Stage::Compute && o.tess.stage == TessStage::None && p.cross_lane && WaveOn("execz")) {
             return "dc_wave_zero(" + mask + ", dc_wz, dc_lidx, dc_tpg, dc_zg)";
         }
