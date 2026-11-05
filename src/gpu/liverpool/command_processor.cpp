@@ -675,6 +675,14 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                        !irq ? 0 : compute ? kIrqCompute + t_ring->index : kIrqGfxEop);
             break;
         }
+        case Op::EventWrite: { // no-op; each event type logged once (ZPASS_DONE = 0x15 needs results)
+            static std::atomic<u64> seen{0};
+            const u32 type = body_n ? body[0] & 0x3F : 0;
+            if (!(seen.fetch_or(1ull << type) & (1ull << type))) {
+                DC_INFO("gpu: CP%s: EVENT_WRITE type %#x (%u dwords)", compute ? " compute" : "", type, body_n);
+            }
+            break;
+        }
         case Op::EventWriteEos: {
             const u32 cmd = (body[2] >> 29) & 7;
             if (cmd == 2) { // signal fence
