@@ -168,6 +168,23 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   info.cp_in = (config >> 8) & 0x3F;
   info.cp_out = (config >> 14) & 0x3F;
   info.domain = u8(tf & 3);
+  // DC_TRACE_TESS=<n>: trace the flip after the n-th one with a tessellated
+  // draw (shader addresses move between runs, flip numbers drift on replay).
+  // DC_TRACE_TESS_CP=<k>: count only draws with k input control points.
+  static const u32 trace_tess = std::getenv("DC_TRACE_TESS") ? u32(std::atoi(std::getenv("DC_TRACE_TESS"))) : 0;
+  static const u32 trace_tess_cp =
+      std::getenv("DC_TRACE_TESS_CP") ? u32(std::atoi(std::getenv("DC_TRACE_TESS_CP"))) : 0;
+  if (trace_tess && !trace_frame && (!trace_tess_cp || info.cp_in == trace_tess_cp)) {
+    static u64 last_frame = ~0ull;
+    static u32 frames = 0;
+    if (last_frame != frame_count) {
+      last_frame = frame_count;
+      if (++frames >= trace_tess) {
+        trace_frame = frame_count + 1;
+        DC_INFO("gpu: DC_TRACE_TESS: tracing flip %llu", (unsigned long long)trace_frame);
+      }
+    }
+  }
   const u32 rsrc2_ls = r[Reg::SPI_SHADER_PGM_RSRC2_LS];
   const u32 rsrc2_hs = r[Reg::SPI_SHADER_PGM_RSRC2_HS];
   const u32 rsrc2_vs = r[Reg::SPI_SHADER_PGM_RSRC2_VS];

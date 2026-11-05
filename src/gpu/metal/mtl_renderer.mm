@@ -6176,7 +6176,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.points = prim == PrimType::PointList;
   vo.vtx_point_size = vo.points && (r[Reg::PA_CL_VS_OUT_CNTL] & 1);
   vo.vtx_layer = draw_layers != 0;
-  const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf && (!tess_draw || trace);
+  // DC_DEBUG_VSOUT=1: the first tessellated (domain) VS of the traced frame.
+  const bool capture = debug_vsout && !debug_vs_buf &&
+                       (debug_vsout == 1 ? tess_draw && trace : vs_addr == debug_vsout && (!tess_draw || trace));
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
@@ -6437,7 +6439,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       std::string vsrc = MslSource(*vs, vo, vs_key);
       std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
       const bool flat = debug_fs && (!tess_flat || tess_draw) && ps && out_type[0] == OutType::Float;
-      const bool will_wait = sync_shaders || probe_slot >= 0;
+      const bool will_wait = sync_shaders || probe_slot >= 0 || capture;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
         id<MTLRenderPipelineState> pso = nil;
@@ -6465,7 +6467,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
     // Probed draws must run, and so must fused GS draws (text glyphs: each
     // ES+GS+VS combination is its own pipeline, skipping it loses letters).
-    if (!sync_shaders && probe_slot < 0 && !fused_pending.on) {
+    // A DC_DEBUG_VSOUT capture is a one-off pipeline: wait for it too.
+    if (!sync_shaders && probe_slot < 0 && !fused_pending.on && !capture) {
       if (trace)
         DC_INFO("gpu:   skipped: pipeline compiling");
       return;
