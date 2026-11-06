@@ -62,6 +62,9 @@ public:
     void WaitIdle();
     // WaitIdle with a limit; false if some ring was still busy after `ms`.
     bool WaitIdleFor(int ms);
+    // Frame replay: waits (at most `ms`) until every ring is idle or blocked in
+    // a WAIT_REG_MEM, i.e. has consumed all it can without new memory.
+    bool WaitQuiescentFor(int ms);
 
     // Frame capture/replay (capture.cpp): the state that carries over from
     // one frame to the next (registers, constant engine, ring state). Only
@@ -102,6 +105,7 @@ private:
         std::deque<Job> jobs;
         bool busy = false;
         RegFile regs;           // compute rings: their own SH state
+        std::atomic<bool> waiting{false}; // inside a WAIT_REG_MEM on memory
         u64 indirect_base = 0;  // SET_BASE
         std::jthread thread;
     };

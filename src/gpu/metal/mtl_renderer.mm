@@ -7176,6 +7176,43 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   const u32 tx = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_X] & 0xFFFF);
   const u32 ty = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Y] & 0xFFFF);
   const u32 tz = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Z] & 0xFFFF);
+  // DC_LOG_CS=<hex addr>[,<hex addr>...]: user data of those dispatches and the
+  // first dwords their user-data pointer (ud[0..1]) names, now and once the GPU
+  // has run the command buffer (a count a previous dispatch writes).
+  static const std::vector<u64> log_cs = [] {
+    std::vector<u64> v;
+    if (const char *e = std::getenv("DC_LOG_CS")) {
+      for (char *q = const_cast<char *>(e); *q;) {
+        v.push_back(std::strtoull(q, &q, 16));
+        if (*q) ++q;
+      }
+    }
+    return v;
+  }();
+  if (!log_cs.empty() && std::find(log_cs.begin(), log_cs.end(), addr) != log_cs.end()) {
+    const u64 ptr = (u64(ud[0]) | (u64(ud[1] & 0xFFFF) << 32)) & kGpuAddrMask;
+    u32 now[4] = {};
+    if (Readable(ptr, 16)) {
+      std::memcpy(now, reinterpret_cast<const void *>(ptr), 16);
+    }
+    DC_INFO("gpu: cs %#llx %ux%ux%u q%u flip %llu ud %08x %08x %08x %08x ptr %#llx: %08x %08x %08x %08x",
+            (unsigned long long)addr, gx, gy, gz, Gpu::t_queue, (unsigned long long)frame_count, ud[0], ud[1],
+            ud[2], ud[3], (unsigned long long)ptr, now[0], now[1], now[2], now[3]);
+    if (Readable(ptr, 96)) {
+      EnsureCommandBuffer();
+      const u64 a = addr;
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+        const u32 *d = reinterpret_cast<const u32 *>(ptr);
+        char line[400];
+        int n = std::snprintf(line, sizeof(line), "gpu: cs %#llx ptr %#llx after:", (unsigned long long)a,
+                              (unsigned long long)ptr);
+        for (int k = 0; k < 24 && n < int(sizeof(line)) - 10; ++k) {
+          n += std::snprintf(line + n, sizeof(line) - n, " %08x", d[k]);
+        }
+        DC_INFO("%s", line);
+      }];
+    }
+  }
   // Memset shape: 256 threads in one line, destination V# of dwords in user data.
   if (tx == 256 && ty == 1 && tz == 1 && gy == 1 && gz == 1 && ((ud[1] >> 16) & 0x3FFF) == 4) {
     const u64 dst = ud[0] | (u64(ud[1] & 0xFFF) << 32);

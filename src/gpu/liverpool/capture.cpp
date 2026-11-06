@@ -510,6 +510,7 @@ void BeforeHostWrite(void* addr, u64 size) {
 
 // --------------------------------------------------------------- replay ----
 namespace {
+std::atomic<bool> g_applying{false};
 
 struct ChunkRef {
     u64 key;
@@ -570,6 +571,10 @@ std::vector<u8> ReadAll(const std::string& dir, const char* name) {
 }
 
 } // namespace
+
+bool ReplayApplying() {
+    return g_applying.load(std::memory_order_acquire);
+}
 
 bool LoadMemory(const char* dir_c) {
     const std::string dir = dir_c;
@@ -679,6 +684,22 @@ void Replay(const char* dir_c, Renderer* renderer) {
             if (type == kEnd) {
                 break;
             }
+            // Memory events between two submits are one batch. The game wrote them
+            // after the GPU had consumed what it could (it reuses memory once a
+            // fence says so): wait until every ring is idle or waiting on memory and
+            // the host GPU has run what was recorded, then hold GPU waits until the
+            // whole batch is in (a label must not land before its data).
+            const bool mem_event = type == kPage || type == kDiff;
+            if (mem_event && !g_applying.load(std::memory_order_relaxed)) {
+                static const bool loose = std::getenv("DC_REPLAY_LOOSE") != nullptr;
+                if (!loose) {
+                    cp.WaitQuiescentFor(2000);
+                    if (renderer) {
+                        renderer->WaitIdle();
+                    }
+                }
+            }
+            g_applying.store(mem_event, std::memory_order_release);
             if (type == kPage) {
                 u64 va = 0;
                 u32 len = 0;
@@ -772,6 +793,7 @@ void Replay(const char* dir_c, Renderer* renderer) {
                 break;
             }
         }
+        g_applying.store(false, std::memory_order_release);
         const bool done = cp.WaitIdleFor(10000);
         if (renderer) {
             renderer->WaitIdle();

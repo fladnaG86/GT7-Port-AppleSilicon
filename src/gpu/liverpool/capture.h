@@ -49,6 +49,9 @@ bool HandleWriteFault(void* addr);
 void BeforeHostWrite(void* addr, u64 size);
 
 // ---- Replay side ----
+// True while the replay writes one submit's worth of CPU memory changes: a
+// GPU wait (WAIT_REG_MEM) must not see the label before the data it guards.
+bool ReplayApplying();
 // Recreates the capture's mappings and memory. Call after Memory::Init.
 bool LoadMemory(const char* dir);
 // Plays the captured frame; returns when the loops are done.

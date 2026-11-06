@@ -91,6 +91,6 @@ void RegisterPad();
 // Every game log line (file, line): the anchors of recorded inputs, so a
 // replay waits for the game to reach the same point instead of a wall-clock
 // time (loads and dialogs take different times from run to run).
-void OnGameLog(const char* file, int line);
+void OnGameLog(const char* file, int line, const char* text);
 
 } // namespace Hle::Pad

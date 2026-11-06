@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cctype>
 #include <unordered_map>
 #include <string>
 #include <mutex>
@@ -171,9 +172,27 @@ double g_last_anchor_t = 0;
 
 static double InputTime();
 
-void OnGameLog(const char* file, int line) {
+// file:line plus the message with numbers and addresses dropped, spaces as
+// '_': each file the game opens becomes its own (rare) event.
+static std::string AnchorKey(const char* file, int line, const char* text) {
+    std::string key = std::string(file) + ":" + std::to_string(line) + "|";
+    bool in_num = false;
+    for (const char* c = text; *c && key.size() < 140; ++c) {
+        const bool hex = std::isxdigit(static_cast<unsigned char>(*c)) && (in_num || std::isdigit(static_cast<unsigned char>(*c)));
+        if (hex || (*c == 'x' && in_num)) {
+            if (!in_num) key += '#';
+            in_num = true;
+            continue;
+        }
+        in_num = false;
+        key += std::isspace(static_cast<unsigned char>(*c)) ? '_' : *c;
+    }
+    return key;
+}
+
+void OnGameLog(const char* file, int line, const char* text) {
     const double t = InputTime();
-    std::string key = std::string(file) + ":" + std::to_string(line);
+    std::string key = AnchorKey(file, line, text ? text : "");
     std::scoped_lock lk(g_anchor_lock);
     const u32 n = ++g_anchor_count[key];
     if (n <= kRareOccurrence) {
@@ -314,7 +333,7 @@ static void StartReplay() {
     };
     std::vector<Event> events;
     if (std::FILE* f = std::fopen(e, "r")) {
-        char line[256];
+        char line[512];
         while (std::fgets(line, sizeof(line), f)) {
             Event ev{};
             if (std::sscanf(line, "B %lf %x %u", &ev.t, &ev.a, &ev.b) == 3) {
@@ -327,8 +346,8 @@ static void StartReplay() {
                 continue;
             }
             if (const char* at = std::strstr(line, " @ ")) {
-                char key[160];
-                if (std::sscanf(at + 3, "%159s %u %lf", key, &ev.occurrence, &ev.delay) == 3) {
+                char key[256];
+                if (std::sscanf(at + 3, "%255s %u %lf", key, &ev.occurrence, &ev.delay) == 3) {
                     ev.anchor = key;
                 }
             }

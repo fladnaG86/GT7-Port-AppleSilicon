@@ -174,7 +174,7 @@ extern "C" void DcGt7Log(void*, int level, void*, void*, const char* file, int l
         }
     }
     DC_INFO("game[%d] %s:%d %s", level, name, line, text);
-    Hle::Pad::OnGameLog(name, line);
+    Hle::Pad::OnGameLog(name, line, text);
 }
 
 void HookGt7Log(const Loader::Module& exe) {

@@ -206,6 +206,33 @@ bool CommandProcessor::WaitIdleFor(int ms) {
     return ok;
 }
 
+bool CommandProcessor::WaitQuiescentFor(int ms) {
+    std::vector<Ring*> all;
+    {
+        std::scoped_lock lk(rings_lock);
+        for (auto& r : rings) {
+            if (r) {
+                all.push_back(r.get());
+            }
+        }
+    }
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    for (;;) {
+        bool quiet = true;
+        for (Ring* r : all) {
+            std::scoped_lock lk(r->lock);
+            quiet &= (r->jobs.empty() && !r->busy) || r->waiting.load(std::memory_order_acquire);
+        }
+        if (quiet) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() > until) {
+            return false;
+        }
+        sched_yield();
+    }
+}
+
 namespace {
 template <typename T>
 void Put(std::vector<u8>& out, const T& v) {
@@ -902,6 +929,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 mask = body[4];
             if (memory) {
                 const volatile u32* addr = Ptr<const u32>(body[1] & ~3u, body[2]);
+                while (Capture::ReplayApplying()) {
+                    sched_yield(); // frame replay: the label may come before its data
+                }
                 if (Compare(func, *addr & mask, ref)) {
                     break;
                 }
@@ -931,7 +961,16 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 static const bool no_sleep = std::getenv("DC_WAIT_SLEEP") == nullptr;
                 constexpr auto kWaitSpin = std::chrono::microseconds(200);
                 const auto t0 = std::chrono::steady_clock::now();
-                while (!Compare(func, *addr & mask, ref)) {
+                struct Waiting {
+                    std::atomic<bool>* w;
+                    ~Waiting() {
+                        if (w) w->store(false, std::memory_order_release);
+                    }
+                } waiting{t_ring ? &t_ring->waiting : nullptr};
+                if (waiting.w) {
+                    waiting.w->store(true, std::memory_order_release);
+                }
+                while (Capture::ReplayApplying() || !Compare(func, *addr & mask, ref)) {
                     // Another queue (async compute) may record the write meanwhile:
                     // all queues share one host command stream, so recorded work
                     // runs before anything this queue records after the wait.
