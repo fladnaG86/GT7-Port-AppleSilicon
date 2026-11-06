@@ -1,6 +1,7 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include "hle/pad/pad.h"
 #include "core/guest_profile.h"
 #include "core/guest_trace.h"
 #include "core/runtime.h"
@@ -173,6 +174,7 @@ extern "C" void DcGt7Log(void*, int level, void*, void*, const char* file, int l
         }
     }
     DC_INFO("game[%d] %s:%d %s", level, name, line, text);
+    Hle::Pad::OnGameLog(name, line);
 }
 
 void HookGt7Log(const Loader::Module& exe) {

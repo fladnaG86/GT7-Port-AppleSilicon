@@ -34,16 +34,23 @@
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 #include "gpu/metal/mtl_renderer.h"
+#include "gpu/liverpool/capture.h"
+#include "gpu/liverpool/command_processor.h"
 
 namespace {
 
 constexpr int kWindowWidth = 1920;
 constexpr int kWindowHeight = 1080;
 
+int RunWindow(Core::Loader::Linker* linker_ptr, const char* replay_dir);
+
 int Run(int argc, char** argv) {
-    const bool interactive = Launcher::IsInteractive(argc, argv);
+    // DC_FRAME_REPLAY=<capture dir>: no game, play a captured GPU frame (capture.h).
+    const char* replay_dir = std::getenv("DC_FRAME_REPLAY");
+    const bool interactive = !replay_dir && Launcher::IsInteractive(argc, argv);
     std::filesystem::path game_dir;
-    if (interactive) {
+    if (replay_dir) {
+    } else if (interactive) {
         Launcher::BeginSession();
         game_dir = Launcher::ChooseGameFolder();
         if (game_dir.empty()) {
@@ -57,6 +64,12 @@ int Run(int argc, char** argv) {
 
     Core::AddressSpace::Init();
     Core::Memory::Init();
+    if (replay_dir) {
+        if (!Gpu::Capture::LoadMemory(replay_dir)) {
+            return 1;
+        }
+        return RunWindow(nullptr, replay_dir);
+    }
     Hle::RegisterAll();
 
     const char* home = std::getenv("HOME");
@@ -83,15 +96,25 @@ int Run(int argc, char** argv) {
         return 0;
     }
 
+    return RunWindow(&linker, nullptr);
+}
+
+// The window, renderer and event loop: the game's (`linker`) or a frame
+// replay's (`replay_dir`).
+int RunWindow(Core::Loader::Linker* linker_ptr, const char* replay_dir) {
     // SDL first, on the main thread: guest threads use its audio right away.
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         DC_ERROR("SDL_Init: %s", SDL_GetError());
         return 1;
     }
 
-    Core::Signals::Install(
-        [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
-    Core::Runtime::StartGame(linker);
+    if (linker_ptr) {
+        Core::Signals::Install(
+            [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
+        Core::Runtime::StartGame(*linker_ptr);
+    } else {
+        Core::Signals::Install([](u64) { return std::string(); });
+    }
 
     SDL_Window* window =
         SDL_CreateWindow("GT7 Port", kWindowWidth, kWindowHeight,
@@ -111,6 +134,14 @@ int Run(int argc, char** argv) {
     auto renderer = std::make_unique<Gpu::Metal::MetalRenderer>(*device);
     renderer->SetEdr(config.edr);
     Gpu::Liverpool::Instance().SetRenderer(renderer.get());
+    if (replay_dir) {
+        std::thread([r = renderer.get(), replay_dir] {
+            Gpu::Capture::Replay(replay_dir, r);
+            SDL_Event quit{};
+            quit.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit);
+        }).detach();
+    }
     const std::string gpu_name = device->Info().name;
 
     int w = 0, h = 0;

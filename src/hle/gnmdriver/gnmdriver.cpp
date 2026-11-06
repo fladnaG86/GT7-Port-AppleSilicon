@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "gpu/liverpool/capture.h"
 #include "hle/gnmdriver/gnmdriver.h"
 
 #include <array>
@@ -555,6 +556,13 @@ s32 sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_ptrs[], const u32 dcb_s
     return 0;
 }
 
+// Frame capture: what the flip about to be submitted shows.
+void NoteCaptureFlip(u32 vo_handle, u32 buf_idx) {
+    if (std::getenv("DC_CAPTURE")) {
+        Gpu::Capture::NoteFlip(VideoOut::Driver::Instance().GetFlipInfo(static_cast<s32>(vo_handle), buf_idx));
+    }
+}
+
 // Runs after the frame's command buffers: show the buffer, then tell the game.
 void FlipOnGpuThread(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
     auto& vo = VideoOut::Driver::Instance();
@@ -584,7 +592,7 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
                 flip_count, count, vo_handle, buf_idx, flip_arg);
     }
     VideoOut::Driver::Instance().MarkFlipPending(vo_handle, buf_idx);
-
+    NoteCaptureFlip(vo_handle, buf_idx);
     Instance().SubmitGraphics(CollectBuffers(count, dcb_ptrs, dcb_sizes, ccb_ptrs, ccb_sizes), [vo_handle, buf_idx, flip_arg] {
         FlipOnGpuThread(vo_handle, buf_idx, flip_arg);
     });
@@ -594,6 +602,7 @@ s32 sceGnmSubmitAndFlipCommandBuffers(u32 count, const u32* dcb_ptrs[], const u3
 // The game flips separately from its submits: the flip queues behind them.
 s32 sceVideoOutSubmitFlip(s32 vo_handle, s32 buf_idx, u32 /*flip_mode*/, s64 flip_arg) {
     VideoOut::Driver::Instance().MarkFlipPending(vo_handle, static_cast<u32>(buf_idx));
+    NoteCaptureFlip(static_cast<u32>(vo_handle), static_cast<u32>(buf_idx));
     Instance().SubmitGraphics({}, [vo_handle, buf_idx, flip_arg] {
         FlipOnGpuThread(static_cast<u32>(vo_handle), static_cast<u32>(buf_idx), flip_arg);
     });
@@ -618,6 +627,7 @@ void sceGnmFlushGarlic() {
 }
 
 s32 sceGnmRequestFlipAndSubmitDone(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
+    NoteCaptureFlip(vo_handle, buf_idx);
     Instance().SubmitGraphics({}, [vo_handle, buf_idx, flip_arg] {
         FlipOnGpuThread(vo_handle, buf_idx, flip_arg);
     });

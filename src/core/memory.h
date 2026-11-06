@@ -8,6 +8,7 @@
 // the console (games map GPU buffers twice with different attributes).
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/types.h"
@@ -80,5 +81,13 @@ struct DirectRange {
 // changes whenever they do (so callers can cache the list).
 std::vector<DirectRange> DirectMappings();
 u64 DirectMapGeneration();
+
+// ---- Frame capture / replay (src/gpu/liverpool/capture.cpp) ----
+// Every mapping (all types but Free), in address order.
+std::vector<Vma> AllVmas();
+// Allocated direct memory as (phys, size) ranges.
+std::vector<std::pair<u64, u64>> DirectAllocations();
+// Marks [phys, phys+size) allocated (a replay restoring a capture's layout).
+int AllocateDirectAt(u64 phys, u64 size);
 
 } // namespace Core::Memory

@@ -84,6 +84,11 @@ public:
     // Called on the GPU thread once the frame's command buffers are done.
     virtual void Flip(const FlipInfo& flip) = 0;
 
+    // Frame capture/replay: the contents of surfaces that live only on the
+    // host GPU, written to / read back from `path`. Call while idle.
+    virtual void SaveTargets(const char* path) {}
+    virtual void LoadTargets(const char* path) {}
+
     // A SET_CONTEXT_REG packet body (`body[0]` = register offset), read in
     // place in the command buffer: the Gnm driver puts render target size
     // hints in the NOP packet right after it.

@@ -3936,6 +3936,180 @@ struct MetalRenderer::Impl {
     return *list.back();
   }
 
+  // ---- Frame capture (src/gpu/liverpool/capture.cpp) ----
+  // Render targets live only on the host GPU, so a capture saves their
+  // pixels (state a frame inherits: history, exposure, Hi-Z, cached shadows)
+  // and a replay puts them back before each loop.
+  struct TargetPlane {
+    u32 bpp;
+    MTLBlitOption option;
+  };
+  static std::vector<TargetPlane> TargetPlanes(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatDepth32Float: return {{4, MTLBlitOptionNone}};
+    case MTLPixelFormatDepth16Unorm: return {{2, MTLBlitOptionNone}};
+    case MTLPixelFormatStencil8: return {{1, MTLBlitOptionNone}};
+    case MTLPixelFormatDepth32Float_Stencil8:
+      return {{4, MTLBlitOptionDepthFromDepthStencil}, {1, MTLBlitOptionStencilFromDepthStencil}};
+    default: break;
+    }
+    if (const u32 b = PixelBytes(f)) {
+      return {{b, MTLBlitOptionNone}};
+    }
+    return {};
+  }
+  static u32 TargetSlices(id<MTLTexture> t) {
+    switch (t.textureType) {
+    case MTLTextureType2DArray: return u32(t.arrayLength);
+    case MTLTextureTypeCube: return 6;
+    case MTLTextureTypeCubeArray: return 6 * u32(t.arrayLength);
+    default: return 1;
+    }
+  }
+  // Calls fn(level, slice, plane, w, h, d, bytes) in the file's order.
+  template <typename Fn> static void ForEachTargetImage(id<MTLTexture> t, Fn &&fn) {
+    const auto planes = TargetPlanes(t.pixelFormat);
+    for (u32 l = 0; l < t.mipmapLevelCount; ++l) {
+      const u32 w = std::max<u32>(1, u32(t.width) >> l), h = std::max<u32>(1, u32(t.height) >> l);
+      const u32 d = t.textureType == MTLTextureType3D ? std::max<u32>(1, u32(t.depth) >> l) : 1;
+      for (u32 sl = 0; sl < TargetSlices(t); ++sl) {
+        for (const TargetPlane &p : planes) {
+          fn(l, sl, p, w, h, d, u64(w) * p.bpp * h * d);
+        }
+      }
+    }
+  }
+  static constexpr u32 kTargetsMagic = 0x54524731; // "TRG1"
+
+  void SaveTargets(const char *path) {
+    EndPass();
+    Commit(true);
+    FILE *f = std::fopen(path, "wb");
+    if (!f) {
+      DC_ERROR("capture: cannot write %s", path);
+      return;
+    }
+    std::fwrite(&kTargetsMagic, 4, 1, f);
+    u32 saved = 0, skipped = 0;
+    u64 bytes_total = 0;
+    for (int depth = 0; depth < 2; ++depth) {
+      for (auto &[addr, list] : depth ? depth_targets : color_targets) {
+        for (auto &rt : list) {
+          id<MTLTexture> t = rt->tex;
+          if (rt->view_of || !t || t.sampleCount > 1 || TargetPlanes(t.pixelFormat).empty()) {
+            ++skipped;
+            continue;
+          }
+          u64 total = 0;
+          ForEachTargetImage(t, [&](u32, u32, const TargetPlane &, u32, u32, u32, u64 b) { total += b; });
+          id<MTLBuffer> buf = [device newBufferWithLength:std::max<u64>(total, 16)
+                                                  options:MTLResourceStorageModeShared];
+          if (!buf) {
+            ++skipped;
+            continue;
+          }
+          EnsureCommandBuffer();
+          id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+          u64 off = 0;
+          ForEachTargetImage(t, [&](u32 l, u32 sl, const TargetPlane &p, u32 w, u32 h, u32 d, u64 n) {
+            [b copyFromTexture:t
+                         sourceSlice:sl
+                         sourceLevel:l
+                        sourceOrigin:MTLOriginMake(0, 0, 0)
+                          sourceSize:MTLSizeMake(w, h, d)
+                            toBuffer:buf
+                   destinationOffset:off
+              destinationBytesPerRow:u64(w) * p.bpp
+            destinationBytesPerImage:u64(w) * p.bpp * h
+                             options:p.option];
+            off += n;
+          });
+          [b endEncoding];
+          Commit(true);
+          const u32 hdr[12] = {u32(depth), u32(t.pixelFormat), rt->width, rt->height, rt->levels,
+                               u32(rt->dim), rt->depth_or_layers, rt->initialized ? 1u : 0u,
+                               rt->bind_slice, rt->bind_level, rt->comp_swap, rt->three_channels ? 1u : 0u};
+          std::fwrite(&addr, 8, 1, f);
+          std::fwrite(hdr, sizeof(hdr), 1, f);
+          std::fwrite(&total, 8, 1, f);
+          std::fwrite(buf.contents, 1, total, f);
+          bytes_total += total;
+          ++saved;
+        }
+      }
+    }
+    std::fclose(f);
+    DC_INFO("capture: %u render targets saved (%llu MB), %u skipped (views, MSAA, other formats)", saved,
+            (unsigned long long)(bytes_total >> 20), skipped);
+  }
+
+  void LoadTargets(const char *path) {
+    FILE *f = std::fopen(path, "rb");
+    if (!f) {
+      return;
+    }
+    u32 magic = 0;
+    if (std::fread(&magic, 4, 1, f) != 1 || magic != kTargetsMagic) {
+      std::fclose(f);
+      return;
+    }
+    EndPass();
+    u32 loaded = 0;
+    for (;;) {
+      u64 addr = 0, total = 0;
+      u32 hdr[12];
+      if (std::fread(&addr, 8, 1, f) != 1 || std::fread(hdr, sizeof(hdr), 1, f) != 1 ||
+          std::fread(&total, 8, 1, f) != 1) {
+        break;
+      }
+      id<MTLBuffer> buf = [device newBufferWithLength:std::max<u64>(total, 16)
+                                              options:MTLResourceStorageModeShared];
+      if (!buf || std::fread(buf.contents, 1, total, f) != total) {
+        break;
+      }
+      const bool depth = hdr[0] != 0;
+      RenderTarget &rt = GetTarget(depth ? depth_targets : color_targets, addr, MTLPixelFormat(hdr[1]), hdr[2],
+                                   hdr[3], depth, hdr[4], TexDim(hdr[5]), hdr[6]);
+      id<MTLTexture> t = rt.tex;
+      u64 need = 0;
+      ForEachTargetImage(t, [&](u32, u32, const TargetPlane &, u32, u32, u32, u64 b) { need += b; });
+      if (need != total) {
+        DC_WARN("capture: target %#llx came back with another layout; left as is", (unsigned long long)addr);
+        continue;
+      }
+      EnsureCommandBuffer();
+      id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+      u64 off = 0;
+      ForEachTargetImage(t, [&](u32 l, u32 sl, const TargetPlane &p, u32 w, u32 h, u32 d, u64 n) {
+        [b copyFromBuffer:buf
+                   sourceOffset:off
+              sourceBytesPerRow:u64(w) * p.bpp
+            sourceBytesPerImage:u64(w) * p.bpp * h
+                     sourceSize:MTLSizeMake(w, h, d)
+                      toTexture:t
+               destinationSlice:sl
+               destinationLevel:l
+              destinationOrigin:MTLOriginMake(0, 0, 0)
+                        options:p.option];
+        off += n;
+      });
+      [b endEncoding];
+      rt.initialized = hdr[7] != 0;
+      rt.bind_slice = hdr[8];
+      rt.bind_level = hdr[9];
+      rt.comp_swap = hdr[10];
+      rt.three_channels = hdr[11] != 0;
+      rt.clear_pending = false;
+      rt.written = ++write_seq;
+      ++loaded;
+    }
+    std::fclose(f);
+    Commit(true);
+    texture_cache.clear();
+    ++texture_epoch;
+    DC_INFO("capture: %u render targets restored", loaded);
+  }
+
   // `rt` holds BC blocks, one per texel (a shader compressed a texture into
   // it): a `fi.format` texture of width x height with those blocks, copied
   // again whenever `rt` is written. nil when the shapes do not match.
@@ -8087,6 +8261,20 @@ void MetalRenderer::OnContextRegs(const std::uint32_t *body,
 void MetalRenderer::NoteConstDump(std::uint64_t addr, std::uint32_t bytes) {
   std::scoped_lock lk(impl->dump_lock);
   impl->NoteConstDump(addr, bytes);
+}
+
+void MetalRenderer::SaveTargets(const char *path) {
+  Gpu::LtLock lk(impl->lock);
+  @autoreleasepool {
+    impl->SaveTargets(path);
+  }
+}
+
+void MetalRenderer::LoadTargets(const char *path) {
+  Gpu::LtLock lk(impl->lock);
+  @autoreleasepool {
+    impl->LoadTargets(path);
+  }
 }
 
 std::uint8_t *MetalRenderer::Gds() {

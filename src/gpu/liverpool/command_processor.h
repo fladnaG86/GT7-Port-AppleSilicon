@@ -60,6 +60,14 @@ public:
 
     // Blocks until every queued submission has executed.
     void WaitIdle();
+    // WaitIdle with a limit; false if some ring was still busy after `ms`.
+    bool WaitIdleFor(int ms);
+
+    // Frame capture/replay (capture.cpp): the state that carries over from
+    // one frame to the next (registers, constant engine, ring state). Only
+    // meaningful while idle.
+    std::vector<u8> SaveState();
+    void LoadState(const std::vector<u8>& state);
 
     void SetInterruptHandler(std::function<void(u32 irq)> handler) { on_irq = std::move(handler); }
     void SetRenderer(Gpu::Renderer* r) { renderer = r; }

@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "gpu/liverpool/capture.h"
 #include "common/log.h"
 #include "core/benchmark.h"
 #include "hle/hle.h"
@@ -200,6 +201,7 @@ s64 sceKernelRead(int fd, void* buf, u64 n) {
     if (LogIo()) {
         DC_INFO("read(fd %d, %llu) at %lld", fd, (unsigned long long)n, (long long)lseek(fd, 0, SEEK_CUR));
     }
+    Gpu::Capture::BeforeHostWrite(buf, n);
     return Sce64(read(fd, buf, n));
 }
 s64 sceKernelWrite(int fd, const void* buf, u64 n) { return Sce64(write(fd, buf, n)); }
@@ -207,6 +209,7 @@ s64 sceKernelPread(int fd, void* buf, u64 n, s64 off) {
     if (LogIo()) {
         DC_INFO("pread(fd %d, %llu, %lld)", fd, (unsigned long long)n, (long long)off);
     }
+    Gpu::Capture::BeforeHostWrite(buf, n);
     return Sce64(pread(fd, buf, n, off));
 }
 s64 sceKernelPwrite(int fd, const void* buf, u64 n, s64 off) { return Sce64(pwrite(fd, buf, n, off)); }

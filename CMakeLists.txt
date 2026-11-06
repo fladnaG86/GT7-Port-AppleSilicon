@@ -63,6 +63,8 @@ set(DC_CORE_SOURCES
     src/gpu/liverpool/pm4.h
     src/gpu/liverpool/command_processor.h
     src/gpu/liverpool/command_processor.cpp
+    src/gpu/liverpool/capture.h
+    src/gpu/liverpool/capture.cpp
     src/gpu/liverpool/registers.h
     src/gpu/liverpool/tiling.h
     src/gpu/liverpool/tiling.cpp

@@ -17,6 +17,7 @@
 #include "common/log.h"
 #include "core/memory.h"
 #include "gpu/label_trace.h"
+#include "gpu/liverpool/capture.h"
 #include "gpu/renderer.h"
 
 namespace Gpu::Liverpool {
@@ -159,10 +160,14 @@ void CommandProcessor::SubmitGraphics(std::vector<CmdBuffers> bufs, std::functio
     if (LtOn()) {
         DC_INFO("lt %.0f submit %zu bufs", LtUs(LtNow()), bufs.size());
     }
+    const bool flip = static_cast<bool>(after);
+    Capture::BeforeGraphics(bufs, flip);
     Push(0, {std::move(bufs), std::move(after)});
+    Capture::AfterGraphics(flip);
 }
 
 void CommandProcessor::SubmitCompute(u32 queue, std::span<const u32> acb) {
+    Capture::BeforeCompute(queue, acb);
     Push(queue, {{CmdBuffers{acb, {}}}, {}});
 }
 
@@ -179,6 +184,114 @@ void CommandProcessor::WaitIdle() {
     for (Ring* r : all) {
         std::unique_lock lk(r->lock);
         r->idle_cv.wait(lk, [&] { return r->jobs.empty() && !r->busy; });
+    }
+}
+
+bool CommandProcessor::WaitIdleFor(int ms) {
+    std::vector<Ring*> all;
+    {
+        std::scoped_lock lk(rings_lock);
+        for (auto& r : rings) {
+            if (r) {
+                all.push_back(r.get());
+            }
+        }
+    }
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    bool ok = true;
+    for (Ring* r : all) {
+        std::unique_lock lk(r->lock);
+        ok &= r->idle_cv.wait_until(lk, until, [&] { return r->jobs.empty() && !r->busy; });
+    }
+    return ok;
+}
+
+namespace {
+template <typename T>
+void Put(std::vector<u8>& out, const T& v) {
+    const auto* p = reinterpret_cast<const u8*>(&v);
+    out.insert(out.end(), p, p + sizeof(T));
+}
+void PutBytes(std::vector<u8>& out, const void* data, size_t n) {
+    const auto* p = static_cast<const u8*>(data);
+    out.insert(out.end(), p, p + n);
+}
+template <typename T>
+T Get(const std::vector<u8>& in, size_t& at) {
+    T v{};
+    if (at + sizeof(T) <= in.size()) {
+        std::memcpy(&v, in.data() + at, sizeof(T));
+    }
+    at += sizeof(T);
+    return v;
+}
+void GetBytes(const std::vector<u8>& in, size_t& at, void* data, size_t n) {
+    if (at + n <= in.size()) {
+        std::memcpy(data, in.data() + at, n);
+    }
+    at += n;
+}
+constexpr u32 kStateMagic = 0x43505331; // "CPS1"
+} // namespace
+
+std::vector<u8> CommandProcessor::SaveState() {
+    std::vector<u8> out;
+    Put(out, kStateMagic);
+    PutBytes(out, regs.Data(), RegFile::kSize * 4);
+    Put(out, ce.ce_counter);
+    Put(out, ce.de_counter);
+    PutBytes(out, ce.ram.data(), ce.ram.size() * 4);
+    Put(out, index_base);
+    Put(out, index_size);
+    Put(out, num_instances);
+    Put(out, flip_label.addr);
+    Put(out, flip_label.value);
+    Put(out, u8(flip_label.interrupt));
+    std::scoped_lock lk(rings_lock);
+    u32 n = 0;
+    for (auto& r : rings) {
+        n += r ? 1 : 0;
+    }
+    Put(out, n);
+    for (auto& r : rings) {
+        if (!r) {
+            continue;
+        }
+        Put(out, r->index);
+        Put(out, r->indirect_base);
+        PutBytes(out, r->regs.Data(), RegFile::kSize * 4);
+    }
+    return out;
+}
+
+void CommandProcessor::LoadState(const std::vector<u8>& in) {
+    size_t at = 0;
+    if (Get<u32>(in, at) != kStateMagic) {
+        DC_ERROR("capture: CP state has the wrong magic");
+        return;
+    }
+    GetBytes(in, at, regs.Data(), RegFile::kSize * 4);
+    ce.stack.clear();
+    ce.ce_counter = Get<u64>(in, at);
+    ce.de_counter = Get<u64>(in, at);
+    GetBytes(in, at, ce.ram.data(), ce.ram.size() * 4);
+    index_base = Get<u64>(in, at);
+    index_size = Get<u32>(in, at);
+    num_instances = Get<u32>(in, at);
+    flip_label.addr = Get<u64>(in, at);
+    flip_label.value = Get<u32>(in, at);
+    flip_label.interrupt = Get<u8>(in, at) != 0;
+    {
+        std::scoped_lock lk(fence_lock);
+        pending_fences.clear();
+    }
+    const u32 n = Get<u32>(in, at);
+    for (u32 k = 0; k < n && at < in.size(); ++k) {
+        const u32 index = Get<u32>(in, at);
+        Ring& r = GetRing(index);
+        std::scoped_lock lk(r.lock);
+        r.indirect_base = Get<u64>(in, at);
+        GetBytes(in, at, r.regs.Data(), RegFile::kSize * 4);
     }
 }
 

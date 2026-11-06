@@ -1,3 +1,4 @@
+#include "gpu/liverpool/capture.h"
 #include "core/signals.h"
 
 #include <algorithm>
@@ -296,6 +297,9 @@ bool WatchFault(ucontext_t* uc, u64 fault); // DC_PROBE_WATCH, below
 
 void Handler(int sig, siginfo_t* info, void* raw) {
     if (sig != SIGILL) {
+        if (Gpu::Capture::HandleWriteFault(info->si_addr)) {
+            return; // a page the frame capture protected
+        }
         if (WatchFault(static_cast<ucontext_t*>(raw), reinterpret_cast<u64>(info->si_addr))) {
             return;
         }

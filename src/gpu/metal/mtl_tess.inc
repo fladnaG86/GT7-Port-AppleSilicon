@@ -168,11 +168,21 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   info.cp_in = (config >> 8) & 0x3F;
   info.cp_out = (config >> 14) & 0x3F;
   info.domain = u8(tf & 3);
-  // DC_TESS_CP=<n>: emulate only draws with n input control points (others stay skipped).
-  static const u32 only_cp = std::getenv("DC_TESS_CP") ? u32(std::atoi(std::getenv("DC_TESS_CP"))) : 0;
+  // DC_TESS_CP=<n>[,<n>...]: emulate only draws with these input control point counts.
+  static const u64 only_cp = [] {
+    u64 m = 0;
+    if (const char *e = std::getenv("DC_TESS_CP")) {
+      for (char *q = const_cast<char *>(e); *q;) {
+        const unsigned long v = std::strtoul(q, &q, 10);
+        if (v < 64) m |= 1ull << v;
+        if (*q) ++q;
+      }
+    }
+    return m;
+  }();
   // DC_TESS_N=<n>: only draws of n patches.
   static const u32 only_n = std::getenv("DC_TESS_N") ? u32(std::atoi(std::getenv("DC_TESS_N"))) : 0;
-  if ((only_cp && info.cp_in != only_cp) ||
+  if ((only_cp && !(only_cp >> info.cp_in & 1)) ||
       (only_n && info.cp_in && dc.count / info.cp_in != only_n)) {
     return false;
   }

@@ -343,4 +343,31 @@ std::vector<DirectRange> DirectMappings() {
     return out;
 }
 
+std::vector<Vma> AllVmas() {
+    std::scoped_lock lk(g_lock);
+    std::vector<Vma> out;
+    out.reserve(g_vmas.size());
+    for (const auto& [start, v] : g_vmas) {
+        if (v.type != VmaType::Free) {
+            out.push_back(v);
+        }
+    }
+    return out;
+}
+
+std::vector<std::pair<u64, u64>> DirectAllocations() {
+    std::scoped_lock lk(g_lock);
+    return {g_direct_used.begin(), g_direct_used.end()};
+}
+
+int AllocateDirectAt(u64 phys, u64 size) {
+    std::scoped_lock lk(g_lock);
+    size = AlignUp(size, kPage);
+    if (phys + size > kDirectSize) {
+        return EINVAL;
+    }
+    g_direct_used.emplace(phys, size);
+    return 0;
+}
+
 } // namespace Core::Memory

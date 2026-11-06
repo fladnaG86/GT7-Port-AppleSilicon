@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
+#include <string>
+#include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -151,6 +155,55 @@ static double InputTime() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_input_t0).count();
 }
 
+// ---- Anchors: game log events (file:line, n-th occurrence) ----
+// A recorded input names the latest *rare* event before it (an occurrence
+// number <= kRareOccurrence) and its delay after it: "B <sec> <mask> <0|1> @
+// <file:line> <n> <delay>". Replay waits for that event, then the delay.
+namespace {
+constexpr u32 kRareOccurrence = 2;
+std::mutex g_anchor_lock;
+std::condition_variable g_anchor_cv;
+std::unordered_map<std::string, u32> g_anchor_count;           // file:line -> occurrences
+std::unordered_map<std::string, double> g_anchor_time;         // "file:line#n" -> time
+std::string g_last_anchor;                                     // "file:line n"
+double g_last_anchor_t = 0;
+} // namespace
+
+static double InputTime();
+
+void OnGameLog(const char* file, int line) {
+    const double t = InputTime();
+    std::string key = std::string(file) + ":" + std::to_string(line);
+    std::scoped_lock lk(g_anchor_lock);
+    const u32 n = ++g_anchor_count[key];
+    if (n <= kRareOccurrence) {
+        g_anchor_time[key + "#" + std::to_string(n)] = t;
+        g_last_anchor = key + " " + std::to_string(n);
+        g_last_anchor_t = t;
+        g_anchor_cv.notify_all();
+    }
+}
+
+// " @ <file:line> <n> <delay>" for the current time, or "".
+static std::string AnchorSuffix() {
+    std::scoped_lock lk(g_anchor_lock);
+    if (g_last_anchor.empty()) {
+        return "";
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), " %.3f", InputTime() - g_last_anchor_t);
+    return " @ " + g_last_anchor + buf;
+}
+
+// Waits (at most `timeout` s) for the n-th occurrence of `key`; its time, or <0.
+static double WaitAnchor(const std::string& key, u32 n, double timeout) {
+    const std::string id = key + "#" + std::to_string(n);
+    std::unique_lock lk(g_anchor_lock);
+    const bool seen = g_anchor_cv.wait_for(lk, std::chrono::milliseconds(static_cast<s64>(timeout * 1000)),
+                                           [&] { return g_anchor_time.count(id) != 0; });
+    return seen ? g_anchor_time[id] : -1.0;
+}
+
 static std::FILE* RecordFile() {
     static std::FILE* f = [] {
         const char* e = std::getenv("DC_PAD_RECORD");
@@ -162,7 +215,7 @@ static std::FILE* RecordFile() {
 void SetButton(u32 button, bool pressed) {
     const u32 before = g_buttons.load();
     if (std::FILE* f = RecordFile(); f && ((before & button) != 0) != pressed) {
-        std::fprintf(f, "B %.3f %x %d\n", InputTime(), button, pressed ? 1 : 0);
+        std::fprintf(f, "B %.3f %x %d%s\n", InputTime(), button, pressed ? 1 : 0, AnchorSuffix().c_str());
         std::fflush(f);
     }
     if (pressed) {
@@ -176,10 +229,10 @@ void SetStick(bool right, u8 x, u8 y) {
     if (std::FILE* f = RecordFile()) {
         const u8 ox = (right ? g_right_x : g_left_x).load(), oy = (right ? g_right_y : g_left_y).load();
         if (ox != x) {
-            std::fprintf(f, "S %.3f %d 0 %u\n", InputTime(), right, x);
+            std::fprintf(f, "S %.3f %d 0 %u%s\n", InputTime(), right, x, AnchorSuffix().c_str());
         }
         if (oy != y) {
-            std::fprintf(f, "S %.3f %d 1 %u\n", InputTime(), right, y);
+            std::fprintf(f, "S %.3f %d 1 %u%s\n", InputTime(), right, y, AnchorSuffix().c_str());
         }
         std::fflush(f);
     }
@@ -194,7 +247,7 @@ void SetStick(bool right, u8 x, u8 y) {
 
 void SetStickAxis(bool right, bool y, u8 value) {
     if (std::FILE* f = RecordFile()) {
-        std::fprintf(f, "S %.3f %d %d %u\n", InputTime(), right, y, value);
+        std::fprintf(f, "S %.3f %d %d %u%s\n", InputTime(), right, y, value, AnchorSuffix().c_str());
         std::fflush(f);
     }
     (right ? (y ? g_right_y : g_right_x) : (y ? g_left_y : g_left_x)).store(value);
@@ -202,7 +255,7 @@ void SetStickAxis(bool right, bool y, u8 value) {
 
 void SetTrigger(bool right, u8 value) {
     if (std::FILE* f = RecordFile(); f && (right ? g_r2 : g_l2).load() != value) {
-        std::fprintf(f, "T %.3f %d %u\n", InputTime(), right, value);
+        std::fprintf(f, "T %.3f %d %u%s\n", InputTime(), right, value, AnchorSuffix().c_str());
         std::fflush(f);
     }
     (right ? g_r2 : g_l2).store(value);
@@ -255,10 +308,13 @@ static void StartReplay() {
         char kind;
         double t;
         u32 a, b, c;
+        std::string anchor; // file:line, empty = wall-clock time only
+        u32 occurrence = 0;
+        double delay = 0;
     };
     std::vector<Event> events;
     if (std::FILE* f = std::fopen(e, "r")) {
-        char line[96];
+        char line[256];
         while (std::fgets(line, sizeof(line), f)) {
             Event ev{};
             if (std::sscanf(line, "B %lf %x %u", &ev.t, &ev.a, &ev.b) == 3) {
@@ -270,15 +326,34 @@ static void StartReplay() {
             } else {
                 continue;
             }
+            if (const char* at = std::strstr(line, " @ ")) {
+                char key[160];
+                if (std::sscanf(at + 3, "%159s %u %lf", key, &ev.occurrence, &ev.delay) == 3) {
+                    ev.anchor = key;
+                }
+            }
             events.push_back(ev);
         }
         std::fclose(f);
     }
     DC_INFO("pad: replaying %zu inputs from %s", events.size(), e);
     std::thread([events = std::move(events)] {
+        // DC_PAD_ANCHOR_TIMEOUT=<s>: longest wait for an anchor (default 180).
+        const double timeout =
+            std::getenv("DC_PAD_ANCHOR_TIMEOUT") ? std::strtod(std::getenv("DC_PAD_ANCHOR_TIMEOUT"), nullptr) : 180.0;
         for (const Event& ev : events) {
-            std::this_thread::sleep_until(g_input_t0 +
-                                          std::chrono::milliseconds(static_cast<s64>(ev.t * 1000)));
+            double at = ev.t;
+            if (!ev.anchor.empty()) {
+                const double t = WaitAnchor(ev.anchor, ev.occurrence, timeout);
+                if (t < 0) {
+                    DC_WARN("pad: replay anchor %s #%u not seen in %.0f s: input at %.1f s goes now", ev.anchor.c_str(),
+                            ev.occurrence, timeout, ev.t);
+                    at = InputTime();
+                } else {
+                    at = t + ev.delay;
+                }
+            }
+            std::this_thread::sleep_until(g_input_t0 + std::chrono::milliseconds(static_cast<s64>(at * 1000)));
             if (ev.kind == 'B') {
                 SetButton(ev.a, ev.b != 0);
             } else if (ev.kind == 'T') {
