@@ -3482,7 +3482,7 @@ struct MetalRenderer::Impl {
           d.width = width;
           d.height = height;
           if (tt.dim == TexDim::Tex2DArray) {
-            d.arrayLength = layers;
+            d.arrayLength = std::min<u32>(layers, 2048); // Metal limit; more = a garbage T#
           }
           d.usage = MTLTextureUsageShaderRead;
           d.storageMode = MTLStorageModePrivate;
@@ -3577,9 +3577,9 @@ struct MetalRenderer::Impl {
       d.height = height;
       d.mipmapLevelCount = levels;
       if (tt.dim == TexDim::Tex3D) {
-        d.depth = layers;
+        d.depth = std::min<u32>(layers, 2048);
       } else if (tt.dim == TexDim::Tex2DArray) {
-        d.arrayLength = layers;
+        d.arrayLength = std::min<u32>(layers, 2048); // Metal limit; more = a garbage T#
       }
       d.usage = MTLTextureUsageShaderRead;
       d.storageMode = cpu_upload ? MTLStorageModeManaged : MTLStorageModePrivate;
@@ -3787,7 +3787,7 @@ struct MetalRenderer::Impl {
                 MTLTextureUsagePixelFormatView;
     } else if (dim == TexDim::Tex2DArray) {
       d.textureType = MTLTextureType2DArray;
-      d.arrayLength = std::max(depth_or_layers, 1u);
+      d.arrayLength = std::min(std::max(depth_or_layers, 1u), 2048u);
       d.usage = depth
                     ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                           MTLTextureUsagePixelFormatView
@@ -5996,6 +5996,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }();
   if (!skip_ps.empty() && std::find(skip_ps.begin(), skip_ps.end(), ps_addr) !=
                               skip_ps.end()) { // debug: drop these pixel shaders' draws
+    static std::atomic<u32> skipped{0};
+    if (skipped.fetch_add(1) == 0) {
+      DC_INFO("gpu: DC_SKIP_PS: first draw skipped (ps %#llx, %zu shaders listed)", (unsigned long long)ps_addr,
+              skip_ps.size());
+    }
     return;
   }
   // DC_SKIP_DRAW=<hex ps>:<count>: drop only that shader's draws of that index count.

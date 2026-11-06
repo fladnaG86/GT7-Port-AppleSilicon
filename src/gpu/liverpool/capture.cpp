@@ -662,7 +662,10 @@ void Replay(const char* dir_c, Renderer* renderer) {
             LoadContents(dir);
         }
         cp.LoadState(cp_state);
-        if (renderer) {
+        // DC_REPLAY_NO_TARGETS=1: start from empty host surfaces (tells what the
+        // replayed frame renders itself from what the capture restored).
+        static const bool no_targets = std::getenv("DC_REPLAY_NO_TARGETS") != nullptr;
+        if (renderer && !no_targets) {
             renderer->LoadTargets((dir + "/targets.bin").c_str());
         }
         if (renderer && gds.size() == size_t(kGdsPartition) * kGdsPartitions) {
