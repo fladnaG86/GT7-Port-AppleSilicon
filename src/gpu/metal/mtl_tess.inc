@@ -168,6 +168,14 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   info.cp_in = (config >> 8) & 0x3F;
   info.cp_out = (config >> 14) & 0x3F;
   info.domain = u8(tf & 3);
+  // DC_TESS_CP=<n>: emulate only draws with n input control points (others stay skipped).
+  static const u32 only_cp = std::getenv("DC_TESS_CP") ? u32(std::atoi(std::getenv("DC_TESS_CP"))) : 0;
+  // DC_TESS_N=<n>: only draws of n patches.
+  static const u32 only_n = std::getenv("DC_TESS_N") ? u32(std::atoi(std::getenv("DC_TESS_N"))) : 0;
+  if ((only_cp && info.cp_in != only_cp) ||
+      (only_n && info.cp_in && dc.count / info.cp_in != only_n)) {
+    return false;
+  }
   // DC_TRACE_TESS=<n>: trace the flip after the n-th one with a tessellated
   // draw (shader addresses move between runs, flip numbers drift on replay).
   // DC_TRACE_TESS_CP=<k>: count only draws with k input control points.
@@ -261,7 +269,7 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
     return false;
   }
   if (trace && dump_frames) { // LDS slices 0-1 after the HS, for offline inspection
-    const u64 bytes = std::min<u64>(u64(info.lds_dwords) * 4 * 2, tess_lds.length);
+    const u64 bytes = std::min<u64>(u64(info.lds_dwords) * 4 * groups, tess_lds.length); // all groups
     id<MTLBuffer> copy = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
     [b copyFromBuffer:tess_lds sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
@@ -290,8 +298,15 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   if (trace) {
     const u32 floats = info.tf_bytes / 4, count = n;
     const u64 hs_at = hs_addr;
+    const std::string tf_file = dump_frames ? std::string(dump_frames) + "/tf_" + std::to_string(draw_count) + "_" +
+                                                  Hex(hs_addr) + "_n" + std::to_string(n) + ".bin"
+                                            : std::string();
     [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
       const float *f = static_cast<const float *>(tf_buf.contents);
+      if (!tf_file.empty()) {
+        std::ofstream(tf_file, std::ios::binary).write(static_cast<const char *>(tf_buf.contents),
+                                                        static_cast<std::streamsize>(u64(count) * floats * 4));
+      }
       u32 live = 0;
       float mx = 0.0f;
       for (u32 k = 0; k < count; ++k) {

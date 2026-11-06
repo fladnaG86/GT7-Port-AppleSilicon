@@ -791,6 +791,7 @@ struct MetalRenderer::Impl {
       0; // DC_DUMP_TEXTURE=<addr>: write its uploads next to the frame dumps
   u64 debug_vsout = 0; // DC_DEBUG_VSOUT=<vs address>: dump its first positions
   id<MTLBuffer> debug_vs_buf = nil;
+  bool debug_vs_domain = false;
   id<MTLFunction> debug_fs =
       nil; // DC_DEBUG_FLAT: every pixel shader outputs magenta
   bool trace = false;
@@ -6774,8 +6775,13 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
 
   if (capture) {
-    debug_vs_buf = [device newBufferWithLength:64 * 16
+    debug_vs_domain = tess_draw != nullptr;
+    debug_vs_buf = [device newBufferWithLength:debug_vs_domain ? (6145 + 240000) * 16 : 64 * 16
                                        options:MTLResourceStorageModeShared];
+    if (debug_vs_domain) {
+      std::memset(debug_vs_buf.contents, 0xFF, debug_vs_buf.length); // NaN = corner not run
+      static_cast<u32 *>(debug_vs_buf.contents)[6144 * 4] = 0;     // vertex counter
+    }
     BindBuffer(0, debug_vs_buf, 0, 6);
     DC_INFO("gpu: capturing VS %#llx ud: %08x %08x %08x %08x %08x %08x %08x "
             "%08x %08x %08x %08x %08x %08x %08x %08x %08x",
@@ -7841,7 +7847,36 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     Commit(true);
     EnsureCommandBuffer();
     const float *d = static_cast<const float *>(debug_vs_buf.contents);
-    for (u32 v = 0; v < 8; ++v) {
+    if (debug_vs_domain) { // per-patch corner clip positions -> file, summary in the log
+      if (dump_frames) {
+        std::string file = std::string(dump_frames) + "/domain_corners.bin";
+        std::ofstream(file, std::ios::binary).write(static_cast<const char *>(debug_vs_buf.contents),
+                                                     static_cast<std::streamsize>(debug_vs_buf.length));
+      }
+      u32 run = 0, bad = 0;
+      for (u32 c = 0; c < 4096; ++c) {
+        const float *q = d + c * 4;
+        u32 bits;
+        std::memcpy(&bits, q, 4);
+        if (bits == 0xFFFFFFFFu) continue;
+        ++run;
+        bad += !std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[3]) || std::fabs(q[3]) < 1e-4f;
+      }
+      DC_INFO("gpu: domain vertices: %u", static_cast<const u32 *>(debug_vs_buf.contents)[6144 * 4]);
+      u32 out = 0;
+      for (u32 v = 0; v < 1024; ++v) {
+        const float *q = d + (4096 + v * 2) * 4;
+        if (q[6] == 1.0f) {
+          if (out++ < 16) {
+            DC_INFO("gpu: domain outlier patch %u uv (%g %g): clip (%g %g %g %g)", v, q[4], q[5], q[0], q[1], q[2], q[3]);
+          }
+        }
+      }
+      DC_INFO("gpu: domain corners: %u written, %u non-finite or w~0; %u patches with outliers", run, bad, out);
+      debug_vs_domain = false;
+      debug_vs_buf = nil;
+    }
+    for (u32 v = 0; v < 8 && !debug_vs_domain; ++v) {
       DC_INFO("gpu: vs out %u: raw (%g %g %g %g) -> clip (%g %g %g %g)", v,
               d[v * 8], d[v * 8 + 1], d[v * 8 + 2], d[v * 8 + 3], d[v * 8 + 4],
               d[v * 8 + 5], d[v * 8 + 6], d[v * 8 + 7]);

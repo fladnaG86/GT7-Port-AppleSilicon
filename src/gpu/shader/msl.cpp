@@ -339,6 +339,36 @@ private:
     std::unordered_map<u32, u32> index_of;    // pc -> instruction index
     std::unordered_map<u32, u32> loop_end;    // loop header index -> index of its last back edge
 
+    // SGPR spills: the compiler parks SGPRs in single lanes of a VGPR
+    // (v_writelane v, s, k / v_readlane s, v, k), several per VGPR. Run per
+    // lane, writing the whole VGPR let the last spill overwrite the others
+    // (GT7's terrain-car hull shader restored a wrong LDS base and wrote its
+    // factor copy over patch 0's outputs). Each (VGPR, constant lane) written
+    // by a v_writelane is its own scalar: wl_<v>_<k>.
+    static bool ConstLane(const Inst& i, u32* lane) {
+        const u16 op = i.src[1] >= Operand::Vgpr0 ? u16(i.src[1] - Operand::Vgpr0) : i.src[1];
+        if (op < Operand::Zero || op > Operand::IntPosMax) return false;
+        *lane = op - Operand::Zero;
+        return true;
+    }
+    static bool IsVop(const Inst& i, Vop v) {
+        return (i.enc == Enc::VOP1 || i.enc == Enc::VOP2 || (i.enc == Enc::VOP3 && i.op >= 256)) &&
+               static_cast<Vop>(i.op) == v;
+    }
+    std::set<std::pair<u32, u32>> spill_slots; // (VGPR, lane)
+    bool spills_scanned = false;
+    const std::set<std::pair<u32, u32>>& SpillSlots() {
+        if (!spills_scanned) {
+            spills_scanned = true;
+            for (const Inst& i : p.code) {
+                u32 lane;
+                if (IsVop(i, Vop::V_WRITELANE_B32) && ConstLane(i, &lane)) spill_slots.emplace(i.dst, lane);
+            }
+        }
+        return spill_slots;
+    }
+    static std::string SpillName(u32 v, u32 lane) { return "wl_" + std::to_string(v) + "_" + std::to_string(lane); }
+
     // A guest wave is 64 lanes in lockstep: LDS one lane writes is there for the
     // others at the next instruction, so shaders sized to one wave skip s_barrier.
     // Metal runs the threadgroup as 32-wide SIMD groups that drift apart. Where the
@@ -806,6 +836,12 @@ void Emitter::EmitVop(const Inst& i) {
             const u16 lane_op = i.src[1] >= Operand::Vgpr0 ? u16(i.src[1] - Operand::Vgpr0) : i.src[1];
             const bool const_lane = lane_op >= Operand::Zero && lane_op <= Operand::IntPosMax;
             const std::string lane_val = Src(lane_op, i.literal);
+            u32 slot_lane;
+            if (i.src[0] >= Operand::Vgpr0 && ConstLane(i, &slot_lane) && !std::getenv("DC_NO_SPILL_SLOTS") &&
+                SpillSlots().count({u32(i.src[0] - Operand::Vgpr0), slot_lane})) {
+                SetS(i.dst, SpillName(i.src[0] - Operand::Vgpr0, slot_lane));
+                break;
+            }
             if (wave_ok && const_lane && !in_loop && WaveOn("rlx")) {
                 const u32 lane = lane_op - Operand::Zero;
                 Line("threadgroup_barrier(mem_flags::mem_threadgroup); dc_wx[dc_lidx] = " + u(0) +
@@ -816,7 +852,15 @@ void Emitter::EmitVop(const Inst& i) {
             }
         }
         break;
-    case Vop::V_WRITELANE_B32: SetV(i.dst, u(0)); break;
+    case Vop::V_WRITELANE_B32: {
+        u32 lane;
+        if (ConstLane(i, &lane) && !std::getenv("DC_NO_SPILL_SLOTS")) {
+            Line(SpillName(i.dst, lane) + " = " + u(0) + ";");
+        } else {
+            SetV(i.dst, u(0));
+        }
+        break;
+    }
     case Vop::V_ADD_F32: SetVF(i, f(0) + " + " + f(1)); break;
     case Vop::V_SUB_F32: SetVF(i, f(0) + " - " + f(1)); break;
     case Vop::V_SUBREV_F32: SetVF(i, f(1) + " - " + f(0)); break;
@@ -2017,6 +2061,9 @@ std::string Emitter::Run() {
     for (u32 k = 0; k < std::max(max_sgpr, nud); ++k) {
         dl("uint s" + N(k) + " = " + sinit[k] + ";");
     }
+    for (const auto& [v, lane] : SpillSlots()) {
+        dl("uint " + SpillName(v, lane) + " = 0u;");
+    }
     dl("uint vcc_lo = 0u, vcc_hi = 0u, exec_lo = 0xffffffffu, exec_hi = 0xffffffffu, m0r = 0u, dc_null = 0u;");
     dl("bool scc = false;");
     std::vector<std::string> vinit(max_vgpr, "0u");
@@ -2248,13 +2295,18 @@ std::string Emitter::Run() {
                           : "    o = dc_run(vid, iid, " + args + ");\n";
         }
         if (o.debug_capture) {
-            src += domain ? "    uint dv_ = vid & 7u;\n    dbg[dv_ * 2u] = o.pos;\n"
+            // Domain: clip position of each patch corner (4 per patch, first 1024 patches).
+            src += domain ? "    if (vid < 1024u && (dc_pos.x == 0.0f || dc_pos.x == 1.0f) && (dc_pos.y == 0.0f || dc_pos.y == 1.0f)) "
+                            "{ dbg[vid * 4u + uint(dc_pos.x) + 2u * uint(dc_pos.y)] = o.pos; }\n"
+                            "    if (vid < 1024u && (!(o.pos.w > 0.05f) || !(fabs(o.pos.x) < 4.0f * o.pos.w) || !(fabs(o.pos.y) < 4.0f * o.pos.w))) "
+                            "{ dbg[4096u + vid * 2u] = o.pos; dbg[4097u + vid * 2u] = float4(dc_pos.xy, 1.0f, 0.0f); }\n"
+                            "    { uint k_ = atomic_fetch_add_explicit((device atomic_uint*)&dbg[6144u], 1u, memory_order_relaxed); "
+                            "if (k_ < 120000u) { dbg[6145u + k_ * 2u] = o.pos; dbg[6146u + k_ * 2u] = float4(dc_pos.xy, as_type<float>(vid), 0.0f); } }\n"
                           : "    if (vid < 32u) { dbg[vid * 2u] = o.pos; }\n";
         }
         src += "    o.pos = dc_viewport(o.pos, draw);\n";
         if (o.debug_capture) {
-            src += domain ? "    dbg[dv_ * 2u + 1u] = float4(dc_pos.xy, float(vid), 0.0f);\n"
-                          : "    if (vid < 32u) { dbg[vid * 2u + 1u] = o.pos; }\n";
+            if (!domain) src += "    if (vid < 32u) { dbg[vid * 2u + 1u] = o.pos; }\n";
         }
         src += "    return o;\n}\n";
     } else if (p.stage == Stage::Fragment) {
