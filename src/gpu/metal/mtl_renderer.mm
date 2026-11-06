@@ -549,6 +549,30 @@ struct MetalRenderer::Impl {
   TargetMap color_targets; // by address
   TargetMap depth_targets;
   u64 write_seq = 0;
+  // DC_LOG_RESTORED=1 (frame replay): write_seq range LoadTargets handed out;
+  // a sampled target still inside it was never rewritten in this loop.
+  u64 restored_lo = 0, restored_hi = 0, dbg_shader = 0;
+  std::set<std::tuple<u64, u32, u32, u64>> restored_logged;
+  void NoteRestoredRead(const RenderTarget &rt, u64 addr, bool depth) {
+    static const bool on = std::getenv("DC_LOG_RESTORED") != nullptr;
+    if (!on || rt.written <= restored_lo || rt.written > restored_hi ||
+        !restored_logged.insert({addr, rt.width, rt.height, dbg_shader}).second) {
+      return;
+    }
+    std::string others;
+    if (auto it = (depth ? depth_targets : color_targets).find(addr);
+        it != (depth ? depth_targets : color_targets).end()) {
+      for (auto &o : it->second) {
+        if (o.get() == &rt) continue;
+        others += " " + std::to_string(o->width) + "x" + std::to_string(o->height) + "/f" +
+                  std::to_string(u32(o->tex.pixelFormat)) +
+                  (o->written > restored_hi ? "/NEW" : "/old");
+      }
+    }
+    DC_INFO("restored-read: %s %#llx %ux%u f%u by shader %#llx; others:%s", depth ? "depth" : "color",
+            (unsigned long long)addr, rt.width, rt.height, u32(rt.tex.pixelFormat),
+            (unsigned long long)dbg_shader, others.c_str());
+  }
   std::unordered_map<u64, u32> storage_swizzles; // address -> selectors of its storage writes
   // Crops of color targets read through a shorter T#, by (address, height).
   std::unordered_map<u64, std::unique_ptr<RenderTarget>> target_crops;
@@ -3261,6 +3285,7 @@ struct MetalRenderer::Impl {
         }
       }
       if (RenderTarget *rt = latest) {
+        NoteRestoredRead(*rt, addr, false);
         // An array read past the slices rendered so far: grow it (shadPS4 sizes
         // images from the T#), the new slices read as zero until written.
         if (tt.dim == TexDim::Tex2DArray &&
@@ -3326,6 +3351,7 @@ struct MetalRenderer::Impl {
         // another size is not this image (GT7's 720x540 over a 1024x512 depth).
         RenderTarget *rt = Latest(depth_targets, addr, tt.dim, width, height);
         if (rt && rt->width == width && rt->height == height) {
+          NoteRestoredRead(*rt, addr, true);
           return swz == kIdentitySwizzle
                      ? rt->tex
                      : TargetView(*rt, 0, rt->levels, MTLPixelFormatInvalid, 0,
@@ -4055,6 +4081,8 @@ struct MetalRenderer::Impl {
     }
     EndPass();
     u32 loaded = 0;
+    restored_lo = write_seq;
+    restored_logged.clear();
     for (;;) {
       u64 addr = 0, total = 0;
       u32 hdr[12];
@@ -4068,6 +4096,20 @@ struct MetalRenderer::Impl {
         break;
       }
       const bool depth = hdr[0] != 0;
+      // DC_REPLAY_TARGETS_ONLY=<hex>,...: restore only these addresses (state
+      // a frame inherits, to tell it from what the replay must draw itself).
+      static const std::vector<u64> only = [] {
+        std::vector<u64> v;
+        for (const char *q = std::getenv("DC_REPLAY_TARGETS_ONLY"); q && *q;) {
+          char *e = nullptr;
+          v.push_back(std::strtoull(q, &e, 16));
+          q = (e && *e == ',') ? e + 1 : nullptr;
+        }
+        return v;
+      }();
+      if (!only.empty() && std::find(only.begin(), only.end(), addr) == only.end()) {
+        continue;
+      }
       RenderTarget &rt = GetTarget(depth ? depth_targets : color_targets, addr, MTLPixelFormat(hdr[1]), hdr[2],
                                    hdr[3], depth, hdr[4], TexDim(hdr[5]), hdr[6]);
       id<MTLTexture> t = rt.tex;
@@ -4107,6 +4149,7 @@ struct MetalRenderer::Impl {
     Commit(true);
     texture_cache.clear();
     ++texture_epoch;
+    restored_hi = write_seq;
     DC_INFO("capture: %u render targets restored", loaded);
   }
 
@@ -5837,6 +5880,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   ++work_since_commit;
   const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
   const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
+  dbg_shader = ps_addr;
   // DC_TRACE_PS=<hex ps>,<frames>: trace the flip after the n-th one that runs
   // that pixel shader, for scenes whose flip numbers vary between replays.
   static const u64 trace_ps =
@@ -7176,6 +7220,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
 
 void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   const u64 addr = r.ProgramAddr(Reg::COMPUTE_PGM_LO);
+  dbg_shader = addr;
   const u32 rsrc2 = r[Reg::COMPUTE_PGM_RSRC2];
   const u32 *ud = r.UserData(Reg::COMPUTE_USER_DATA_0);
   const u32 tx = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_X] & 0xFFFF);
