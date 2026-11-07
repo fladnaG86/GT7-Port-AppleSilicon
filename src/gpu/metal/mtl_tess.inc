@@ -238,7 +238,8 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
   const u64 lds_bytes = u64(groups) * info.lds_dwords * 4;
   if (!tess_lds || tess_lds.length < lds_bytes) {
     tess_lds = [device newBufferWithLength:std::max<u64>(lds_bytes, 4u << 20)
-                                   options:MTLResourceStorageModePrivate];
+                                   options:MTLResourceStorageModePrivate |
+                                           (std::getenv("DC_UNTRACKED") ? MTLResourceHazardTrackingModeUntracked : 0)];
   }
   // LS vertex indices: the index buffer (or a base vertex) as u32s.
   u64 index_va = 0;

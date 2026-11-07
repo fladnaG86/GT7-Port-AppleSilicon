@@ -94,6 +94,14 @@ template <typename T> u64 Hash(const T &v, u64 seed = 0xcbf29ce484222325ull) {
   return Fnv(&v, sizeof(T), seed);
 }
 
+// DC_UNTRACKED=1 (experiment): the guest-memory buffers skip Metal's hazard
+// tracking, which serializes every pass that binds them. No fences yet: an
+// upper bound for the gain, output may race where the GPU writes guest memory.
+static MTLResourceOptions SharedOpts() {
+  static const bool untracked = std::getenv("DC_UNTRACKED") != nullptr;
+  return MTLResourceStorageModeShared | (untracked ? MTLResourceHazardTrackingModeUntracked : 0);
+}
+
 // The range is guest memory the host can read. It may span several adjacent
 // mappings: GT7 maps its PRT textures (tile mode 16) one 64 KB page at a time.
 bool Readable(u64 addr, u64 size) {
@@ -1158,12 +1166,12 @@ struct MetalRenderer::Impl {
     if (view) {
       mem[0] = [device newBufferWithBytesNoCopy:view
                                          length:mem_split
-                                        options:MTLResourceStorageModeShared
+                                        options:SharedOpts()
                                     deallocator:nil];
       mem[1] =
           [device newBufferWithBytesNoCopy:static_cast<u8 *>(view) + mem_split
                                     length:total - mem_split
-                                   options:MTLResourceStorageModeShared
+                                   options:SharedOpts()
                                deallocator:nil];
     }
     if (!mem[0] || !mem[1]) {
@@ -1178,11 +1186,11 @@ struct MetalRenderer::Impl {
     }
     quad_indices = [device newBufferWithBytes:quads.data()
                                        length:quads.size() * 4
-                                      options:MTLResourceStorageModeShared];
+                                      options:SharedOpts()];
 
     const NSUInteger gds_bytes = Gpu::kGdsPartition * Gpu::kGdsPartitions;
     gds = [device newBufferWithLength:gds_bytes
-                              options:MTLResourceStorageModeShared];
+                              options:SharedOpts()];
     std::memset(gds.contents, 0, gds_bytes);
 
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
@@ -1343,7 +1351,7 @@ struct MetalRenderer::Impl {
     // A fresh buffer: work already recorded keeps reading the old table.
     mem_map = [device newBufferWithBytes:table.data()
                                   length:table.size() * 4
-                                 options:MTLResourceStorageModeShared];
+                                 options:SharedOpts()];
   }
 
   // Guest range [va, va + size) as byte `off` of mem buffer `hi` (no ObjC
