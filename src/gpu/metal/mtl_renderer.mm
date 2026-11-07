@@ -1595,6 +1595,11 @@ struct MetalRenderer::Impl {
   std::unordered_map<void *, u64> split_by;
   u64 stat_passes = 0, stat_split = 0;
   u64 stat_pipe_miss = 0, stat_msl_gen = 0; // DC_GPU_STATS: render pipeline misses
+  // DC_GPU_STATS: draws that reopened a pass over the same attachments:
+  // [0] pending clear, [1] it samples an attachment (by pixel shader).
+  u64 stat_break[2] = {};
+  u64 stat_depth_read_copy = 0; // draws reading the depth copy instead of the attachment
+  std::unordered_map<u64, u64> break_by_ps;
 
   void EndPass() {
     if (cenc) {
@@ -4810,6 +4815,24 @@ struct MetalRenderer::Impl {
   // store, not what the pass drew since: the fog draw (ps 0x9000f9d700)
   // samples the scene and depth it draws into. Ending the pass stores the
   // tiles first.
+  // A view of `copy` (a depth read copy) with the format and swizzle of
+  // `like`, a view of the attachment it copies; cached per copy and swizzle.
+  std::unordered_map<u64, id<MTLTexture>> copy_views;
+  id<MTLTexture> CopyView(id<MTLTexture> copy, id<MTLTexture> like) {
+    const MTLTextureSwizzleChannels sw = like.swizzle;
+    const u64 key = Hash(u64((uintptr_t)(__bridge void *)copy),
+                         Hash(u64(like.pixelFormat) | u64(sw.red) << 16 | u64(sw.green) << 24 |
+                              u64(sw.blue) << 32 | u64(sw.alpha) << 40));
+    auto &v = copy_views[key];
+    if (!v) {
+      v = [copy newTextureViewWithPixelFormat:like.pixelFormat
+                                  textureType:MTLTextureType2D
+                                       levels:NSMakeRange(0, 1)
+                                       slices:NSMakeRange(0, 1)
+                                      swizzle:sw];
+    }
+    return v;
+  }
   static bool SamplesAttachment(const Resources &res, RenderTarget *const colors[8],
                                 const RenderTarget *depth) {
     for (id<MTLTexture> t : res.tex) {
@@ -6538,7 +6561,77 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   if (depth && ((db_control >> 2) & 1)) {
     depth->bounds_seq = 0; // this draw writes depth: an older copy goes stale
   }
-  if (depth_bounds &&
+  // A draw that samples its own depth attachment without writing depth or
+  // stencil (GT7's soft particles and decals, ~25 draws a frame) reads the
+  // same copy: one pass break per depth change instead of one per draw.
+  // DC_NO_DEPTH_READ_COPY=1: break the pass at each such draw (old way).
+  static const bool no_depth_read_copy = std::getenv("DC_NO_DEPTH_READ_COPY") != nullptr;
+  bool depth_read_copy = false;
+  static const bool drc_log = std::getenv("DC_BREAK_LOG") != nullptr;
+  if (drc_log && depth && (SamplesAttachment(ps_res, colors, depth) || SamplesAttachment(vs_res, colors, depth))) {
+    for (const Resources *res : {&ps_res, &vs_res}) {
+      for (id<MTLTexture> t : res->tex) {
+        if (t == depth->tex || t.parentTexture == depth->tex) {
+          char b[200];
+          std::snprintf(b, sizeof(b), "depth read: ps %#llx db_control %#x view %d type %lu levels %lu fmt %lu tfmt %lu",
+                        (unsigned long long)ps_addr, db_control, t != depth->tex,
+                        (unsigned long)depth->tex.textureType, (unsigned long)depth->tex.mipmapLevelCount,
+                        (unsigned long)depth->tex.pixelFormat, (unsigned long)t.pixelFormat);
+          ReportOnce(b);
+        }
+      }
+    }
+  }
+  // Stencil writes leave the depth values alone, so only Z_WRITE_ENABLE counts.
+  auto copy_view_ok = [&](id<MTLTexture> t) {
+    return (t == depth->tex && t.textureType == MTLTextureType2D) ||
+           (t.parentTexture == depth->tex && t.textureType == MTLTextureType2D &&
+            t.parentRelativeLevel == 0 && t.parentRelativeSlice == depth->bind_slice &&
+            t.mipmapLevelCount == 1);
+  };
+  if (depth && !no_depth_read_copy && !((db_control >> 2) & 1) &&
+      (depth->tex.textureType == MTLTextureType2D || depth->tex.textureType == MTLTextureType2DArray) &&
+      depth->tex.mipmapLevelCount == 1) {
+    bool all_ok = true;
+    auto uses = [&](const Resources &res) {
+      bool any = false;
+      for (id<MTLTexture> t : res.tex) {
+        if (t == depth->tex || t.parentTexture == depth->tex) {
+          any = true;
+          all_ok = all_ok && copy_view_ok(t);
+        }
+      }
+      return any;
+    };
+    auto samples_color = [&](const Resources &res) {
+      return SamplesAttachment(res, colors, nullptr);
+    };
+    const bool u = uses(ps_res) | uses(vs_res);
+    depth_read_copy = u && all_ok && !samples_color(ps_res) && !samples_color(vs_res);
+  }
+  if (depth_read_copy) {
+    if (!depth->bounds_copy) {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:depth->tex.pixelFormat
+                                       width:depth->width
+                                      height:depth->height
+                                   mipmapped:NO];
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      d.storageMode = MTLStorageModePrivate;
+      depth->bounds_copy = [device newTextureWithDescriptor:d];
+    }
+    for (Resources *res : {&ps_res, &vs_res}) {
+      for (auto &t : res->tex) {
+        if (t == depth->tex) {
+          t = depth->bounds_copy;
+        } else if (t.parentTexture == depth->tex) {
+          t = CopyView(depth->bounds_copy, t);
+        }
+      }
+    }
+    ++stat_depth_read_copy;
+  }
+  if ((depth_bounds || depth_read_copy) &&
       (!depth->bounds_copy || depth->bounds_seq != depth->written ||
        depth->clear_pending)) {
     if (depth->clear_pending ||
@@ -6553,7 +6646,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
                                        width:depth->width
                                       height:depth->height
                                    mipmapped:NO];
-      d.usage = MTLTextureUsageShaderRead;
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
       d.storageMode = MTLStorageModePrivate;
       depth->bounds_copy = [device newTextureWithDescriptor:d];
     }
@@ -6572,8 +6665,38 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   } else if (!enc || !(want == pass) || pending_clear ||
              (pass_draws && (SamplesAttachment(ps_res, colors, depth) ||
                              SamplesAttachment(vs_res, colors, depth)))) {
+    if (stats && enc && want == pass) { // same attachments: why the new pass
+      ++stat_break[pending_clear ? 0 : 1];
+      if (!pending_clear) {
+        ++break_by_ps[ps_addr];
+        static const bool dbg = std::getenv("DC_BREAK_LOG") != nullptr;
+        if (dbg) {
+          for (const Resources *res : {&ps_res, &vs_res}) {
+            for (id<MTLTexture> t : res->tex) {
+              id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
+              for (u32 k = 0; k < 9; ++k) {
+                const RenderTarget *a = k < 8 ? colors[k] : depth;
+                if (!a || base != a->tex) {
+                  continue;
+                }
+                char b[256];
+                std::snprintf(b, sizeof(b),
+                              "pass break: ps %#llx samples %s%u %#llx %ux%u (bind lvl %u slice %u) "
+                              "through view lvl %lu+%lu slice %lu+%lu %lux%lu",
+                              (unsigned long long)ps_addr, k < 8 ? "cb" : "db", k, (unsigned long long)a->addr,
+                              a->width, a->height, a->bind_level, a->bind_slice,
+                              (unsigned long)t.parentRelativeLevel, (unsigned long)t.mipmapLevelCount,
+                              (unsigned long)t.parentRelativeSlice, (unsigned long)t.arrayLength,
+                              (unsigned long)t.width, (unsigned long)t.height);
+                ReportOnce(b);
+              }
+            }
+          }
+        }
+      }
+    }
     BeginPass(colors, depth, false, 1.0f);
-    if (depth && depth->bounds_seq && depth_bounds) {
+    if (depth && depth->bounds_seq && (depth_bounds || depth_read_copy)) {
       depth->bounds_seq = depth->written; // a new pass over unchanged depth
     }
   }
@@ -8176,6 +8299,27 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
         DC_INFO("gpu stats: %.1f new pipelines/frame, %.1f MSL sources generated/frame, %zu pipelines",
                 stat_pipe_miss / double(frames), stat_msl_gen / double(frames), pipelines.size());
         stat_pipe_miss = stat_msl_gen = 0;
+        {
+          std::vector<std::pair<u64, u64>> top;
+          for (const auto &[a, n] : break_by_ps) {
+            top.push_back({n, a});
+          }
+          std::sort(top.rbegin(), top.rend());
+          std::string by;
+          for (size_t k = 0; k < top.size() && k < 6; ++k) {
+            char b[48];
+            std::snprintf(b, sizeof(b), " %llx:%.1f", (unsigned long long)top[k].second,
+                          top[k].first / double(frames));
+            by += b;
+          }
+          DC_INFO("gpu stats: same-target pass reopen/frame: clear %.1f, samples attachment %.1f by ps%s; "
+                  "%.1f draws read the depth copy",
+                  stat_break[0] / double(frames), stat_break[1] / double(frames), by.c_str(),
+                  stat_depth_read_copy / double(frames));
+          stat_break[0] = stat_break[1] = 0;
+          stat_depth_read_copy = 0;
+          break_by_ps.clear();
+        }
         std::string eb;
         for (const auto &[line, n] : epoch_by_line) {
           char b[40];
