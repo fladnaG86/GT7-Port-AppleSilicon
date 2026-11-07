@@ -40,12 +40,23 @@ Driver::Driver() {
                 s64 data;
             };
             std::vector<TriggerItem> triggers;
+            struct DoneItem {
+                s32 handle;
+                Port::DeferredFlip f;
+            };
+            std::vector<DoneItem> done;
             {
                 std::scoped_lock lk(lock);
                 for (size_t i = 1; i < ports.size(); ++i) {
                     Port& p = ports[i];
                     if (!p.open) continue;
                     ++p.vblank_count;
+                    size_t n = 0;
+                    while (n < p.deferred.size() && p.deferred[n].target <= p.vblank_count) {
+                        done.push_back({static_cast<s32>(i), p.deferred[n]});
+                        ++n;
+                    }
+                    p.deferred.erase(p.deferred.begin(), p.deferred.begin() + n);
                     p.vblank_status.count = p.vblank_count;
                     p.vblank_status.process_time =
                         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -57,6 +68,9 @@ Driver::Driver() {
                 }
             }
             vblank_cv.notify_all();
+            for (const auto& d : done) {
+                OnFlipDone(d.handle, d.f.buf_idx, d.f.flip_arg);
+            }
             for (const auto& item : triggers) {
                 item.eq->Trigger(kInternalEventVblank, Kernel::kEvfiltVideoOut, item.data);
             }
@@ -207,6 +221,33 @@ void Driver::WaitFlipVblank(s32 handle) {
     const u64 target = std::max(p.last_flip_vblank + interval, p.vblank_count + 1);
     vblank_cv.wait_for(lk, std::chrono::milliseconds(100), [&] { return p.vblank_count >= target; });
     p.last_flip_vblank = p.vblank_count;
+}
+
+u64 Driver::ReserveFlipVblank(s32 handle) {
+    std::scoped_lock lk(lock);
+    if (handle <= 0 || static_cast<size_t>(handle) >= ports.size() || !ports[handle].open) {
+        return 0;
+    }
+    Port& p = ports[handle];
+    const u64 interval = static_cast<u64>(std::clamp(p.flip_rate, 0, 2)) + 1;
+    const u64 target = std::max(p.last_flip_vblank + interval, p.vblank_count + 1);
+    p.last_flip_vblank = target;
+    return target;
+}
+
+void Driver::FlipDoneAt(s32 handle, u32 buf_idx, s64 flip_arg, u64 target) {
+    {
+        std::scoped_lock lk(lock);
+        if (handle > 0 && static_cast<size_t>(handle) < ports.size() && ports[handle].open) {
+            Port& p = ports[handle];
+            // Behind an earlier deferred flip, or before its vblank: wait.
+            if (!p.deferred.empty() || p.vblank_count < target) {
+                p.deferred.push_back({buf_idx, flip_arg, target});
+                return;
+            }
+        }
+    }
+    OnFlipDone(handle, buf_idx, flip_arg);
 }
 
 Gpu::FlipInfo Driver::GetFlipInfo(s32 handle, u32 buf_idx) {

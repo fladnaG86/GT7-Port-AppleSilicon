@@ -80,6 +80,12 @@ public:
     // Blocks until the vblank this port's next flip may happen on (honours
     // sceVideoOutSetFlipRate), like the console's vsync'd flip queue.
     void WaitFlipVblank(s32 handle);
+    // Non-blocking form: the vblank the next flip happens on (as WaitFlipVblank
+    // would wait for), recorded as that port's last flip.
+    u64 ReserveFlipVblank(s32 handle);
+    // OnFlipDone at vblank `target`: now if it has passed, else from the
+    // vblank thread when it comes.
+    void FlipDoneAt(s32 handle, u32 buf_idx, s64 flip_arg, u64 target);
     s32 GetVblankStatus(s32 handle, SceVideoOutVblankStatus* status);
     s32 GetFlipStatus(s32 handle, SceVideoOutFlipStatus* status);
 
@@ -102,6 +108,12 @@ private:
         SceVideoOutVblankStatus vblank_status{};
         std::vector<Kernel::EventQueue*> flip_queues;
         std::vector<Kernel::EventQueue*> vblank_queues;
+        struct DeferredFlip {
+            u32 buf_idx;
+            s64 flip_arg;
+            u64 target;
+        };
+        std::vector<DeferredFlip> deferred; // in flip order
     };
 
     std::mutex lock;

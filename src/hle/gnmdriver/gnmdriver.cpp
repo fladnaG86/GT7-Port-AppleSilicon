@@ -566,6 +566,27 @@ void NoteCaptureFlip(u32 vo_handle, u32 buf_idx) {
 // Runs after the frame's command buffers: show the buffer, then tell the game.
 void FlipOnGpuThread(u32 vo_handle, u32 buf_idx, s64 flip_arg) {
     auto& vo = VideoOut::Driver::Instance();
+    // Waiting for the flip's vblank here held the graphics ring: the next
+    // frame, submitted right behind the flip, sat ~6 ms in the queue at ~22 fps.
+    // The frame is presented now; the game hears the flip at its vblank, as
+    // from the console's flip queue. DC_FLIP_BLOCK=1: wait here (old way).
+    static const bool block = std::getenv("DC_FLIP_BLOCK") != nullptr;
+    if (!block) {
+        const u64 target = vo.ReserveFlipVblank(static_cast<s32>(vo_handle));
+        if (auto* r = Instance().GetRenderer()) {
+            const Gpu::FlipInfo flip = vo.GetFlipInfo(static_cast<s32>(vo_handle), buf_idx);
+            if (flip.address) {
+                r->Flip(flip);
+            }
+            r->Signal([vo_handle, buf_idx, flip_arg, target] {
+                VideoOut::Driver::Instance().FlipDoneAt(static_cast<s32>(vo_handle), buf_idx, flip_arg,
+                                                        target);
+            });
+            return;
+        }
+        vo.FlipDoneAt(static_cast<s32>(vo_handle), buf_idx, flip_arg, target);
+        return;
+    }
     vo.WaitFlipVblank(static_cast<s32>(vo_handle));
     if (auto* r = Instance().GetRenderer()) {
         const Gpu::FlipInfo flip = vo.GetFlipInfo(static_cast<s32>(vo_handle), buf_idx);
