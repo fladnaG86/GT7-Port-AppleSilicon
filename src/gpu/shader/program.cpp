@@ -38,9 +38,18 @@ bool IsSgpr(u16 code) {
 // Tracks where each scalar register's value came from.
 class Provenance {
 public:
-    explicit Provenance(u32 num_user_sgprs) {
+    explicit Provenance(u32 num_user_sgprs, Stage stage = Stage::Vertex, u32 compute_rsrc2 = 0) {
         for (u32 i = 0; i < num_user_sgprs && i < state.size(); ++i) {
             state[i] = {SgprSource::UserData, static_cast<u8>(i), 0};
+        }
+        // COMPUTE_PGM_RSRC2 TGID_X/Y/Z_EN: the group ids follow the user SGPRs.
+        if (stage == Stage::Compute) {
+            u32 k = num_user_sgprs;
+            for (u32 c = 0; c < 3; ++c) {
+                if ((compute_rsrc2 & (1u << (7 + c))) && k < state.size()) {
+                    state[k++] = {SgprSource::GroupId, 0, c};
+                }
+            }
         }
     }
 
@@ -76,16 +85,31 @@ public:
             case Smrd::S_BUFFER_LOAD_DWORDX16: count = 16; buffer = true; break;
             default: return;
             }
-            const SgprSource& lo = Get(i.sbase);
-            const SgprSource& hi = Get(i.sbase + 1u);
+            const SgprSource lo = Get(i.sbase);
+            const SgprSource hi = Get(i.sbase + 1u);
             const bool base_is_ud = lo.kind == SgprSource::UserData &&
                                     hi.kind == SgprSource::UserData && hi.ud == lo.ud + 1;
+            // Any other base (a pointer or V# loaded from memory) or a register
+            // offset: the load as an expression the host evaluates per draw.
+            // GT7's SH irradiance CS reads the T#s it stores to this way
+            // (V# from a pointer, T# at V# + group * 0x90).
+            const SgprSource off = i.imm ? SgprSource{SgprSource::Constant, 0, i.smrd_offset * 4}
+                                         : Get(i.smrd_offset);
+            const bool dynamic = DynamicLoads() && !(base_is_ud && i.imm) &&
+                                 lo.kind != SgprSource::Unknown && hi.kind != SgprSource::Unknown &&
+                                 off.kind != SgprSource::Unknown;
             for (u32 k = 0; k < count; ++k) {
                 SgprSource s{};
                 if (base_is_ud && i.imm) {
                     s.kind = buffer ? SgprSource::BufferLoad : SgprSource::PointerLoad;
                     s.ud = lo.ud;
                     s.offset = i.smrd_offset * 4 + k * 4;
+                } else if (dynamic) {
+                    SgprSource at{SgprSource::Computed};
+                    at.expr = std::make_shared<const SgprExpr>(SgprExpr{
+                        SgprExpr::Add, lo,
+                        k ? Expr(SgprExpr::Add, off, {SgprSource::Constant, 0, k * 4}) : off});
+                    s = Expr(buffer ? SgprExpr::LoadBuf : SgprExpr::LoadPtr, at, hi);
                 }
                 if (i.dst + k < state.size()) {
                     state[i.dst + k] = s;
@@ -175,6 +199,18 @@ public:
 
 private:
     static constexpr u32 kVccLo = 106; // compilers use it as a scratch pair
+
+    // DC_NO_DYN_LOADS=1: scalar loads from loaded bases / register offsets stay
+    // unknown (as before 2026-11-07), for A/B.
+    static bool DynamicLoads() {
+        static const bool on = std::getenv("DC_NO_DYN_LOADS") == nullptr;
+        return on;
+    }
+    static SgprSource Expr(SgprExpr::Op op, const SgprSource& a, const SgprSource& b) {
+        SgprSource s{SgprSource::Computed};
+        s.expr = std::make_shared<const SgprExpr>(SgprExpr{op, a, b});
+        return s;
+    }
 
     static std::optional<SgprExpr::Op> ExprOp(Sop2 op) {
         switch (op) {
@@ -789,6 +825,26 @@ bool IsImageCompare(u16 op) {
     }
 }
 
+// A source reading memory through a loaded base (SgprExpr::LoadPtr / LoadBuf).
+bool HasLoad(const SgprSource& s) {
+    if (s.kind != SgprSource::Computed || !s.expr) {
+        return false;
+    }
+    return s.expr->op == SgprExpr::LoadPtr || s.expr->op == SgprExpr::LoadBuf || HasLoad(s.expr->a) ||
+           HasLoad(s.expr->b);
+}
+
+// Work group dims (bits 0-2) a source depends on.
+u8 GroupIdDims(const SgprSource& s) {
+    if (s.kind == SgprSource::GroupId) {
+        return static_cast<u8>(1u << (s.offset & 3u));
+    }
+    if (s.kind == SgprSource::Computed && s.expr) {
+        return GroupIdDims(s.expr->a) | GroupIdDims(s.expr->b);
+    }
+    return 0;
+}
+
 // Replaces S_SWAPPC_B64 (call into the fetch subroutine) with the subroutine's
 // code. The callee address comes from user data, so it is known per draw.
 bool InlineFetch(Program& p, const BuildInput& in) {
@@ -874,7 +930,7 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     }
 
     Exactness exact(p->code);
-    Provenance prov(in.num_user_sgprs);
+    Provenance prov(in.num_user_sgprs, in.stage, in.compute_rsrc2);
     bool v0_written = false; // the vertex index is still in v0
     for (const Inst& i : p->code) {
         if (in.stage == Stage::Vertex && !v0_written && i.pc >= kFetchPcBase &&
@@ -892,8 +948,10 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
             v.typed = i.enc == Enc::MTBUF;
             v.dfmt = i.dfmt;
             v.nfmt = i.nfmt;
-            if (std::all_of(v.vsharp.begin(), v.vsharp.end(),
-                            [](const SgprSource& s) { return s.kind != SgprSource::Unknown; })) {
+            // V#s read through loaded bases stay with the shader's own fetch.
+            if (std::all_of(v.vsharp.begin(), v.vsharp.end(), [](const SgprSource& s) {
+                    return s.kind != SgprSource::Unknown && !HasLoad(s);
+                })) {
                 p->vertex_inputs.push_back(v);
             }
         }
@@ -984,6 +1042,9 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
                 }
             }
             p->image_slot_by_pc.emplace_back(i.pc, slot);
+            for (const SgprSource& t : r.tsharp) {
+                p->group_id_dims |= GroupIdDims(t);
+            }
             break;
         }
         default:
@@ -1045,9 +1106,22 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
             const u32 v = a >> offset;
             return width == 0 ? 0 : width >= 32 ? v : v & ((1u << width) - 1u);
         }
+        case SgprExpr::LoadPtr:
+        case SgprExpr::LoadBuf: {
+            const u64 hi = src.expr->op == SgprExpr::LoadBuf ? (b & 0xFFFu) : (b & 0xFFFFu);
+            const u64 addr = (u64(a) | (hi << 32)) & ~3ull;
+            if (!addr || !ReadableCached(addr, 4, cache)) {
+                return 0;
+            }
+            u32 v;
+            std::memcpy(&v, reinterpret_cast<const void*>(addr), 4);
+            return v;
+        }
         }
         return 0;
     }
+    case SgprSource::GroupId:
+        return 0;
     case SgprSource::PointerLoad: {
         const u64 base = (u64(ud[src.ud]) | (u64(ud[src.ud + 1]) << 32)) & 0xFFFFFFFFFFFFull;
         const u64 addr = base + src.offset;

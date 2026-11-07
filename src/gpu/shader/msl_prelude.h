@@ -431,7 +431,14 @@ static inline float4 dc_ufloat(float4 v) {
     return float4(select(float3(0.0f), min(v.xyz, float3(65024.0f)), v.xyz > 0.0f), v.w);
 }
 static inline float dc_f32(uint v) { return float(as_type<half>(ushort(v & 0xffffu))); }
-static inline float dc_med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
+// V_MED3_F32: with a NaN input the result is MIN3 of the inputs (min ignoring the
+// NaN), so med3(hi, NaN, 0), a shader's saturate, gives 0 like the hardware. The
+// plain median formula gave hi: NaN lighting on GT7's driver glove became a 65000
+// pixel that the bloom spread into a blue veil over half the screen.
+static inline float dc_med3(float a, float b, float c) {
+    if (isnan(a) || isnan(b) || isnan(c)) return fmin(fmin(a, b), c);
+    return max(min(a, b), min(max(a, b), c));
+}
 static inline int dc_med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 static inline uint dc_med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 static inline float dc_cubeid(float x, float y, float z) {

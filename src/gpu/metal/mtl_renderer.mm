@@ -4366,6 +4366,21 @@ struct MetalRenderer::Impl {
         DC_WARN("capture: target %#llx came back with another layout; left as is", (unsigned long long)addr);
         continue;
       }
+      // DC_REPLAY_ZERO_TARGETS=<hex>,...: these come back zeroed instead
+      // (history a capture inherited from a broken run, e.g. GT7's bloom
+      // feedback 0x9015800000 saturated blue by the old glove bug).
+      static const std::vector<u64> zero = [] {
+        std::vector<u64> v;
+        for (const char *q = std::getenv("DC_REPLAY_ZERO_TARGETS"); q && *q;) {
+          char *e = nullptr;
+          v.push_back(std::strtoull(q, &e, 16));
+          q = (e && *e == ',') ? e + 1 : nullptr;
+        }
+        return v;
+      }();
+      if (std::find(zero.begin(), zero.end(), addr) != zero.end()) {
+        std::memset(buf.contents, 0, total);
+      }
       EnsureCommandBuffer();
       id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
       u64 off = 0;
@@ -6002,6 +6017,19 @@ struct MetalRenderer::Impl {
         DC_INFO("gpu: find %#llx: %s %#llx %s[%u] = %08x %08x %08x %08x",
                 (unsigned long long)find, who, (unsigned long long)shader,
                 path.c_str(), k, d[k], d[k + 1], d[k + 2], d[k + 3]);
+      }
+    }
+    // T#s whose base is the address (any high tag bits dropped), with where
+    // the descriptor itself sits in guest memory.
+    if (find) {
+      for (u32 k = 0; k + 8 <= n; ++k) {
+        const u64 tb = ((u64(d[k]) | (u64(d[k + 1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
+        if (tb == find && (d[k + 3] >> 28) >= 8) {
+          DC_INFO("gpu: find %#llx: %s %#llx %s[%u] T# at %#llx = %08x %08x %08x %08x %08x %08x %08x %08x",
+                  (unsigned long long)find, who, (unsigned long long)shader, path.c_str(), k,
+                  (unsigned long long)reinterpret_cast<uintptr_t>(d + k), d[k], d[k + 1], d[k + 2],
+                  d[k + 3], d[k + 4], d[k + 5], d[k + 6], d[k + 7]);
+        }
       }
     }
     // DC_FIND_RAW=1: also raw 64-bit pointers up to 32 KB below the address
@@ -7873,6 +7901,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   if (!cs) {
     return;
   }
+  // Image descriptors indexed by the group id are resolved for group 0 only.
+  if (const u8 d = cs->group_id_dims;
+      ((d & 1) && gx > 1) || ((d & 2) && gy > 1) || ((d & 4) && gz > 1)) {
+    ReportOnce("cs " + Hex(addr) + ": image descriptors depend on the group id; groups past 0 use group 0's");
+  }
   // A shader that only stores to a CMASK/HTILE surface it gets straight
   // from user data is a fast clear (others read metadata, e.g. HTILE for
   // tile depth bounds, and run normally).
@@ -8325,6 +8358,10 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                   (unsigned long long)a, (unsigned long long)frame, (unsigned long long)nz,
                   (unsigned long long)(n / 4), (unsigned long long)(first == ~0ull ? 0 : first * 4),
                   first == ~0ull ? 0u : d[first]);
+          for (u64 i = 0; i < std::min<u64>(n / 4, 128); i += 8) { // the first dwords
+            DC_INFO("gpu:   +%03llx: %08x %08x %08x %08x %08x %08x %08x %08x", (unsigned long long)(i * 4),
+                    d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6], d[i + 7]);
+          }
         }];
       }
     }

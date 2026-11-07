@@ -32,6 +32,8 @@ struct SgprSource {
         BufferLoad,  // dword at V#(user SGPRs ud..ud+3).base + offset
         Constant,    // `offset` is the value: built by the shader's own code
         Computed,    // `expr` of other sources: a descriptor patched by the shader
+        GroupId,     // compute: the work group id along `offset` (0-2), taken as 0
+                     // (Program::group_id_dims says which dims descriptors use)
     };
     Kind kind = Unknown;
     u8 ud = 0;
@@ -43,7 +45,9 @@ struct SgprSource {
 
 // GT7's cube filter loads a T# and rewrites its type and depth before a store.
 struct SgprExpr {
-    enum Op : u8 { And, Or, Add, Mul, Bfe, Lshl, Lshr };
+    // LoadPtr / LoadBuf: the dword at address a (low word) | b (high word),
+    // b being a pointer's high word or a V#'s word 1 (base bits 32-43).
+    enum Op : u8 { And, Or, Add, Mul, Bfe, Lshl, Lshr, LoadPtr, LoadBuf };
     Op op = And;
     SgprSource a, b;
 };
@@ -117,6 +121,7 @@ struct Program {
     bool uses_lds = false;     // any DS instruction
     bool uses_barrier = false; // S_BARRIER
     bool uses_atomic = false;  // buffer atomics (not idempotent: cannot run more than once)
+    u8 group_id_dims = 0;      // compute: work group dims (bits 0-2) image descriptors depend on
     // Per instruction index: this lane is surely on before it (see LaneOn).
     std::vector<bool> lane_on;
 

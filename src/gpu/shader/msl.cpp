@@ -232,12 +232,23 @@ private:
         }
     }
 
+    // DC_NAN_CLAMP=1: color exports that are NaN/Inf become 0 (debugging the
+    // bloom veil); =2 also clamps to [0, 65504]. Off by default.
+    void NanClamp(const std::string& dst) {
+        static const int mode = [] { const char* e = std::getenv("DC_NAN_CLAMP"); return e ? std::atoi(e) : 0; }();
+        if (mode >= 1) Line(dst + " = select(" + dst + ", float4(0.0f), !isfinite(" + dst + "));");
+        if (mode >= 2) Line(dst + " = clamp(" + dst + ", float4(0.0f), float4(65504.0f));");
+    }
     // Register probe at color exports that are not finite (or at all of them).
     void ProbeNanExport(const std::string& dst) {
         if (o.probe_pc == kProbeExportAny) {
             body += "    /*DC_PROBE*/\n";
         } else if (o.probe_pc == kProbeExportNan) {
-            Line("if (any(!isfinite(" + dst + "))) {");
+            // DC_PROBE_BIG=<t>: also exports with a color channel above t.
+            static const char* big = std::getenv("DC_PROBE_BIG");
+            Line("if (any(!isfinite(" + dst + "))" +
+                 (big ? std::string(" || any(" + dst + ".xyz > " + std::to_string(std::atof(big)) + "f)") : std::string()) +
+                 ") {");
             body += "    /*DC_PROBE*/\n";
             Line("}");
         }
@@ -1864,8 +1875,9 @@ void Emitter::EmitExp(const Inst& i) {
         }
         if (type == OutType::Float) {
             Line(dst + (NanProbe() ? " = dc_probe(float4(" + value + "));" : " = float4(" + value + ");"));
-            ClampUfloat(i.target, dst);
             ProbeNanExport(dst);
+            NanClamp(dst);
+            ClampUfloat(i.target, dst);
         }
         else if (type == OutType::Uint) Line(dst + " = uint4(" + value + ");");
         else Line(dst + " = int4(" + value + ");");
@@ -1875,8 +1887,9 @@ void Emitter::EmitExp(const Inst& i) {
         const std::string v4 = "float4(" + comp(0, "0.0f") + ", " + comp(1, "0.0f") + ", " + comp(2, "0.0f") + ", " +
                                comp(3, "1.0f") + ")";
         Line(dst + " = " + (NanProbe() ? "dc_probe(" + v4 + ")" : v4) + ";");
-        ClampUfloat(i.target, dst);
         ProbeNanExport(dst);
+        NanClamp(dst);
+        ClampUfloat(i.target, dst);
     } else {
         const char* t = type == OutType::Uint ? "uint4" : "int4";
         auto raw = [&](u32 k) { return (i.en & (1u << k)) ? VName(i.vsrc[k]) : std::string("0u"); };
