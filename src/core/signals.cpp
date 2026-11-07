@@ -390,6 +390,11 @@ bool WatchFault(ucontext_t* uc, u64 fault) {
 }
 Probe g_probes[16];
 std::atomic<u32> g_probe_count{0};
+std::atomic<VAddr> g_peek_addr{0};
+std::atomic<VAddr> g_peek_last{0};
+u8 g_peek_byte = 0;
+std::atomic<bool> g_peek_hit{false};
+u64 g_peek_regs[16] = {};
 
 void TrapHandler(int sig, siginfo_t*, void* raw) {
     auto* uc = static_cast<ucontext_t*>(raw);
@@ -413,11 +418,64 @@ void TrapHandler(int sig, siginfo_t*, void* raw) {
             return;
         }
     }
+    if (const VAddr last = g_peek_last.load(); last && last == ss.__rip - 1 &&
+        g_peek_addr.load() != last) {
+        ss.__rip -= 1; // another thread already took the one-shot hit and restored the byte
+        return;
+    }
+    if (const VAddr pa = g_peek_addr.load(); pa && pa == ss.__rip - 1) {
+        // DC_PEEK_AT: one-shot breakpoint on any instruction: remember the
+        // registers, put the byte back and run the instruction for real.
+        g_peek_regs[0] = ss.__rax; g_peek_regs[1] = ss.__rbx; g_peek_regs[2] = ss.__rcx;
+        g_peek_regs[3] = ss.__rdx; g_peek_regs[4] = ss.__rsi; g_peek_regs[5] = ss.__rdi;
+        g_peek_regs[6] = ss.__rbp; g_peek_regs[7] = ss.__rsp; g_peek_regs[8] = ss.__r8;
+        g_peek_regs[9] = ss.__r9; g_peek_regs[10] = ss.__r10; g_peek_regs[11] = ss.__r11;
+        g_peek_regs[12] = ss.__r12; g_peek_regs[13] = ss.__r13; g_peek_regs[14] = ss.__r14;
+        g_peek_regs[15] = ss.__r15;
+        auto* code = reinterpret_cast<u8*>(pa);
+        const VAddr page = pa & ~0xFFFull;
+        mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+        code[0] = g_peek_byte;
+        mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
+        ss.__rip -= 1;
+        g_peek_addr.store(0);
+        g_peek_hit.store(true, std::memory_order_release);
+        return;
+    }
     Describe("trap", ss.__rip, 0, ss.__rsp);
     Die(sig);
 }
 
 } // namespace
+
+bool AddPeek(VAddr at) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa{};
+        sa.sa_sigaction = TrapHandler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTRAP, &sa, nullptr);
+    });
+    auto* code = reinterpret_cast<u8*>(at);
+    g_peek_byte = code[0];
+    g_peek_hit.store(false);
+    g_peek_last.store(at);
+    g_peek_addr.store(at);
+    const VAddr page = at & ~0xFFFull;
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    code[0] = 0xCC;
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
+    return true;
+}
+
+bool PeekHit(u64 regs[16]) {
+    if (!g_peek_hit.load(std::memory_order_acquire)) {
+        return false;
+    }
+    for (int i = 0; i < 16; ++i) regs[i] = g_peek_regs[i];
+    return true;
+}
 
 bool AddProbe(VAddr function) {
     auto* code = reinterpret_cast<u8*>(function);

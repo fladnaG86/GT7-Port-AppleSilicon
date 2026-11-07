@@ -34,6 +34,9 @@ void SetFaultHandler(FaultHandler handler);
 // (replaced by int3; the trap handler emulates the push). False if the code
 // there does not start with push rbp or the probe table is full.
 bool AddProbe(VAddr function);
+// Debug: one-shot int3 on any instruction (DC_PEEK_AT); PeekHit gives rax..r15 once hit.
+bool AddPeek(VAddr at);
+bool PeekHit(u64 regs[16]);
 // Entries so far of each probe, in the order they were added.
 std::vector<u64> ProbeHits();
 // rdi (first argument, `this` for methods) of each probe's latest entry.

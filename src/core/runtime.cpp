@@ -219,8 +219,65 @@ void RelocateFixedHeap(const Loader::Module& exe) {
     }
 }
 
+// DC_PEEK_AT=<eboot offset>,<sec>[,<period s>] (debug): after <sec>, a one-shot
+// breakpoint on that instruction records rax..r15; DC_PEEK_SHOW=<reg>+<hex off>,...
+// (reg index 0..15 = rax rbx rcx rdx rsi rdi rbp rsp r8..r15) then logs those
+// floats. One shot by default; <period> > 0 re-arms (crashed with SIGBUS under
+// Rosetta once the code page was translated, so keep it off).
+void StartPeek(const Loader::Module& exe) {
+    const char* env = std::getenv("DC_PEEK_AT");
+    if (!env) {
+        return;
+    }
+    u64 off = 0;
+    double sec = 60, period = 0;
+    std::sscanf(env, "%llx,%lf,%lf", &off, &sec, &period);
+    const VAddr at = exe.Base() + off;
+    std::thread([at, sec, period] {
+        std::this_thread::sleep_for(std::chrono::duration<double>(sec));
+        for (;;) {
+            Signals::AddPeek(at);
+            u64 r[16];
+            for (int i = 0; i < 1000 && !Signals::PeekHit(r); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (Signals::PeekHit(r)) {
+                std::string line;
+                const char* show = std::getenv("DC_PEEK_SHOW");
+                for (const char* q = show ? show : ""; *q;) {
+                    char* e = nullptr;
+                    const unsigned reg = std::strtoul(q, &e, 10);
+                    u64 o = 0;
+                    if (*e == '+') o = std::strtoull(e + 1, &e, 16);
+                    if (reg < 16 && r[reg]) {
+                        const u32 v = *reinterpret_cast<const u32*>(r[reg] + o);
+                        float f;
+                        std::memcpy(&f, &v, 4);
+                        char b[64];
+                        std::snprintf(b, sizeof(b), " r%u+%llx=%08x(%g)", reg, (unsigned long long)o, v, f);
+                        line += b;
+                    }
+                    q = *e == ',' ? e + 1 : e;
+                    if (e == q && *q != ',') break;
+                }
+                DC_INFO("peek: rax=%#llx rcx=%#llx rdx=%#llx r12=%#llx r13=%#llx r14=%#llx%s",
+                        (unsigned long long)r[0], (unsigned long long)r[2], (unsigned long long)r[3],
+                        (unsigned long long)r[12], (unsigned long long)r[13], (unsigned long long)r[14],
+                        line.c_str());
+            } else {
+                DC_INFO("peek: not hit in 10 s");
+            }
+            if (period <= 0) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::duration<double>(period));
+        }
+    }).detach();
+}
+
 // DC_PROBE_FN=<eboot offset>,...: logs every 5 s how often those functions ran.
 void StartProbes(const Loader::Module& exe) {
+    StartPeek(exe);
     const char* env = std::getenv("DC_PROBE_FN");
     if (!env && !std::getenv("DC_WATCH")) {
         return;

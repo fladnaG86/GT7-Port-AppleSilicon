@@ -5,6 +5,7 @@
 #include "hle/gnmdriver/gnmdriver.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -425,8 +426,38 @@ s32 sceGnmDispatchIndirectOnMec(u32* cmdbuf, u32 size, u64 args, u32 modifier) {
 
 // DRAW_(INDEX_)INDIRECT: args at the SET_BASE address + data_offset. The SGPR
 // offsets become SH register offsets of the stage's USER_DATA_0.
+// DC_LOG_INDIRECT_CALLER=1 (debug): logs each new guest call chain (eboot offsets,
+// rbp walk) of the indirect draw helpers.
+static void LogIndirectCaller(u32 data_offset) {
+    static const bool on = std::getenv("DC_LOG_INDIRECT_CALLER") != nullptr;
+    if (!on) {
+        return;
+    }
+    static std::mutex m;
+    static std::unordered_map<u64, u32> seen;
+    u64 chain[6] = {};
+    const u64* fp = static_cast<const u64*>(__builtin_frame_address(0));
+    for (int i = 0; i < 6 && fp; ++i) {
+        const u64 ra = fp[1];
+        chain[i] = ra >= 0x400000 && ra < 0x10000000 ? ra - 0x400000 : ra;
+        const u64* next = reinterpret_cast<const u64*>(fp[0]);
+        if (next <= fp || reinterpret_cast<u64>(next) - reinterpret_cast<u64>(fp) > (1u << 20)) {
+            break;
+        }
+        fp = next;
+    }
+    const u64 key = chain[0] * 31 + chain[1] * 7 + chain[2];
+    std::scoped_lock lk(m);
+    if (seen[key]++ == 0) {
+        DC_INFO("indirect caller off %#x: %#llx %#llx %#llx %#llx %#llx %#llx", data_offset,
+                (unsigned long long)chain[0], (unsigned long long)chain[1], (unsigned long long)chain[2],
+                (unsigned long long)chain[3], (unsigned long long)chain[4], (unsigned long long)chain[5]);
+    }
+}
+
 static s32 WriteDrawIndirect(u32 op, u32* cmdbuf, u32 size, u32 data_offset, u32 stage,
                              u32 vertex_sgpr, u32 instance_sgpr, u32 flags) {
+    LogIndirectCaller(data_offset);
     static constexpr u32 kUserData[7] = {0, 0, 0x4c, 0, 0xcc, 0, 0x14c};
     constexpr u32 kPacketSize = 5;
     if (!cmdbuf || size < kPacketSize + 1 || stage >= 7 || vertex_sgpr >= 16 || instance_sgpr >= 16) {

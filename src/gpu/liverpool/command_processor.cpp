@@ -753,6 +753,51 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             }
         }
 
+        // DC_WATCH_GPU=<addr hex>[,<addr>...] (debug): after each dispatch, draw or
+        // memory packet, waits for the host GPU and logs which one changed a dword.
+        struct GpuWatch {
+            CommandProcessor* cp;
+            u32 op;
+            bool compute;
+            ~GpuWatch() {
+                static const char* env = std::getenv("DC_WATCH_GPU");
+                if (!env) {
+                    return;
+                }
+                static std::vector<u64> addrs = [] {
+                    std::vector<u64> v;
+                    const char* q = env;
+                    while (*q) {
+                        char* e = nullptr;
+                        v.push_back(std::strtoull(q, &e, 16));
+                        q = *e == ',' ? e + 1 : e;
+                        if (e == q && *e != ',') break;
+                    }
+                    return v;
+                }();
+                static std::vector<u32> last(addrs.size(), 0xdeadbeef);
+                const bool interesting = op == Op::DispatchDirect || op == Op::DispatchIndirect ||
+                                         op == Op::DmaData || op == Op::WriteData || op == Op::ReleaseMem ||
+                                         op == Op::DrawIndex2 || op == Op::DrawIndexAuto ||
+                                         op == Op::DrawIndexOffset2 || op == Op::DrawIndirect ||
+                                         op == Op::DrawIndexIndirect;
+                if (!interesting) {
+                    return;
+                }
+                cp->SyncRenderer();
+                for (size_t i = 0; i < addrs.size(); ++i) {
+                    const u32 v = *Ptr<const u32>(static_cast<u32>(addrs[i]), static_cast<u32>(addrs[i] >> 32));
+                    if (v != last[i]) {
+                        DC_INFO("gpu watch %#llx: %#x -> %#x after op %#x%s cs %#llx ps %#llx",
+                                (unsigned long long)addrs[i], last[i], v, op, compute ? " (compute)" : "",
+                                (unsigned long long)cp->CurRegs().ProgramAddr(Reg::COMPUTE_PGM_LO),
+                                (unsigned long long)cp->CurRegs().ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS));
+                        last[i] = v;
+                    }
+                }
+            }
+        } gpu_watch{this, op, compute};
+
         switch (op) {
         case Op::Nop:
             // The Gnm driver hides flip requests in NOPs: "when this frame is

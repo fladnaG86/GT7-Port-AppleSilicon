@@ -6000,6 +6000,20 @@ struct MetalRenderer::Impl {
                 path.c_str(), k, d[k], d[k + 1], d[k + 2], d[k + 3]);
       }
     }
+    // DC_FIND_RAW=1: also raw 64-bit pointers up to 32 KB below the address
+    // (buffers a shader addresses through a pointer, not a V#).
+    static const bool find_raw = std::getenv("DC_FIND_RAW") != nullptr;
+    if (find && find_raw) {
+      for (u32 k = 0; k + 2 <= n; ++k) {
+        const u64 p = u64(d[k]) | (u64(d[k + 1]) << 32);
+        if (p && p <= find && find - p < 0x8000) {
+          DC_INFO("gpu: find %#llx: %s %#llx %s[%u] raw ptr %#llx (+%#llx)",
+                  (unsigned long long)find, who, (unsigned long long)shader,
+                  path.c_str(), k, (unsigned long long)p,
+                  (unsigned long long)(find - p));
+        }
+      }
+    }
     if (depth >= 2) {
       return;
     }
