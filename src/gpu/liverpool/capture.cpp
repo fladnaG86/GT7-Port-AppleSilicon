@@ -681,6 +681,7 @@ void Replay(const char* dir_c, Renderer* renderer) {
         bool idle = true;
         u32 submits = 0, pages = 0;
         u64 kept = 0; // dwords the replay's GPU had already changed
+        u64 kept_logged = 0;
         while (at < ev.size()) {
             u32 type = kEnd;
             get(&type, 4);
@@ -696,9 +697,18 @@ void Replay(const char* dir_c, Renderer* renderer) {
             if (mem_event && !g_applying.load(std::memory_order_relaxed)) {
                 static const bool loose = std::getenv("DC_REPLAY_LOOSE") != nullptr;
                 if (!loose) {
-                    cp.WaitQuiescentFor(2000);
-                    if (renderer) {
-                        renderer->WaitIdle();
+                    // The host GPU finishing its work writes labels (EOP) that let a
+                    // waiting ring go on: settle again until no ring moves, so no GPU
+                    // work runs while the batch goes in (runs differed otherwise).
+                    for (int round = 0; round < 64; ++round) {
+                        cp.WaitQuiescentFor(2000);
+                        const u64 before = cp.GetStats().packets.load();
+                        if (renderer) {
+                            renderer->WaitIdle();
+                        }
+                        if (cp.WaitQuiescentFor(0) && cp.GetStats().packets.load() == before) {
+                            break;
+                        }
                     }
                 }
             }
@@ -746,6 +756,13 @@ void Replay(const char* dir_c, Renderer* renderer) {
                     }
                     at += size_t(count) * 8;
                 }
+                // DC_REPLAY_LOG_KEPT=1: per page, the dwords left as the replay's GPU wrote them.
+                static const bool log_kept = std::getenv("DC_REPLAY_LOG_KEPT") != nullptr;
+                if (log_kept && kept != kept_logged) {
+                    DC_INFO("capture: kept submit %u page %#llx: %llu", submits, (unsigned long long)va,
+                            (unsigned long long)(kept - kept_logged));
+                }
+                kept_logged = kept;
                 ++pages;
             } else if (type == kGraphics) {
                 u32 n = 0;
@@ -782,6 +799,12 @@ void Replay(const char* dir_c, Renderer* renderer) {
                 cp.SubmitGraphics(std::move(bufs), std::move(after));
                 idle = false;
                 ++submits;
+                // DC_REPLAY_SERIAL=1: each submit runs until it ends or waits before
+                // the next one goes in (ring threads otherwise interleave freely).
+                static const bool serial = std::getenv("DC_REPLAY_SERIAL") != nullptr;
+                if (serial) {
+                    cp.WaitQuiescentFor(2000);
+                }
             } else if (type == kCompute) {
                 u32 queue = 0, dw = 0;
                 u64 addr = 0;
@@ -791,6 +814,10 @@ void Replay(const char* dir_c, Renderer* renderer) {
                 cp.SubmitCompute(queue, {reinterpret_cast<const u32*>(addr), dw});
                 idle = false;
                 ++submits;
+                static const bool serial = std::getenv("DC_REPLAY_SERIAL") != nullptr;
+                if (serial) {
+                    cp.WaitQuiescentFor(2000);
+                }
             } else {
                 DC_ERROR("capture: events.bin: unknown event %u at %zu", type, at - 4);
                 break;

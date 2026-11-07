@@ -974,7 +974,8 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     // Another queue (async compute) may record the write meanwhile:
                     // all queues share one host command stream, so recorded work
                     // runs before anything this queue records after the wait.
-                    if (PendingFence(reinterpret_cast<u64>(addr), &pending) && Compare(func, pending & mask, ref)) {
+                    if (!Capture::ReplayApplying() && PendingFence(reinterpret_cast<u64>(addr), &pending) &&
+                        Compare(func, pending & mask, ref)) {
                         break;
                     }
                     const auto waited = std::chrono::steady_clock::now() - t0;

@@ -180,6 +180,16 @@ bool DrawTess(const RegFile &r, const DrawCall &dc) {
     }
     return m;
   }();
+  if (static const bool stats = std::getenv("DC_TESS_STATS") != nullptr; stats) {
+    static std::set<std::tuple<u32, u32, u64, u32>> seen;
+    const u64 hs = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_HS);
+    if (seen.insert({info.cp_in, info.cp_out, hs, info.domain}).second) {
+      DC_INFO("gpu: tess kind: cp %u->%u domain %u hs %#llx ls %#llx ps %#llx, first draw %u cps",
+              info.cp_in, info.cp_out, info.domain, (unsigned long long)hs,
+              (unsigned long long)r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_LS),
+              (unsigned long long)r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS), dc.count);
+    }
+  }
   // DC_TESS_N=<n>: only draws of n patches.
   static const u32 only_n = std::getenv("DC_TESS_N") ? u32(std::atoi(std::getenv("DC_TESS_N"))) : 0;
   if ((only_cp && !(only_cp >> info.cp_in & 1)) ||
