@@ -7080,7 +7080,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     return;
   case static_cast<PrimType>(9): // DI_PT_PATCH: the domain pass of DrawTess
     if (!tess_draw) {
-      ReportOnce("primitive type 9 not supported (tessellation off, DC_TESS=1)");
+      ReportOnce("patch draw skipped (tessellation off: DC_NO_TESS / DC_TESS=0, or not emulated)");
       return;
     }
     if (static const bool nodepth = std::getenv("DC_TESS_NODEPTH") != nullptr; nodepth) {

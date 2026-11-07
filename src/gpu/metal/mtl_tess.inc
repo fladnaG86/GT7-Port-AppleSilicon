@@ -155,7 +155,11 @@ bool TessFactors(id<MTLBuffer> in, u32 floats, u32 patches, float max_factor, id
 
 // Returns false when the draw is not emulated (it is then skipped as before).
 bool DrawTess(const RegFile &r, const DrawCall &dc) {
-  static const bool on = std::getenv("DC_TESS") != nullptr;
+  // On by default; DC_NO_TESS=1 or DC_TESS=0 skips patch draws (old behaviour).
+  static const bool on = [] {
+    const char *e = std::getenv("DC_TESS");
+    return std::getenv("DC_NO_TESS") == nullptr && !(e && e[0] == '0');
+  }();
   // DC_TESS_OC=<bytes>: off-chip bytes per threadgroup (default below).
   static const u32 oc_env = std::getenv("DC_TESS_OC") ? u32(std::strtoul(std::getenv("DC_TESS_OC"), nullptr, 0)) : 0;
   if (!on || tess_draw || !dc.count || r.Primitive() != PrimType(9)) {
