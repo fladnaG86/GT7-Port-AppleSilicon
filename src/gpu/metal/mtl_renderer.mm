@@ -94,10 +94,24 @@ template <typename T> u64 Hash(const T &v, u64 seed = 0xcbf29ce484222325ull) {
   return Fnv(&v, sizeof(T), seed);
 }
 
+// The range is guest memory the host can read. It may span several adjacent
+// mappings: GT7 maps its PRT textures (tile mode 16) one 64 KB page at a time.
 bool Readable(u64 addr, u64 size) {
-  Core::Memory::Vma vma;
-  return addr && Core::Memory::Query(addr, false, &vma) &&
-         addr + size <= vma.start + vma.size;
+  if (!addr) {
+    return false;
+  }
+  for (u64 at = addr, end = addr + size; at < end;) {
+    Core::Memory::Vma vma;
+    if (!Core::Memory::Query(at, false, &vma)) {
+      return false;
+    }
+    if (at != addr && vma.type != Core::Memory::VmaType::Direct &&
+        vma.type != Core::Memory::VmaType::Flexible) {
+      return false;
+    }
+    at = vma.start + vma.size;
+  }
+  return true;
 }
 
 // Scissor registers: x in [14:0], y in [30:16].
@@ -3495,6 +3509,25 @@ struct MetalRenderer::Impl {
                           fi.bytes_per_block, fi.compressed, pow2, mips);
     if (!Readable(addr, size)) {
       ReportOnce("texture memory not mapped");
+      static int logged = 0;
+      if (logged < 12) { // which VMAs cover it: several adjacent ones, or holes
+        ++logged;
+        std::string spans;
+        for (u64 at = addr; at < addr + size;) {
+          Core::Memory::Vma vma;
+          if (!Core::Memory::Query(at, false, &vma) || vma.start + vma.size <= at) {
+            spans += " hole@" + std::to_string((at - addr) >> 10) + "K";
+            at = (at + 0x10000) & ~0xFFFFull;
+            continue;
+          }
+          spans += " [" + std::to_string((vma.start > addr ? vma.start - addr : 0) >> 10) + "K+" +
+                   std::to_string((vma.start + vma.size - std::max(vma.start, at)) >> 10) + "K]";
+          at = vma.start + vma.size;
+          if (spans.size() > 600) break;
+        }
+        DC_WARN("gpu: unmapped texture %#llx %u KB tile %u %ux%u:%s", (unsigned long long)addr,
+                unsigned(size >> 10), tiling, width, height, spans.c_str());
+      }
       return Dummy(tt);
     }
 
