@@ -3107,14 +3107,50 @@ struct MetalRenderer::Impl {
            ((h[4] | h[5] << 32) * 5) ^ ((h[6] | h[7] << 32) * 7);
   }
 
-  u64 ChunkHash(u64 addr, u64 size, u32 chunk) {
+  u64 ChunkHash(const u8 *base, u64 size, u32 chunk) {
     const u64 off = u64(chunk) * kChunk;
-    return Hash64(reinterpret_cast<const u8 *>(addr) + off,
-                  std::min(kChunk, size - off));
+    return Hash64(base + off, std::min(kChunk, size - off));
+  }
+
+  // PRT textures with pages not committed (GT7 keeps only the mip tail of
+  // some): a copy of the range with the mapped pages and zeros elsewhere, as
+  // unmapped PRT tiles read on the GPU. Rebuilt on every call so pages the
+  // game commits later show up. nullptr when nothing of it is mapped.
+  struct SparseStaging {
+    std::vector<u8> bytes;
+    std::vector<std::pair<u64, u64>> spans; // mapped [lo, hi) of the last build
+  };
+  std::unordered_map<u64, SparseStaging> sparse_staging;
+  const u8 *SparseSource(u64 addr, u64 size) {
+    std::vector<std::pair<u64, u64>> spans;
+    for (u64 at = addr, end = addr + size; at < end;) {
+      Core::Memory::Vma vma;
+      if (!Core::Memory::Query(at, true, &vma) || vma.start >= end) {
+        break;
+      }
+      const u64 lo = std::max(at, vma.start), hi = std::min(end, vma.start + vma.size);
+      if (vma.type == Core::Memory::VmaType::Direct || vma.type == Core::Memory::VmaType::Flexible) {
+        spans.emplace_back(lo, hi);
+      }
+      at = vma.start + vma.size;
+    }
+    if (spans.empty()) {
+      sparse_staging.erase(addr);
+      return nullptr;
+    }
+    SparseStaging &st = sparse_staging[addr];
+    if (st.bytes.size() != size || st.spans != spans) { // layout changed: holes back to zero
+      st.bytes.assign(size, 0);
+      st.spans = spans;
+    }
+    for (const auto &[lo, hi] : spans) { // the committed pages, as they are now
+      std::memcpy(st.bytes.data() + (lo - addr), reinterpret_cast<const u8 *>(lo), hi - lo);
+    }
+    return st.bytes.data();
   }
 
   // True if the texture memory differs from what was uploaded.
-  bool TextureChanged(TextureEntry &e, u64 addr, u64 size) {
+  bool TextureChanged(TextureEntry &e, const u8 *addr, u64 size) {
     const u32 n = static_cast<u32>(e.chunks.size());
     if (e.hot) {
       for (u32 c = 0; c < n; ++c) {
@@ -3507,7 +3543,17 @@ struct MetalRenderer::Impl {
     const u64 size =
         Tiling::MipLayout(tiling, pitch, height, layers, levels,
                           fi.bytes_per_block, fi.compressed, pow2, mips);
-    if (!Readable(addr, size)) {
+    // Where the texel bytes come from: guest memory, or a staging copy of a
+    // partly committed PRT texture (tile modes 16..20 on GCN are PRT).
+    const u8 *tex_base = reinterpret_cast<const u8 *>(addr);
+    static const bool no_sparse = std::getenv("DC_NO_SPARSE_TEX") != nullptr;
+    if (!Readable(addr, size) && !no_sparse && tiling >= 16 && tiling <= 20) {
+      if (const u8 *b = SparseSource(addr, size)) {
+        tex_base = b;
+        ReportOnce("partly committed PRT textures read their holes as zero");
+      }
+    }
+    if (tex_base == reinterpret_cast<const u8 *>(addr) && !Readable(addr, size)) {
       ReportOnce("texture memory not mapped");
       static int logged = 0;
       if (logged < 12) { // which VMAs cover it: several adjacent ones, or holes
@@ -3639,7 +3685,7 @@ struct MetalRenderer::Impl {
       return view();
     }
     if (e.tex) {
-      if (!TextureChanged(e, addr, size)) {
+      if (!TextureChanged(e, tex_base, size)) {
         e.frame = frame_count;
         return view();
       }
@@ -3677,7 +3723,7 @@ struct MetalRenderer::Impl {
       texture_bytes += e.tex.allocatedSize;
       texture_bytes_peak = std::max(texture_bytes_peak, texture_bytes);
     }
-    const auto *src = reinterpret_cast<const u8 *>(addr);
+    const auto *src = tex_base;
     std::vector<u8> linear;
     {
     CpuTimer t(cpu_profile ? &cpu_upload_s : nullptr);
@@ -3739,7 +3785,7 @@ struct MetalRenderer::Impl {
     }
     e.chunks.resize((size + kChunk - 1) / kChunk);
     for (u32 c = 0; c < e.chunks.size(); ++c) {
-      e.chunks[c] = ChunkHash(addr, size, c);
+      e.chunks[c] = ChunkHash(src, size, c);
     }
     e.frame = frame_count;
     e.addr = addr;
