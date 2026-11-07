@@ -4214,6 +4214,8 @@ struct MetalRenderer::Impl {
     }
   }
   static constexpr u32 kTargetsMagic = 0x54524731; // "TRG1"
+  // Address no target can have: starts the storage-swizzle trailer.
+  static constexpr u64 kTargetsTrailer = ~0ull;
 
   void SaveTargets(const char *path) {
     EndPass();
@@ -4272,6 +4274,20 @@ struct MetalRenderer::Impl {
         }
       }
     }
+    // Trailer: the T# selectors storage writes used (storage_swizzles). A
+    // target written through a swizzled storage T# is read back in place by the
+    // same T#; without them a replay reads such targets (the tonemap 3D LUT)
+    // with the channels moved.
+    {
+      const u64 marker = kTargetsTrailer;
+      const u64 n = storage_swizzles.size();
+      std::fwrite(&marker, 8, 1, f);
+      std::fwrite(&n, 8, 1, f);
+      for (const auto &[a, s] : storage_swizzles) {
+        const u64 rec[2] = {a, s};
+        std::fwrite(rec, sizeof(rec), 1, f);
+      }
+    }
     std::fclose(f);
     DC_INFO("capture: %u render targets saved (%llu MB), %u skipped (views, MSAA, other formats)", saved,
             (unsigned long long)(bytes_total >> 20), skipped);
@@ -4291,11 +4307,30 @@ struct MetalRenderer::Impl {
     u32 loaded = 0;
     restored_lo = write_seq;
     restored_logged.clear();
+    // DC_NO_STORAGE_SWZ_RESTORE=1: old behaviour, storage swizzles not restored.
+    static const bool swz_restore = std::getenv("DC_NO_STORAGE_SWZ_RESTORE") == nullptr;
     for (;;) {
       u64 addr = 0, total = 0;
       u32 hdr[12];
-      if (std::fread(&addr, 8, 1, f) != 1 || std::fread(hdr, sizeof(hdr), 1, f) != 1 ||
-          std::fread(&total, 8, 1, f) != 1) {
+      if (std::fread(&addr, 8, 1, f) != 1) {
+        break;
+      }
+      if (addr == kTargetsTrailer) { // storage swizzles (captures made after it existed)
+        u64 n = 0;
+        if (std::fread(&n, 8, 1, f) == 1) {
+          for (u64 k = 0; k < n; ++k) {
+            u64 rec[2];
+            if (std::fread(rec, sizeof(rec), 1, f) != 1) {
+              break;
+            }
+            if (swz_restore) {
+              storage_swizzles[rec[0]] = static_cast<u32>(rec[1]);
+            }
+          }
+        }
+        break;
+      }
+      if (std::fread(hdr, sizeof(hdr), 1, f) != 1 || std::fread(&total, 8, 1, f) != 1) {
         break;
       }
       id<MTLBuffer> buf = [device newBufferWithLength:std::max<u64>(total, 16)
@@ -4358,7 +4393,20 @@ struct MetalRenderer::Impl {
     texture_cache.clear();
     BumpEpoch(__LINE__);
     restored_hi = write_seq;
-    DC_INFO("capture: %u render targets restored", loaded);
+    // DC_REPLAY_STORAGE_SWZ=<addr hex>:<swz hex>,...: storage swizzles for
+    // captures saved before the trailer existed (GT7 tonemap LUT:
+    // 901e400000:977).
+    for (const char *q = std::getenv("DC_REPLAY_STORAGE_SWZ"); q && *q;) {
+      char *e = nullptr;
+      const u64 a = std::strtoull(q, &e, 16);
+      if (!e || *e != ':') {
+        break;
+      }
+      const u32 s = static_cast<u32>(std::strtoul(e + 1, &e, 16));
+      storage_swizzles[a] = s;
+      q = (e && *e == ',') ? e + 1 : nullptr;
+    }
+    DC_INFO("capture: %u render targets restored, %zu storage swizzles", loaded, storage_swizzles.size());
   }
 
   // `rt` holds BC blocks, one per texel (a shader compressed a texture into
