@@ -549,6 +549,22 @@ struct MetalRenderer::Impl {
   TargetMap color_targets; // by address
   TargetMap depth_targets;
   u64 write_seq = 0;
+  // Metal allows 2048 array layers / 3D depth; more comes from a garbage T#.
+  // DC_NO_LAYER_CLAMP=1: pass the count through (old behaviour, for A/B runs).
+  static u32 LayerLimit(u32 layers) {
+    static const bool no_clamp = std::getenv("DC_NO_LAYER_CLAMP") != nullptr;
+    if (layers > 2048) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        DC_WARN("gpu: texture with %u layers clamped to 2048%s", layers, no_clamp ? " (DC_NO_LAYER_CLAMP: not)" : "");
+      }
+      if (!no_clamp) {
+        return 2048;
+      }
+    }
+    return layers;
+  }
   // DC_LOG_RESTORED=1 (frame replay): write_seq range LoadTargets handed out;
   // a sampled target still inside it was never rewritten in this loop.
   u64 restored_lo = 0, restored_hi = 0, dbg_shader = 0;
@@ -3508,7 +3524,7 @@ struct MetalRenderer::Impl {
           d.width = width;
           d.height = height;
           if (tt.dim == TexDim::Tex2DArray) {
-            d.arrayLength = std::min<u32>(layers, 2048); // Metal limit; more = a garbage T#
+            d.arrayLength = LayerLimit(layers); // Metal limit; more = a garbage T#
           }
           d.usage = MTLTextureUsageShaderRead;
           d.storageMode = MTLStorageModePrivate;
@@ -3603,9 +3619,9 @@ struct MetalRenderer::Impl {
       d.height = height;
       d.mipmapLevelCount = levels;
       if (tt.dim == TexDim::Tex3D) {
-        d.depth = std::min<u32>(layers, 2048);
+        d.depth = LayerLimit(layers);
       } else if (tt.dim == TexDim::Tex2DArray) {
-        d.arrayLength = std::min<u32>(layers, 2048); // Metal limit; more = a garbage T#
+        d.arrayLength = LayerLimit(layers); // Metal limit; more = a garbage T#
       }
       d.usage = MTLTextureUsageShaderRead;
       d.storageMode = cpu_upload ? MTLStorageModeManaged : MTLStorageModePrivate;
@@ -3813,7 +3829,7 @@ struct MetalRenderer::Impl {
                 MTLTextureUsagePixelFormatView;
     } else if (dim == TexDim::Tex2DArray) {
       d.textureType = MTLTextureType2DArray;
-      d.arrayLength = std::min(std::max(depth_or_layers, 1u), 2048u);
+      d.arrayLength = LayerLimit(std::max(depth_or_layers, 1u));
       d.usage = depth
                     ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                           MTLTextureUsagePixelFormatView
