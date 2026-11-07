@@ -328,6 +328,103 @@ static inline float4 dc_probe(float4 v) {
 }
 // The VALU clamp modifier: NaN becomes 0 (Metal's saturate keeps NaN).
 static inline float dc_sat(float f) { return f > 0.0f ? min(f, 1.0f) : 0.0f; }
+
+// ---- f64 (Metal has no double): IEEE binary64 bits in a ulong, integer
+// soft-float. Round to nearest, denormals flushed to zero, NaN payloads not
+// kept. Exact integer math, so fast-math cannot fold it away.
+constant ulong DC_D_SIGN = 0x8000000000000000ul;
+constant ulong DC_D_M52 = 0x000ffffffffffffful;
+constant ulong DC_D_INF = 0x7ff0000000000000ul;
+// m holds the significand with its leading bit at 61 (9 guard bits), e biased.
+static inline ulong dc_d_pack(ulong sign, int e, ulong m) {
+    ulong r = m + 0x100ul;
+    if ((r >> 62) != 0ul) { r >>= 1; e += 1; }
+    if (e >= 0x7ff) return sign | DC_D_INF;
+    if (e <= 0) return sign;
+    return sign | (ulong(e) << 52) | ((r >> 9) & DC_D_M52);
+}
+static inline ulong dc_d_add(ulong a, ulong b) {
+    int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
+    if (ea == 0x7ff) return a;
+    if (eb == 0x7ff) return b;
+    if (eb == 0) return ea == 0 ? (a & b & DC_D_SIGN) : a;
+    if (ea == 0) return b;
+    if ((a & ~DC_D_SIGN) < (b & ~DC_D_SIGN)) { ulong t = a; a = b; b = t; int te = ea; ea = eb; eb = te; }
+    ulong ma = ((a & DC_D_M52) | (1ul << 52)) << 9;
+    ulong mb = ((b & DC_D_M52) | (1ul << 52)) << 9;
+    int d = ea - eb;
+    if (d > 62) mb = 1ul;
+    else if (d > 0) mb = (mb >> d) | (((mb << (64 - d)) != 0ul) ? 1ul : 0ul);
+    ulong m = ((a ^ b) & DC_D_SIGN) != 0ul ? ma - mb : ma + mb;
+    if (m == 0ul) return 0ul;
+    int e = ea;
+    int lz = int(clz(m));
+    if (lz < 2) { m = (m >> 1) | (m & 1ul); e += 1; }
+    else { m <<= (lz - 2); e -= (lz - 2); }
+    return dc_d_pack(a & DC_D_SIGN, e, m);
+}
+static inline ulong dc_d_mul(ulong a, ulong b) {
+    ulong sign = (a ^ b) & DC_D_SIGN;
+    int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
+    if (ea == 0x7ff || eb == 0x7ff) return sign | DC_D_INF;
+    if (ea == 0 || eb == 0) return sign;
+    ulong ma = (a & DC_D_M52) | (1ul << 52), mb = (b & DC_D_M52) | (1ul << 52);
+    ulong hi = mulhi(ma, mb), lo = ma * mb;
+    int e = ea + eb - 1023;
+    ulong m;
+    if (((hi >> 41) & 1ul) != 0ul) { m = (hi << 20) | (lo >> 44); m |= (lo << 20) != 0ul ? 1ul : 0ul; e += 1; }
+    else { m = (hi << 21) | (lo >> 43); m |= (lo << 21) != 0ul ? 1ul : 0ul; }
+    return dc_d_pack(sign, e, m);
+}
+static inline ulong dc_d_fma(ulong a, ulong b, ulong c) { return dc_d_add(dc_d_mul(a, b), c); }
+static inline ulong dc_f2d(float f) {
+    uint x = as_type<uint>(f);
+    ulong sign = ulong(x & 0x80000000u) << 32;
+    uint e = (x >> 23) & 0xffu;
+    if (e == 0u) return sign;
+    if (e == 0xffu) return sign | DC_D_INF | (ulong(x & 0x7fffffu) << 29);
+    return sign | (ulong(e - 127u + 1023u) << 52) | (ulong(x & 0x7fffffu) << 29);
+}
+static inline float dc_d2f(ulong d) {
+    uint sign = uint(d >> 32) & 0x80000000u;
+    int e = int((d >> 52) & 0x7fful);
+    if (e == 0x7ff) return as_type<float>(sign | 0x7f800000u | ((d & DC_D_M52) != 0ul ? 0x400000u : 0u));
+    e = e - 1023 + 127;
+    if (e <= 0) return as_type<float>(sign);
+    ulong m = ((d & DC_D_M52) | (1ul << 52)) + (1ul << 28);
+    if ((m >> 53) != 0ul) { m >>= 1; e += 1; }
+    if (e >= 0xff) return as_type<float>(sign | 0x7f800000u);
+    return as_type<float>(sign | (uint(e) << 23) | (uint(m >> 29) & 0x7fffffu));
+}
+static inline ulong dc_d_rcp(ulong x) {
+    int e = int((x >> 52) & 0x7fful);
+    if (e == 0) return (x & DC_D_SIGN) | DC_D_INF;
+    if (e == 0x7ff) return (x & DC_D_M52) != 0ul ? x : (x & DC_D_SIGN);
+    // Estimate in float on the significand (exponent handled apart), then Newton.
+    ulong xm = (x & (DC_D_SIGN | DC_D_M52)) | (1023ul << 52);  // x scaled to [1, 2)
+    ulong y = dc_f2d(1.0f / dc_d2f(xm));
+    const ulong two = 0x4000000000000000ul;
+    y = dc_d_mul(y, dc_d_add(two, dc_d_mul(xm, y) ^ DC_D_SIGN));
+    y = dc_d_mul(y, dc_d_add(two, dc_d_mul(xm, y) ^ DC_D_SIGN));
+    int ey = int((y >> 52) & 0x7fful) - (e - 1023);
+    if (ey >= 0x7ff) return (y & DC_D_SIGN) | DC_D_INF;
+    if (ey <= 0) return y & DC_D_SIGN;
+    return (y & ~(0x7fful << 52)) | (ulong(ey) << 52);
+}
+static inline ulong dc_d_trunc(ulong x) {
+    int e = int((x >> 52) & 0x7fful) - 1023;
+    if (e < 0) return x & DC_D_SIGN;
+    if (e >= 52) return x;
+    return x & ~(DC_D_M52 >> e);
+}
+static inline ulong dc_d_key(ulong x) { return (x & DC_D_SIGN) != 0ul ? ~x : (x | DC_D_SIGN); }  // unsigned order
+static inline ulong dc_d_min(ulong a, ulong b) { return dc_d_key(a) <= dc_d_key(b) ? a : b; }
+static inline ulong dc_d_max(ulong a, ulong b) { return dc_d_key(a) >= dc_d_key(b) ? a : b; }
+static inline bool dc_d_lt(ulong a, ulong b) { return dc_d_key(a) < dc_d_key(b); }
+static inline ulong dc_d_sat(ulong x) {
+    if ((x & DC_D_SIGN) != 0ul || x == 0ul) return 0ul;
+    return x > 0x3ff0000000000000ul ? 0x3ff0000000000000ul : x;
+}
 // What the CB stores for R11G11B10: negatives and NaN become 0, overflow the largest
 // finite value (65024).
 static inline float4 dc_ufloat(float4 v) {

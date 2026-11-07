@@ -141,6 +141,36 @@ private:
         return "ulong(long(int(" + Src(code, lit) + ")))";
     }
     std::string U64(const Inst& i, int k) { return Src64(i.src[k], i.literal); }
+    // An f64 operand: register pairs as they are; inline float constants are
+    // doubles; a literal is the high half; then the neg/abs modifiers.
+    std::string D(const Inst& i, int k) {
+        const u16 code = i.src[k];
+        std::string e;
+        if (code >= Operand::FloatHalf && code <= Operand::FloatNegFour) {
+            static const u64 d[] = {0x3fe0000000000000ull, 0xbfe0000000000000ull, 0x3ff0000000000000ull,
+                                    0xbff0000000000000ull, 0x4000000000000000ull, 0xc000000000000000ull,
+                                    0x4010000000000000ull, 0xc010000000000000ull};
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "0x%016llxul", (unsigned long long)d[code - Operand::FloatHalf]);
+            e = buf;
+        } else if (code >= Operand::Zero && code <= Operand::IntNegMax) {
+            e = "ulong(long(int(" + Src(code, i.literal) + ")))";  // raw bits, as shadPS4
+        } else if (code == Operand::Literal) {
+            e = "(ulong(" + Hex(i.literal) + ") << 32)";
+        } else {
+            e = Src64(code, i.literal);
+        }
+        if (i.abs & (1 << k)) e = "(" + e + " & ~DC_D_SIGN)";
+        if (i.neg & (1 << k)) e = "(" + e + " ^ DC_D_SIGN)";
+        return e;
+    }
+    // Writes an f64 result (clamp honoured; omod on f64 is not used by GT7).
+    void SetVD(const Inst& i, const std::string& e) {
+        Line("{ ulong r_ = " + (i.clamp ? "dc_d_sat(" + e + ")" : e) + ";");
+        SetV(i.dst, "uint(r_)");
+        SetV(i.dst + 1u, "uint(r_ >> 32)");
+        Line("}");
+    }
     // A lane mask read as this lane's bit.
     std::string Mask(u16 code) {
         if (code == Operand::Zero) return "false";
@@ -988,6 +1018,20 @@ void Emitter::EmitVop(const Inst& i) {
         break;
     case Vop::V_MUL_HI_U32: SetV(i.dst, "mulhi(" + u(0) + ", " + u(1) + ")"); break;
     case Vop::V_MUL_HI_I32: SetV(i.dst, "uint(mulhi(" + s(0) + ", " + s(1) + "))"); break;
+    case Vop::V_ADD_F64: SetVD(i, "dc_d_add(" + D(i, 0) + ", " + D(i, 1) + ")"); break;
+    case Vop::V_MUL_F64: SetVD(i, "dc_d_mul(" + D(i, 0) + ", " + D(i, 1) + ")"); break;
+    case Vop::V_FMA_F64: SetVD(i, "dc_d_fma(" + D(i, 0) + ", " + D(i, 1) + ", " + D(i, 2) + ")"); break;
+    case Vop::V_MIN_F64: SetVD(i, "dc_d_min(" + D(i, 0) + ", " + D(i, 1) + ")"); break;
+    case Vop::V_MAX_F64: SetVD(i, "dc_d_max(" + D(i, 0) + ", " + D(i, 1) + ")"); break;
+    case Vop::V_RCP_F64:
+    case Vop::V_RCP_CLAMP_F64: SetVD(i, "dc_d_rcp(" + D(i, 0) + ")"); break;
+    case Vop::V_TRUNC_F64: SetVD(i, "dc_d_trunc(" + D(i, 0) + ")"); break;
+    case Vop::V_CVT_F64_F32: SetVD(i, "dc_f2d(" + f(0) + ")"); break;
+    case Vop::V_CVT_F32_F64: SetVF(i, "dc_d2f(" + D(i, 0) + ")"); break;
+    case Vop::V_CVT_F64_I32: SetVD(i, "dc_f2d(float(" + s(0) + "))"); break;
+    case Vop::V_CVT_F64_U32: SetVD(i, "dc_f2d(float(" + u(0) + "))"); break;
+    case Vop::V_CVT_I32_F64: SetV(i.dst, "uint(int(dc_d2f(" + D(i, 0) + ")))"); break;
+    case Vop::V_CVT_U32_F64: SetV(i.dst, "uint(max(dc_d2f(" + D(i, 0) + "), 0.0f))"); break;
     case Vop::V_MAD_U64_U32:
         Line("{ ulong r_ = ulong(" + u(0) + ") * ulong(" + u(1) + ") + " + U64(i, 2) + ";");
         SetV(i.dst, "uint(r_)");

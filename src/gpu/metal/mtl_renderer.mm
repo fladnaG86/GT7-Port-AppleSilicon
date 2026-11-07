@@ -2817,12 +2817,16 @@ struct MetalRenderer::Impl {
                         u64 key) {
     std::vector<std::string> unsupported;
     std::string src = Shader::GenerateMsl(p, o, &unsupported);
-    for (const auto &u : unsupported) {
-      ReportOnce("shader op not translated: " + u);
-    }
     const char *stage = p.stage == Stage::Vertex     ? "vs"
                         : p.stage == Stage::Fragment ? "ps"
                                                      : "cs";
+    for (const auto &u : unsupported) {
+      ReportOnce("shader op not translated: " + u);
+      // Once per op and shader: which programs lose that op.
+      char who[64];
+      std::snprintf(who, sizeof(who), " in %s %#llx", stage, (unsigned long long)p.address);
+      ReportOnce("shader op not translated: " + u + who);
+    }
     if (dump_dir) {
       char path[512];
       std::snprintf(path, sizeof(path), "%s/%s_%016llx_%016llx.metal", dump_dir,
