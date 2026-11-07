@@ -12,6 +12,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -25,6 +26,8 @@
 #include "core/signals.h"
 #include "core/loader/linker.h"
 #include "core/tls.h"
+
+extern std::atomic<bool> g_sync_shaders_now; // gpu/metal/mtl_renderer.mm
 
 namespace Core::Runtime {
 
@@ -175,6 +178,11 @@ extern "C" void DcGt7Log(void*, int level, void*, void*, const char* file, int l
     }
     DC_INFO("game[%d] %s:%d %s", level, name, line, text);
     Hle::Pad::OnGameLog(name, line, text);
+    static const bool sync_on_course = std::getenv("DC_SYNC_ON_COURSE") != nullptr;
+    if (sync_on_course && std::strstr(text, "loading course file") &&
+        !g_sync_shaders_now.exchange(true)) {
+        DC_INFO("gpu: pipelines compile synchronously from now on (DC_SYNC_ON_COURSE)");
+    }
 }
 
 void HookGt7Log(const Loader::Module& exe) {

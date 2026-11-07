@@ -40,6 +40,10 @@
 #include "gpu/shader/msl_prelude.h"
 #include "gpu/shader/program.h"
 
+// Debug (DC_SYNC_ON_COURSE): set by the game log hook once GT7 loads a
+// course; from then on draws wait for their pipeline instead of skipping.
+std::atomic<bool> g_sync_shaders_now{false};
+
 namespace Gpu::Metal {
 
 using namespace Liverpool;
@@ -7084,7 +7088,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }
       const bool has_ps = ps != nullptr;
       const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
-      const bool will_wait = sync_shaders || probe_slot >= 0 || capture;
+      const bool will_wait = sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) ||
+                             probe_slot >= 0 || capture;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr, has_ps] {
         id<MTLRenderPipelineState> pso = nil;
@@ -7113,7 +7118,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     // Probed draws must run, and so must fused GS draws (text glyphs: each
     // ES+GS+VS combination is its own pipeline, skipping it loses letters).
     // A DC_DEBUG_VSOUT capture is a one-off pipeline: wait for it too.
-    if (!sync_shaders && probe_slot < 0 && !fused_pending.on && !capture) {
+    if (!sync_shaders && !g_sync_shaders_now.load(std::memory_order_relaxed) &&
+        probe_slot < 0 && !fused_pending.on && !capture) {
       if (trace)
         DC_INFO("gpu:   skipped: pipeline compiling");
       return;
