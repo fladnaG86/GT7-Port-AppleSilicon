@@ -60,6 +60,11 @@ void ShaderCompiler::Worker(bool urgent_only) {
     }
 }
 
+bool ShaderCompiler::Has(u64 key) {
+    std::scoped_lock lk(fn_lock);
+    return functions.count(key) != 0;
+}
+
 id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 address) {
     {
         std::scoped_lock lk(fn_lock);

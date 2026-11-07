@@ -2274,7 +2274,7 @@ std::string Emitter::Run() {
         }
         const bool domain = o.tess.stage == TessStage::Domain;
         if (o.fused.on) {
-            src += o.fused.es_src + "\n" + o.fused.gs_src + "\n";
+            src += *o.fused.es_src + "\n" + *o.fused.gs_src + "\n";
         }
         src += "static VsOut dc_run(uint vid, uint iid, " + std::string(domain ? "float2 dc_uv, device uint* lds, " : "") +
                std::string(o.fused.on ? "ulong dc_gsvs, ulong dc_gsvs_bias, " : "") + "constant uint* ud, thread const DcMem& mem" +

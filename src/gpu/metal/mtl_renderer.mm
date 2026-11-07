@@ -625,14 +625,72 @@ struct MetalRenderer::Impl {
   // way and report a mismatch. Deterministic, unlike comparing two runs.
   bool tex_cache_check = false;
   u64 tex_cache_mismatches = 0, tex_cache_checks = 0;
+  // Addresses whose Latest() answer a cached result depends on, with the
+  // write generation of each when it was cached (see AddrGen).
+  using AddrDeps = std::vector<std::pair<u64, u64>>;
   struct TextureCacheEntry {
     id<MTLTexture> tex = nil;
     TextureType type;
     u64 epoch = 0;
+    AddrDeps deps;
   };
   std::unordered_map<u64, TextureCacheEntry> texture_cache;
   u64 texture_cache_frame = ~0ull;
   u64 texture_epoch = 0;
+  // DC_GPU_STATS: texture_epoch bumps by source line (each one empties the
+  // texture and resolve caches).
+  std::map<u32, u64> epoch_by_line;
+  void BumpEpoch(u32 line) {
+    ++texture_epoch;
+    ++epoch_by_line[line];
+  }
+  // A write that only changes which surface Latest() picks at one address
+  // bumps that address's generation instead of texture_epoch: GT7 keeps dozens
+  // of transient surfaces at one address (0x900a0b0000) and wrote them ~60
+  // times a frame, emptying both caches each time. DC_GLOBAL_EPOCH=1: old way.
+  std::unordered_map<u64, u64> addr_gen;
+  u64 AddrGen(u64 a) const {
+    const auto it = addr_gen.find(a);
+    return it == addr_gen.end() ? 0 : it->second;
+  }
+  void BumpAddr(u64 a, u32 line) {
+    static const bool global = std::getenv("DC_GLOBAL_EPOCH") != nullptr;
+    if (global) {
+      BumpEpoch(line);
+      return;
+    }
+    ++addr_gen[a];
+    ++epoch_by_line[line + 1000]; // stats: L100x = per-address bumps
+  }
+  // While a cache fills an entry, Latest() appends each address it looks up.
+  // Plain static, not thread_local (TLV crashes in this -no_pie binary): the
+  // renderer runs under impl->lock.
+  static inline std::vector<u64> *latest_deps = nullptr;
+  AddrDeps SnapDeps(std::vector<u64> &addrs) const {
+    std::sort(addrs.begin(), addrs.end());
+    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+    AddrDeps d;
+    d.reserve(addrs.size());
+    for (u64 a : addrs) {
+      d.emplace_back(a, AddrGen(a));
+    }
+    return d;
+  }
+  bool DepsValid(const AddrDeps &d) const {
+    for (const auto &[a, g] : d) {
+      if (AddrGen(a) != g) {
+        return false;
+      }
+    }
+    return true;
+  }
+  static void ForwardDeps(const AddrDeps &d) {
+    if (latest_deps) {
+      for (const auto &e : d) {
+        latest_deps->push_back(e.first);
+      }
+    }
+  }
 
   // A target was written: Latest() picks the most recently written surface at
   // an address, so when several share one the answer changes. With one target
@@ -650,13 +708,30 @@ struct MetalRenderer::Impl {
 
   void NoteTargetWritten(const RenderTarget &rt) {
     auto c = color_targets.find(rt.addr);
-    if (c == color_targets.end() || c->second.size() > 1) {
-      ++texture_epoch;
+    if (c == color_targets.end()) {
+      BumpEpoch(1); // DC_GPU_STATS label L1: written target not in color_targets
+      return;
+    }
+    if (c->second.size() > 1 || memory_fills.count(rt.addr)) {
+      // L1002: several surfaces share the address, or a memset there is
+      // compared against this write (GetTextureUncached)
+      BumpAddr(rt.addr, 2);
+      static const bool dbg = std::getenv("DC_EPOCH_LOG") != nullptr;
+      if (dbg) {
+        std::string s;
+        for (const auto &o : c->second) {
+          char b[96];
+          std::snprintf(b, sizeof(b), " [%ux%u fmt %lu d/l %u lvl %u]", o->width, o->height,
+                        (unsigned long)o->tex.pixelFormat, o->depth_or_layers, o->bind_level);
+          s += b;
+        }
+        ReportOnce("epoch: shared address " + Hex(rt.addr) + s);
+      }
       return;
     }
     auto d = depth_targets.find(rt.addr);
     if (d != depth_targets.end() && d->second.size() > 1) {
-      ++texture_epoch;
+      BumpAddr(rt.addr, 3);
     }
   }
 
@@ -1519,6 +1594,7 @@ struct MetalRenderer::Impl {
   void *last_end_ra = nullptr;
   std::unordered_map<void *, u64> split_by;
   u64 stat_passes = 0, stat_split = 0;
+  u64 stat_pipe_miss = 0, stat_msl_gen = 0; // DC_GPU_STATS: render pipeline misses
 
   void EndPass() {
     if (cenc) {
@@ -3195,7 +3271,8 @@ struct MetalRenderer::Impl {
       key = Hash(t[k], key);
     }
     if (auto it = texture_cache.find(key); it != texture_cache.end()) {
-      if (it->second.epoch == texture_epoch) {
+      if (it->second.epoch == texture_epoch && DepsValid(it->second.deps)) {
+        ForwardDeps(it->second.deps);
         if (cpu_profile) {
           ++cpu_gettex_hits;
         }
@@ -3228,8 +3305,14 @@ struct MetalRenderer::Impl {
     }
     CpuTimer t_(cpu_profile ? &cpu_gettex_s : nullptr);
     TextureType tt;
+    std::vector<u64> looked;
+    std::vector<u64> *outer = latest_deps;
+    latest_deps = &looked;
     id<MTLTexture> tex = GetTextureUncached(t, &tt, false);
-    texture_cache[key] = TextureCacheEntry{tex, tt, texture_epoch};
+    latest_deps = outer;
+    AddrDeps deps = SnapDeps(looked);
+    ForwardDeps(deps);
+    texture_cache[key] = TextureCacheEntry{tex, tt, texture_epoch, std::move(deps)};
     *type_out = tt;
     return tex;
   }
@@ -3879,6 +3962,9 @@ struct MetalRenderer::Impl {
   static RenderTarget *Latest(TargetMap &map, u64 addr,
                               std::optional<TexDim> dim = std::nullopt,
                               u32 width = 0, u32 height = 0, u32 texel_bytes = 0) {
+    if (latest_deps) {
+      latest_deps->push_back(addr);
+    }
     auto it = map.find(addr);
     if (it == map.end()) {
       return nullptr;
@@ -4025,7 +4111,7 @@ struct MetalRenderer::Impl {
             v->views.clear();
           }
         }
-        ++texture_epoch; // the old texture object is gone
+        BumpEpoch(__LINE__); // the old texture object is gone
       }
       return *t;
     }
@@ -4065,7 +4151,7 @@ struct MetalRenderer::Impl {
             depth_or_layers, (unsigned long)fmt,
             (unsigned long long)resolving_shader, twin ? ", a view of its sRGB twin" : "");
     list.push_back(std::move(rt));
-    ++texture_epoch; // a new surface: descriptors may now resolve elsewhere
+    BumpEpoch(__LINE__); // a new surface: descriptors may now resolve elsewhere
     return *list.back();
   }
 
@@ -4255,7 +4341,7 @@ struct MetalRenderer::Impl {
     std::fclose(f);
     Commit(true);
     texture_cache.clear();
-    ++texture_epoch;
+    BumpEpoch(__LINE__);
     restored_hi = write_seq;
     DC_INFO("capture: %u render targets restored", loaded);
   }
@@ -4556,7 +4642,7 @@ struct MetalRenderer::Impl {
       }
       RenderTarget &rt = *colors[k];
       if (rt.has_crops) {
-        ++texture_epoch; // its crops go stale: the next bind copies them again
+        BumpEpoch(__LINE__); // its crops go stale: the next bind copies them again
       }
       rp.colorAttachments[k].texture = rt.tex;
       rp.colorAttachments[k].slice = draw_layers ? 0 : rt.bind_slice;
@@ -4750,6 +4836,7 @@ struct MetalRenderer::Impl {
     u64 epoch;
     std::vector<TextureType> types;
     Resources res;
+    AddrDeps deps;
   };
   std::unordered_map<u64, ResolveEntry> resolve_cache; // this frame's Resolve results
   u64 resolve_cache_frame = 0;
@@ -4792,16 +4879,21 @@ struct MetalRenderer::Impl {
         ++cpu_resolve_calls;
       }
       if (auto it = resolve_cache.find(key);
-          it != resolve_cache.end() && it->second.epoch == texture_epoch) {
+          it != resolve_cache.end() && it->second.epoch == texture_epoch &&
+          DepsValid(it->second.deps)) {
         if (cpu_profile) {
           ++cpu_resolve_hits;
         }
+        ForwardDeps(it->second.deps);
         types = it->second.types;
         out.tex = it->second.res.tex;
         out.smp = it->second.res.smp;
         return;
       }
     }
+    std::vector<u64> looked;
+    std::vector<u64> *outer = latest_deps;
+    latest_deps = &looked;
     for (size_t i = 0; i < p.images.size(); ++i) {
       const auto &img = p.images[i];
       const u32 *t = tsharps_[i].data();
@@ -4865,8 +4957,11 @@ struct MetalRenderer::Impl {
       CpuTimer t(cpu_profile ? &cpu_sampler_s : nullptr);
       out.smp.push_back(GetSampler(s.data()));
     }
+    latest_deps = outer;
+    AddrDeps deps = SnapDeps(looked);
+    ForwardDeps(deps);
     if (cacheable) {
-      resolve_cache[key] = ResolveEntry{texture_epoch, types, out};
+      resolve_cache[key] = ResolveEntry{texture_epoch, types, out, std::move(deps)};
     }
   }
 
@@ -4930,7 +5025,7 @@ struct MetalRenderer::Impl {
       if (!added) {
         continue;
       }
-      ++texture_epoch; // a new level alias: descriptors at `a` resolve to it
+      BumpEpoch(__LINE__); // a new level alias: descriptors at `a` resolve to it
       // Already rendered as a target of its own: move its slices in.
       auto list = color_targets.find(a);
       if (list == color_targets.end()) {
@@ -4966,7 +5061,7 @@ struct MetalRenderer::Impl {
                 c.height, m, k, rt.addr);
         retired.push_back(std::move(v[i]));
         v.erase(v.begin() + i);
-        ++texture_epoch; // surfaces went away: descriptors at `a` change
+        BumpEpoch(__LINE__); // surfaces went away: descriptors at `a` change
       }
       if (v.empty()) {
         color_targets.erase(list);
@@ -5725,8 +5820,8 @@ struct MetalRenderer::Impl {
         }
         return it->second;
       };
-      f.fused.es_src = cached(ke, *esp, oe);
-      f.fused.gs_src = cached(kg, *gsp2, og);
+      f.fused.es_src = &cached(ke, *esp, oe);
+      f.fused.gs_src = &cached(kg, *gsp2, og);
       f.key = Hash(ke, kg);
       f.es_addr = es_addr;
       f.gs_addr = gs_addr;
@@ -6200,7 +6295,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       if (colors[k]->comp_swap != ColorInfo::CompSwap(info)) {
         colors[k]->comp_swap = ColorInfo::CompSwap(info);
         colors[k]->three_channels = fmt == 6 || fmt == 7;
-        ++texture_epoch; // T# selectors over it change meaning
+        BumpEpoch(__LINE__); // T# selectors over it change meaning
       }
       color_fmt[k] = cf.format;
       out_type[k] = cf.out;
@@ -6773,17 +6868,30 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         d.stencilAttachmentPixelFormat = depth_fmt;
       }
       pending.insert(pkey);
-      std::string vsrc = MslSource(*vs, vo, vs_key);
-      std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
+      ++stat_pipe_miss;
+      // A new pipeline often reuses compiled functions (same shaders, other
+      // blend/format/vertex layout): generating their MSL again was most of
+      // the GPU thread's time in a race. DC_ALWAYS_MSL=1 restores it (A/B).
+      static const bool always_msl = std::getenv("DC_ALWAYS_MSL") != nullptr;
+      std::string vsrc, fsrc;
+      if (always_msl || !compiler->Has(vs_key)) {
+        vsrc = MslSource(*vs, vo, vs_key);
+        ++stat_msl_gen;
+      }
+      if (ps && (always_msl || !compiler->Has(ps_key))) {
+        fsrc = MslSource(*ps, fo, ps_key);
+        ++stat_msl_gen;
+      }
+      const bool has_ps = ps != nullptr;
       const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
       const bool will_wait = sync_shaders || probe_slot >= 0 || capture;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
-                        vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
+                        vs_key, ps_key, pkey, flat, vs_addr, ps_addr, has_ps] {
         id<MTLRenderPipelineState> pso = nil;
         id<MTLFunction> vfn = compiler->Function(vs_key, vsrc, vs_addr);
         id<MTLFunction> ffn =
-            fsrc.empty() ? nil : compiler->Function(ps_key, fsrc, ps_addr);
-        if (vfn && (fsrc.empty() || ffn)) {
+            !has_ps ? nil : compiler->Function(ps_key, fsrc, ps_addr);
+        if (vfn && (!has_ps || ffn)) {
           d.vertexFunction = vfn;
           d.fragmentFunction = flat ? debug_fs : ffn;
           NSError *err = nil;
@@ -7375,7 +7483,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     const u64 dst = ud[0] | (u64(ud[1] & 0xFFF) << 32);
     if (color_targets.count(dst)) {
       memory_fills[dst] = ++write_seq;
-      ++texture_epoch;
+      BumpEpoch(__LINE__);
     }
     // The same memset over a depth surface clears it (GT7 clears its reflection
     // cube depth 0x900b460000 to 0, reverse Z, this way each frame). The value
@@ -8065,6 +8173,17 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                 stat_passes / double(frames), stat_split / double(frames), by.c_str());
         split_by.clear();
         stat_passes = stat_split = 0;
+        DC_INFO("gpu stats: %.1f new pipelines/frame, %.1f MSL sources generated/frame, %zu pipelines",
+                stat_pipe_miss / double(frames), stat_msl_gen / double(frames), pipelines.size());
+        stat_pipe_miss = stat_msl_gen = 0;
+        std::string eb;
+        for (const auto &[line, n] : epoch_by_line) {
+          char b[40];
+          std::snprintf(b, sizeof(b), " L%u:%.1f", line, n / double(frames));
+          eb += b;
+        }
+        epoch_by_line.clear();
+        DC_INFO("gpu stats: texture epoch bumps/frame by line:%s", eb.c_str());
       }
       if (cpu_profile) {
         // Wall clock per frame vs the part of it spent inside draws.

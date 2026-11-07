@@ -31,6 +31,10 @@ public:
     // compile. Thread-safe.
     id<MTLFunction> Function(u64 key, const std::string& src, u64 address);
 
+    // Whether Function(key, ...) is already cached (it then ignores `src`).
+    // Entries are never removed, so a true answer stays true.
+    bool Has(u64 key);
+
     // Runs `job` on a worker thread. Urgent jobs (the GPU thread is about to
     // wait for them) go before every queued normal job, and one worker serves
     // only them, so they never sit behind long pipeline compiles.

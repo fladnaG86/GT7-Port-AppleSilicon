@@ -201,7 +201,11 @@ struct MslOptions {
         u32 input_verts = 1;
         u32 ipp = 0;          // copy-VS indices per primitive (RingInfo::IndicesPerPrim)
         u8 es_index_size = 0; // ES reads its vertex index from Binding::GsIndex (0: thread id)
-        std::string es_src, gs_src;
+        // Borrowed MSL of dc_es / dc_gs (the renderer's cache owns them and
+        // never drops entries): copying them per draw cost the GPU thread
+        // more than the draw itself.
+        const std::string* es_src = nullptr;
+        const std::string* gs_src = nullptr;
     } fused;
     // LS / HS (compute) or domain VS (vertex) of a tessellation pipeline.
     TessInfo tess;
