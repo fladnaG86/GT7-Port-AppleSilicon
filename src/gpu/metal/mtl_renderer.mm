@@ -6569,11 +6569,26 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   Program *vs = GetProgram(Stage::Vertex, vs_addr, vs_ud,
                            Bits(r[Reg::SPI_SHADER_PGM_RSRC2_VS], 1, 5),
                            Bits(r[Reg::SPI_SHADER_PGM_RSRC1_VS], 24, 2));
-  Program *ps = ps_addr && any_color
+  // A depth-only draw (no color target) still runs its pixel shader on GCN
+  // when the shader can kill pixels or writes depth (DB_SHADER_CONTROL
+  // KILL_ENABLE / Z_EXPORT_ENABLE): the alpha-tested depth prepass of foliage
+  // (GT7 trees) cuts the leaf silhouettes out of the canopy hull that way, and
+  // the color pass then draws with z EQUAL. Without the shader the hull wrote
+  // full depth: trees came out as opaque blobs. DC_DEPTH_ONLY_NO_PS=1 drops
+  // the shader again (A/B).
+  static const bool depth_only_no_ps = std::getenv("DC_DEPTH_ONLY_NO_PS") != nullptr;
+  const u32 db_shader = r[Reg::DB_SHADER_CONTROL];
+  const bool depth_ps = !depth_only_no_ps && ps_addr && !any_color && depth &&
+                        ((db_shader & 1) || ((db_shader >> 6) & 1));
+  const bool run_ps = ps_addr && (any_color || depth_ps);
+  Program *ps = run_ps
                     ? GetProgram(Stage::Fragment, ps_addr, ps_ud,
                                  Bits(r[Reg::SPI_SHADER_PGM_RSRC2_PS], 1, 5), 0)
                     : nullptr;
-  if (!vs || (ps_addr && any_color && !ps)) {
+  if (trace && depth_ps)
+    DC_INFO("gpu:   depth-only draw keeps ps %#llx (db_shader_control %#x)",
+            (unsigned long long)ps_addr, db_shader);
+  if (!vs || (run_ps && !ps)) {
     if (trace)
       DC_INFO("gpu:   skipped: shader decode failed");
     return;
