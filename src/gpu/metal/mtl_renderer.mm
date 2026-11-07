@@ -501,6 +501,16 @@ struct MetalRenderer::Impl {
     const char *v = std::getenv("DC_COMMIT_EVERY");
     return v ? static_cast<u32>(std::atoi(v)) : 60u;
   }();
+  // The commit above waits for a pass boundary, and GT7's main scene pass has
+  // ~500 draws (~7 ms of GPU-thread time): the GPU sat idle meanwhile, then ran
+  // the whole pass after the guest had finished the frame. After this many
+  // draws a pass is ended, committed and reopened (attachments load again).
+  // DC_COMMIT_MIDPASS=<n> overrides, 0 disables.
+  const u32 kCommitMidPass = [] {
+    const char *v = std::getenv("DC_COMMIT_MIDPASS");
+    return v ? static_cast<u32>(std::atoi(v)) : 120u;
+  }();
+  u64 stat_midpass = 0;
 
   // Signals: an event value encoded between passes, so fences do not cut
   // command buffers. Callbacks run in order on the listener's queue.
@@ -6554,6 +6564,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   for (u32 k = 0; k < 8; ++k) {
     pending_clear = pending_clear || (colors[k] && colors[k]->clear_pending);
   }
+  if (kCommitMidPass && enc && pass_draws && work_since_commit >= kCommitMidPass) {
+    EndPass();
+    Commit(false); // the next check reopens the pass over the same attachments
+    ++stat_midpass;
+  }
   // Depth bounds test (Metal on AMD has none): the pixel shader compares a copy
   // of the depth buffer, taken when the depth may have changed since the last
   // copy.
@@ -8316,6 +8331,8 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                   "%.1f draws read the depth copy",
                   stat_break[0] / double(frames), stat_break[1] / double(frames), by.c_str(),
                   stat_depth_read_copy / double(frames));
+          DC_INFO("gpu stats: %.1f mid-pass commits/frame", stat_midpass / double(frames));
+          stat_midpass = 0;
           stat_break[0] = stat_break[1] = 0;
           stat_depth_read_copy = 0;
           break_by_ps.clear();
