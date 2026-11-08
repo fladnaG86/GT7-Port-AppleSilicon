@@ -6486,6 +6486,22 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   if (skip_draw.first && ps_addr == skip_draw.first && dc.count == skip_draw.second) {
     return;
   }
+  // DC_WATCH_PS=<hex ps>: log every draw of that pixel shader (debug).
+  static const u64 watch_ps = [] {
+    const char *e = std::getenv("DC_WATCH_PS");
+    return e ? std::strtoull(e, nullptr, 16) : 0ull;
+  }();
+  if (watch_ps && ps_addr == watch_ps) {
+    const u32 *ud = r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0);
+    u32 args[5] = {};
+    if (dc.indirect_args && Readable(dc.indirect_args, sizeof(args)))
+      std::memcpy(args, reinterpret_cast<const void *>(dc.indirect_args), sizeof(args));
+    DC_INFO("gpu: watch flip #%llu vs %#llx count %u inst %u idx %#llx+%u ind %#llx [%u %u %u %u %u] "
+            "ud %08x %08x %08x %08x %08x %08x",
+            (unsigned long long)frame_count, (unsigned long long)vs_addr, dc.count, dc.instances,
+            (unsigned long long)dc.index_base, dc.index_offset, (unsigned long long)dc.indirect_args,
+            args[0], args[1], args[2], args[3], args[4], ud[0], ud[1], ud[2], ud[3], ud[4], ud[5]);
+  }
 
   // ---- attachments ----
   DrawLap(1);
@@ -7322,6 +7338,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       ++frame_skips;
       if (trace)
         DC_INFO("gpu:   skipped: pipeline compiling");
+      static const bool log_skip_draws = [] {
+        const char *e = std::getenv("DC_LOG_SKIPS");
+        return e && std::atoi(e) >= 2;
+      }();
+      if (log_skip_draws) // DC_LOG_SKIPS=2: every skipped draw
+        DC_INFO("gpu: skip flip #%llu vs %#llx ps %#llx pkey %#llx class %u",
+                (unsigned long long)frame_count, (unsigned long long)vs_addr,
+                (unsigned long long)ps_addr, (unsigned long long)pkey, skip_class);
       return;
     }
     {
@@ -8842,7 +8866,20 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     }
     debug_vsout = 0;
   }
-  if (src && dump_frames && (key_trace_only ? trace : frame_count % dump_every == 0)) {
+  // DC_DUMP_RANGE=<a>-<b>: also dump every flip in [a,b] (debug).
+  static const std::pair<u64, u64> dump_range = [] {
+    std::pair<u64, u64> r{1, 0};
+    if (const char *e = std::getenv("DC_DUMP_RANGE")) {
+      char *q = nullptr;
+      r.first = std::strtoull(e, &q, 10);
+      r.second = *q == '-' ? std::strtoull(q + 1, nullptr, 10) : r.first;
+    }
+    return r;
+  }();
+  if (src && dump_frames &&
+      (key_trace_only ? trace
+                      : (frame_count % dump_every == 0 ||
+                         (frame_count >= dump_range.first && frame_count <= dump_range.second)))) {
     DumpFrame(dst);
   }
   if (!pass_dumps.empty()) {
