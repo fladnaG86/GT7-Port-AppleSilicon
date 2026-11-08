@@ -2297,6 +2297,11 @@ struct MetalRenderer::Impl {
           } else if (f == MTLPixelFormatRGBA16Float) {
             const u16 *q = reinterpret_cast<const u16 *>(p);
             for (int i = 0; i < 3; ++i) v[i] = Half(q[i]);
+          } else if (f == MTLPixelFormatRG16Float) {
+            const u16 *q = reinterpret_cast<const u16 *>(p);
+            for (int i = 0; i < 2; ++i) v[i] = Half(q[i]);
+          } else if (f == MTLPixelFormatR32Float || f == MTLPixelFormatDepth32Float) {
+            std::memcpy(v, p, 4);
           } else {
             for (int i = 0; i < 3; ++i) v[i] = p[i] / 255.0f;
           }
@@ -4044,6 +4049,20 @@ struct MetalRenderer::Impl {
     if (!addr || ttype < 8 || dfmt == 0) {
       return Dummy(tt, true);
     }
+    // A T# no Metal texture can hold (3D past 2048, 2D past 16384 texels a
+    // side) is not a real image: GT7 fetches descriptors from tables of
+    // materials that do not have them (the guard-rail shader ps 0x9071151f00
+    // reads a shadow T# past the end of a short table) and never samples
+    // them there; creating one aborts the process (Metal validation).
+    // DC_NO_TSHARP_LIMIT=1: old behaviour.
+    static const bool no_limit = std::getenv("DC_NO_TSHARP_LIMIT") != nullptr;
+    if (!no_limit && (ttype == 10 ? (width > 2048 || height > 2048 || depth > 2048)
+                                  : (width > 16384 || height > 16384))) {
+      ReportOnce("gpu: T# larger than any Metal texture (" + std::to_string(width) + "x" +
+                 std::to_string(height) + "x" + std::to_string(depth) + " type " +
+                 std::to_string(ttype) + "): zero texture");
+      return Dummy(tt, true);
+    }
 
     // Slices a descriptor of an array covers (a cube is 6 faces from its base).
     const u32 slice_count = tt.dim != TexDim::Tex2DArray ? 1
@@ -5780,6 +5799,9 @@ struct MetalRenderer::Impl {
       out.tex.push_back(tex);
     }
     for (const auto &s : ssharps_) {
+      if (trace) {
+        DC_INFO("gpu:   smp%zu S# %08x %08x %08x %08x", out.smp.size(), s[0], s[1], s[2], s[3]);
+      }
       CpuTimer t(cpu_profile ? &cpu_sampler_s : nullptr);
       out.smp.push_back(GetSampler(s.data()));
     }
@@ -5944,6 +5966,88 @@ struct MetalRenderer::Impl {
     }
     return rt;
   }
+
+  // Temporal history ping-pong (GT7's TAA, ps 0x901367e400): the resolve
+  // writes one of two same-size targets and samples the other as history,
+  // switching by frame parity. When the game drops a frame (this emulation is
+  // slower than the PS4) the parity skips a step: the draw then writes the
+  // target it wrote last time and reads the other one, which is two or more
+  // frames old while its motion vectors span one frame, so the reprojected
+  // history lands off by the missed camera motion; repeated every few flips,
+  // foliage and rocks smear into horizontal streaks along a pan. A pixel shader
+  // seen alternating between exactly two targets is a ping-pong; when it writes
+  // the same one as on its previous flip, that target (the newest history)
+  // is copied over the other first. Opt-in, DC_PINGPONG_FIX=1: the streaks
+  // seen in scenic replays did not go away with it (see commit message).
+  struct PingPong {
+    u64 a = 0, b = 0, last = 0, last_frame = 0;
+    u32 alternations = 0;
+    bool broken = false;
+  };
+  std::unordered_map<u64, PingPong> pingpong;
+  void RepairPingPong(u64 ps, RenderTarget &out) {
+    static const bool off = std::getenv("DC_PINGPONG_FIX") == nullptr; // opt-in: unproven
+    // DC_PINGPONG_MIN_ALT=<n>: alternations seen before repairs start (default 2;
+    // 1 lets a short capture replay repair from its first stale frame).
+    static const u32 min_alt = std::getenv("DC_PINGPONG_MIN_ALT")
+                                   ? u32(std::strtoul(std::getenv("DC_PINGPONG_MIN_ALT"), nullptr, 10))
+                                   : 2u;
+    PingPong &pp = pingpong[ps];
+    const u64 o = out.addr;
+    if (pp.broken) {
+      return;
+    }
+    if (!pp.a) {
+      pp.a = o;
+    } else if (o != pp.a && !pp.b) {
+      pp.b = o;
+    } else if (o != pp.a && o != pp.b) {
+      pp.broken = true;
+      return;
+    }
+    const bool new_flip = pp.last_frame != frame_count;
+    if (pp.last && new_flip) {
+      if (pp.last != o) {
+        ++pp.alternations;
+      } else if (pp.alternations >= min_alt && pp.b && !off) {
+        const u64 h = o == pp.a ? pp.b : pp.a;
+        bool reads = false;
+        for (const auto &t : tsharps_) {
+          reads |= (((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask) == h;
+        }
+        RenderTarget *hist = !reads ? nullptr : Latest(color_targets, h, out.dim, out.width, out.height);
+        if (hist && hist != &out && hist->tex && out.tex && out.initialized &&
+            hist->width == out.width && hist->height == out.height &&
+            hist->tex.pixelFormat == out.tex.pixelFormat &&
+            hist->tex.textureType == MTLTextureType2D && out.tex.textureType == MTLTextureType2D &&
+            hist->tex.sampleCount == 1 && out.tex.sampleCount == 1 && out.written > hist->written) {
+          EndPass();
+          EnsureCommandBuffer();
+          id<MTLBlitCommandEncoder> e = [cmd blitCommandEncoder];
+          [e copyFromTexture:out.tex sourceSlice:0 sourceLevel:0 toTexture:hist->tex
+                destinationSlice:0 destinationLevel:0 sliceCount:1 levelCount:1];
+          [e endEncoding];
+          hist->initialized = true;
+          hist->clear_pending = false;
+          hist->written = ++write_seq;
+          NoteTargetWritten(*hist);
+          ++stat_pingpong_repairs;
+          if (trace) {
+            DC_INFO("gpu:   ping-pong repair: ps %#llx writes %#llx again, newest history copied to %#llx",
+                    (unsigned long long)ps, (unsigned long long)o, (unsigned long long)h);
+          }
+          if (stat_pingpong_repairs <= 20 || stat_pingpong_repairs % 100 == 0) {
+            DC_INFO("gpu: ping-pong repair #%llu at flip %llu (ps %#llx, %#llx -> %#llx)",
+                    (unsigned long long)stat_pingpong_repairs, (unsigned long long)frame_count,
+                    (unsigned long long)ps, (unsigned long long)o, (unsigned long long)h);
+          }
+        }
+      }
+    }
+    pp.last = o;
+    pp.last_frame = frame_count;
+  }
+  u64 stat_pingpong_repairs = 0;
 
   // CB_COLOR_CONTROL.MODE = eliminate: tiles still fast-cleared get the
   // clear color. Here: a target with a pending clear is cleared now.
@@ -6998,6 +7102,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
             u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
             r[Reg::DB_Z_INFO], r[Reg::CB_BLEND0_CONTROL],
             r[Reg::SPI_SHADER_COL_FORMAT], r[Reg::DB_ALPHA_TO_MASK]);
+    for (u32 k = 1; k < 8; ++k) {
+      if (((r[Reg::CB_TARGET_MASK] >> (4 * k)) & 0xF) && r.ColorTarget(k, Reg::CB_BASE)) {
+        DC_INFO("gpu:   cb%u=%#llx info=%#x cmask=%#llx clear=%08x %08x", k,
+                (unsigned long long)(u64(r.ColorTarget(k, Reg::CB_BASE)) << 8), r.ColorTarget(k, Reg::CB_INFO),
+                (unsigned long long)(u64(r.ColorTarget(k, Reg::CB_CMASK)) << 8),
+                r.ColorTarget(k, Reg::CB_CLEAR_WORD0), r.ColorTarget(k, Reg::CB_CLEAR_WORD1));
+      }
+    }
     DC_INFO("gpu:   index base %#llx offset %u size %u instances %u first_vertex %u indirect %#llx",
             (unsigned long long)dc.index_base, dc.index_offset, dc.index_size, dc.instances,
             dc.first_vertex, (unsigned long long)dc.indirect_args);
@@ -7131,10 +7243,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     if (dc.indirect_args && Readable(dc.indirect_args, sizeof(args)))
       std::memcpy(args, reinterpret_cast<const void *>(dc.indirect_args), sizeof(args));
     DC_INFO("gpu: watch flip #%llu vs %#llx count %u inst %u idx %#llx+%u ind %#llx [%u %u %u %u %u] "
-            "ud %08x %08x %08x %08x %08x %08x",
+            "ud %08x %08x %08x %08x %08x %08x cb0 %#llx cb1 %#llx",
             (unsigned long long)frame_count, (unsigned long long)vs_addr, dc.count, dc.instances,
             (unsigned long long)dc.index_base, dc.index_offset, (unsigned long long)dc.indirect_args,
-            args[0], args[1], args[2], args[3], args[4], ud[0], ud[1], ud[2], ud[3], ud[4], ud[5]);
+            args[0], args[1], args[2], args[3], args[4], ud[0], ud[1], ud[2], ud[3], ud[4], ud[5],
+            (unsigned long long)(u64(r.ColorTarget(0, Reg::CB_BASE)) << 8),
+            (unsigned long long)(u64(r.ColorTarget(1, Reg::CB_BASE)) << 8));
+    const u32 *pud = r.UserData(Reg::SPI_SHADER_USER_DATA_PS_0);
+    DC_INFO("gpu: watch ps ud %08x %08x %08x %08x", pud[0], pud[1], pud[2], pud[3]);
   }
 
   // ---- attachments ----
@@ -7415,6 +7531,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   if (ps) {
     Resolve(*ps, ps_ud, ps_types, ps_res);
   }
+  }
+  if (cb_mode == 1 && ps && colors[0]) {
+    RepairPingPong(ps_addr, *colors[0]); // after Resolve: needs the PS's T#s
   }
 
   bool pending_clear = depth && depth->clear_pending;
