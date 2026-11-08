@@ -441,6 +441,24 @@ static inline float dc_med3(float a, float b, float c) {
 }
 static inline int dc_med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 static inline uint dc_med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
+// The three vertex values of an interpolated param, from its value and screen
+// derivatives against the barycentrics b it is linear in (see msl.cpp PerVertex). Values within 1/256 of an
+// integer snap to it: shaders add P0 + P10 and truncate probe indices.
+static inline float4 dc_snap(float4 v) {
+    const float4 r = rint(v);
+    return select(v, r, abs(v - r) < 0.00390625f);
+}
+static inline void dc_vertex_values(float4 v, float3 b, thread float4* out) {
+    const float4 vx = dfdx(v), vy = dfdy(v);
+    const float b1x = dfdx(b.y), b1y = dfdy(b.y), b2x = dfdx(b.z), b2y = dfdy(b.z);
+    const float det = b1x * b2y - b2x * b1y;
+    const float id = det != 0.0f ? 1.0f / det : 0.0f;
+    const float4 d1 = (vx * b2y - vy * b2x) * id, d2 = (vy * b1x - vx * b1y) * id;
+    const float4 v0 = v - b.y * d1 - b.z * d2;
+    out[0] = dc_snap(v0);
+    out[1] = dc_snap(v0 + d1);
+    out[2] = dc_snap(v0 + d2);
+}
 static inline float dc_cubeid(float x, float y, float z) {
     if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? 5.0f : 4.0f;
     if (abs(y) >= abs(x)) return y < 0.0f ? 3.0f : 2.0f;

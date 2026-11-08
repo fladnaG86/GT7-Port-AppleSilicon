@@ -143,6 +143,7 @@ struct Program {
     // PS usage.
     u32 attr_mask = 0;      // PS attributes read by v_interp_*
     u32 attr_flat_mask = 0; // ... of which read through v_interp_mov
+    u32 attr_vertex_mask = 0; // ... of which read per vertex (v_interp_mov P10 / P20)
     u8 mrt_mask = 0;
     bool exports_depth = false;
     bool uses_quad_ops = false;

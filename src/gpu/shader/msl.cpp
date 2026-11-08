@@ -7,6 +7,7 @@
 #include <set>
 #include <unordered_map>
 
+#include "common/log.h"
 #include "gpu/gds.h"
 #include "gpu/shader/msl_prelude.h"
 
@@ -54,7 +55,34 @@ u32 FloatBits(float f) {
 
 class Emitter {
 public:
-    Emitter(const Program& p, const MslOptions& o) : p(p), o(o) {}
+    Emitter(const Program& p, const MslOptions& o) : p(p), o(o) {
+        for (u32 a = 0; a < 32; ++a) {
+            if (PerVertex(a)) {
+                ps_vertex.insert(o.ps_input_cntl[a] & 0x3F);
+            }
+        }
+    }
+    // v_interp_mov P10 / P20 read an attribute's per-vertex deltas (P1 - P0,
+    // P2 - P0), and such shaders also read the I/J barycentric VGPRs directly:
+    // GT7's sign boards pick a reflection probe per pixel among their three
+    // vertices', weighted by I/J against a dither. Deltas of 0 and I/J of 0
+    // always took vertex 0's probe. I/J come from [[barycentric_coord]]; the
+    // vertex values are solved from the interpolated param and its screen
+    // derivatives against those barycentrics (the param is linear in them, so
+    // the quad differences are too). MSL 4 vertex_value would give them
+    // directly, but returns garbage on an M1 Max. FLAT_SHADE params keep deltas of 0, like
+    // the hardware. DC_NO_PERVERTEX=1 restores the old zeros (A/B).
+    static bool PerVertexOn() {
+        static const bool on = std::getenv("DC_NO_PERVERTEX") == nullptr;
+        return on;
+    }
+    bool PerVertex(u32 attr) const {
+        if (p.stage != Stage::Fragment || !PerVertexOn() || !((p.attr_vertex_mask >> (attr & 31)) & 1)) return false;
+        const u32 cntl = o.ps_input_cntl[attr & 31];
+        const u32 off = cntl & 0x3F;
+        return !(off & 0x20) && ((o.vs_param_mask >> off) & 1) && !(cntl & (1u << 10));
+    }
+    std::set<u32> ps_vertex; // VS params the PS reads per vertex (see PerVertex)
 
     std::string Run();
     std::set<std::string> unsupported;
@@ -1159,6 +1187,9 @@ std::string Emitter::AttrExpr(u32 attr, u32 chan) {
         return defaults[(cntl >> 8) & 3][chan & 3];
     }
     ps_params.insert(off);
+    if (ps_vertex.count(off)) {
+        return "dc_pv" + N(off) + "[0][" + N(chan) + "]";
+    }
     return "pin.p" + N(off) + "[" + N(chan) + "]";
 }
 
@@ -1167,11 +1198,20 @@ void Emitter::EmitVintrp(const Inst& i) {
         Unsupported(i);
         return;
     }
+    const bool per_vertex = PerVertex(i.attr);
     if (static_cast<Vintrp>(i.op) == Vintrp::V_INTERP_MOV_F32 && i.src[0] - Operand::Vgpr0 != 2) {
-        SetV(i.dst, "0u"); // P10 / P20: vertex deltas
+        if (per_vertex) { // P10 / P20: vertex deltas
+            const u32 off = o.ps_input_cntl[i.attr & 31] & 0x3F;
+            const std::string pv = "dc_pv" + N(off), c = "[" + N(i.chan & 3) + "]";
+            ps_params.insert(off);
+            const u32 vtx = i.src[0] - Operand::Vgpr0 == 0 ? 1u : 2u;
+            SetV(i.dst, "as_type<uint>(" + pv + "[" + N(vtx) + "]" + c + " - " + pv + "[0]" + c + ")");
+            return;
+        }
+        SetV(i.dst, "0u"); // P10 / P20: vertex deltas (0 for FLAT_SHADE params)
         return;
     }
-    const std::string v = AttrExpr(i.attr, i.chan);
+    std::string v = AttrExpr(i.attr, i.chan);
     // The I/J VGPRs say which barycentrics are used; LINEAR_* ones (SPI_PS_INPUT_ADDR
     // bits 4-6) mean screen-space interpolation, e.g. light volumes that read the
     // G-buffer at interpolated clip x/y without dividing by w.
@@ -1182,6 +1222,14 @@ void Emitter::EmitVintrp(const Inst& i) {
         if (ij >= reg && ij < reg + widths[bit]) {
             if (bit >= 4 && v.rfind("pin.p", 0) == 0) {
                 ps_linear.insert(o.ps_input_cntl[i.attr & 31] & 0x3F);
+            }
+            if (per_vertex && static_cast<Vintrp>(i.op) != Vintrp::V_INTERP_MOV_F32) {
+                // Interpolated read of a per-vertex param: P0 + I * P10 + J * P20.
+                const std::string pv = "dc_pv" + N(o.ps_input_cntl[i.attr & 31] & 0x3F);
+                const std::string b = "pin.dc_bary"; // perspective (see the I/J init)
+                const std::string c = "[" + N(i.chan & 3) + "]";
+                v = "(" + pv + "[0]" + c + " * " + b + ".x + " + pv + "[1]" + c + " * " + b + ".y + " + pv + "[2]" + c +
+                    " * " + b + ".z)";
             }
             break;
         }
@@ -2176,6 +2224,13 @@ std::string Emitter::Run() {
             case 12: val = "as_type<uint>(pin.ff ? 1.0f : -1.0f)"; break;
             default: break;
             }
+            // I/J of the perspective barycentric sets (see PerVertex): weights of
+            // vertices 1 and 2. Metal takes one [[barycentric_coord]] per
+            // function, so the LINEAR sets stay 0.
+            if (!ps_vertex.empty() && bit <= 2 && reg + 1 < vinit.size()) {
+                vinit[reg] = "as_type<uint>(pin.dc_bary.y)";
+                vinit[reg + 1] = "as_type<uint>(pin.dc_bary.z)";
+            }
             if (!val.empty() && reg < vinit.size()) vinit[reg] = val;
             reg += widths[bit];
         }
@@ -2368,7 +2423,14 @@ std::string Emitter::Run() {
         src += "    return o;\n}\n";
     } else if (p.stage == Stage::Fragment) {
         src += "struct PsIn {\n    float4 pos [[position]];\n    bool ff [[front_facing]];\n";
+        if (!ps_vertex.empty()) {
+            src += "    float3 dc_bary [[barycentric_coord]];\n";
+        }
         for (u32 k : ps_params) {
+            if (ps_vertex.count(k)) {
+                src += "    float4 p" + N(k) + " [[user(p" + N(k) + ")]];\n";
+                continue;
+            }
             bool flat = false;
             for (u32 a = 0; a < 32; ++a) {
                 const u32 cntl = o.ps_input_cntl[a];
@@ -2400,6 +2462,10 @@ std::string Emitter::Run() {
                ") {\n";
         if (o.depth_bounds) {
             src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; float bmin = min(dc_zbr.x, dc_zbr.y); float bmax = max(dc_zbr.x, dc_zbr.y); if (z_ < bmin || z_ > bmax) discard_fragment(); }\n";
+        }
+        for (u32 k : ps_vertex) {
+            if (!ps_params.count(k)) continue;
+            src += "    float4 dc_pv" + N(k) + "[3]; dc_vertex_values(pin.p" + N(k) + ", pin.dc_bary, dc_pv" + N(k) + ");\n";
         }
         src += "    " + MemInit() + "\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
@@ -2484,6 +2550,14 @@ std::string Emitter::Run() {
 std::string GenerateMsl(const Program& p, const MslOptions& o, std::vector<std::string>* unsupported) {
     Emitter e(p, o);
     std::string src = e.Run();
+    // DC_LOG_PERVERTEX=1: shaders given per-vertex inputs (see PerVertex).
+    static const bool log_pv = std::getenv("DC_LOG_PERVERTEX") != nullptr;
+    if (log_pv && !e.ps_vertex.empty()) {
+        std::string ks;
+        for (u32 k : e.ps_vertex) ks += " p" + std::to_string(k);
+        DC_INFO("msl: ps %#llx per-vertex params%s (input_addr %#x)", (unsigned long long)p.address, ks.c_str(),
+                o.ps_input_addr);
+    }
     if (unsupported) {
         unsupported->assign(e.unsupported.begin(), e.unsupported.end());
     }

@@ -989,6 +989,9 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
             p->attr_mask |= 1u << i.attr;
             if (static_cast<Vintrp>(i.op) == Vintrp::V_INTERP_MOV_F32) {
                 p->attr_flat_mask |= 1u << i.attr;
+                if (i.src[0] - Operand::Vgpr0 != 2) { // P10 / P20, not P0
+                    p->attr_vertex_mask |= 1u << i.attr;
+                }
             }
             break;
         case Enc::DS:

@@ -1870,7 +1870,17 @@ struct MetalRenderer::Impl {
         const u8 *base = static_cast<const u8 *>(b.contents) + slice_bytes * s;
         double sum[4] = {}, mx[4] = {};
         std::vector<u8> img;
-        const bool write = s < nfiles;
+        // DC_DUMP_BOUND_FIRST=<n>: write slices n.. instead of 0..;
+        // DC_DUMP_GAIN=<x> scales texels before the x/(1+x) curve.
+        static const u32 first_file = [] {
+          const char *e = std::getenv("DC_DUMP_BOUND_FIRST");
+          return e ? u32(std::strtoul(e, nullptr, 10)) : 0u;
+        }();
+        static const float gain = [] {
+          const char *e = std::getenv("DC_DUMP_GAIN");
+          return e ? std::strtof(e, nullptr) : 1.0f;
+        }();
+        const bool write = s >= first_file && s < first_file + nfiles;
         if (write) {
           img.resize(u64(w) * h * 3);
         }
@@ -1884,7 +1894,7 @@ struct MetalRenderer::Impl {
           }
           if (write) {
             for (int c = 0; c < 3; ++c) {
-              const float v = std::isfinite(t[c]) && t[c] > 0 ? t[c] : 0.0f;
+              const float v = std::isfinite(t[c]) && t[c] > 0 ? t[c] * gain : 0.0f;
               img[i * 3 + c] = u8(std::min(255.0f, 255.0f * v / (1.0f + v)));
             }
           }
@@ -2241,8 +2251,14 @@ struct MetalRenderer::Impl {
          f == MTLPixelFormatRG16Uint || f == MTLPixelFormatRGBA16Uint)) {
       return;
     }
-    const u32 w = std::max<u32>(1, static_cast<u32>(t.width) / 4),
-              h = std::max<u32>(1, static_cast<u32>(t.height) / 4);
+    // DC_DUMP_PASSES_DIV=<n>: downscale factor of the pass dumps (default 4).
+    static const u32 div = [] {
+      const char *e = std::getenv("DC_DUMP_PASSES_DIV");
+      const u32 v = e ? u32(std::strtoul(e, nullptr, 10)) : 4u;
+      return v ? v : 4u;
+    }();
+    const u32 w = std::max<u32>(1, static_cast<u32>(t.width) / div),
+              h = std::max<u32>(1, static_cast<u32>(t.height) / div);
     MTLTextureDescriptor *d = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                      width:w
