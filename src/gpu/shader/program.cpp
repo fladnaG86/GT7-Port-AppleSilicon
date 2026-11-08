@@ -864,11 +864,11 @@ bool InlineFetch(Program& p, const BuildInput& in) {
             return false;
         }
         const u64 target = u64(in.user_data[lo.ud]) | (u64(in.user_data[hi.ud]) << 32);
-        if (!Readable(target, 16)) {
+        if (!in.fetch_code && !Readable(target, 16)) {
             DC_WARN("shader %#llx: fetch subroutine %#llx is not mapped", p.address, target);
             return false;
         }
-        const u32* fcode = reinterpret_cast<const u32*>(target);
+        const u32* fcode = in.fetch_code ? in.fetch_code : reinterpret_cast<const u32*>(target);
         auto fetch = DecodeProgram(fcode, 4096, true);
         p.fetch_bytes = fetch.empty() ? 0 : fetch.back().pc + fetch.back().size * 4;
         if (!fetch.empty() && fetch.back().enc == Enc::SOP1 &&

@@ -549,6 +549,7 @@ struct MetalRenderer::Impl {
   std::condition_variable done_cv;
   std::vector<std::pair<u64, id<MTLRenderPipelineState>>> done_render;
   std::vector<std::pair<u64, id<MTLComputePipelineState>>> done_compute;
+  std::vector<u64> done_failed; // prewarm jobs that gave up: their keys stop being pending
   std::unordered_map<u64, id<MTLDepthStencilState>> depth_states;
   std::unordered_map<u64, id<MTLSamplerState>> samplers;
 
@@ -3048,6 +3049,7 @@ struct MetalRenderer::Impl {
   }
   void PrewarmStart() {
     const std::string path = PrewarmPath();
+    RenderPrewarmStart(!std::getenv("DC_NO_PREWARM"));
     if (std::getenv("DC_NO_PREWARM") || path.empty()) {
       return;
     }
@@ -3094,7 +3096,7 @@ struct MetalRenderer::Impl {
         o.linear_mask = e.linear_mask;
         o.linear_aligned = e.linear_aligned;
         const std::string src = Shader::GenerateMsl(*prog, o, nullptr);
-        id<MTLFunction> fn = compiler->Function(key, src, e.addr);
+        id<MTLFunction> fn = compiler->Function(key, src, e.addr, true);
         if (!fn) {
           return;
         }
@@ -3110,8 +3112,469 @@ struct MetalRenderer::Impl {
           std::scoped_lock lk(done_lock);
           done_compute.emplace_back(e.pkey, pso);
         }
-      }, /*urgent=*/false);
+      }, /*urgent=*/false, 0, /*background=*/true);
     }
+  }
+
+  // ================= render pipeline prewarm =================
+  // Like the compute prewarm above, for the VS+PS pipelines of ordinary draws
+  // (not tessellated, not fused GS, not debug): every one built is recorded
+  // in ~/Library/Caches/DriveclubNative/render_pipelines.bin with the guest
+  // code of both shaders and every input of their MSL options and of the
+  // pipeline state, never the MSL. The next launch rebuilds them all on the
+  // compiler threads from the start (intro and menus take minutes), with the
+  // current translator, so a race after a translator change (new MSL, Metal's
+  // shader cache misses) or on a cleared cache skips no draw for a pipeline
+  // compiling. The jobs are queued under their pipeline key and the key is
+  // pending: a draw that needs one first touches it (skip) or runs it (wait).
+  // An entry whose recomputed key differs (its inputs changed meaning) is
+  // dropped and compiles the old way. DC_NO_PREWARM=1: no prewarm at all;
+  // DC_NO_RENDER_PREWARM=1: none for render pipelines (recording goes on).
+  // The fixed-function part of a render pipeline (MTLRenderPipelineDescriptor
+  // without tessellation, functions or label).
+  struct RenderPipeState {
+    struct Vb {
+      u32 format = 0, stride = 0, bytes = 0;
+    };
+    Vb vbufs[16];
+    u32 nvbufs = 0;
+    u32 colors = 0;    // bound color targets
+    u32 blendable = 0; // targets whose output type can blend
+    u32 color_fmt[8] = {}, blend[8] = {};
+    u32 write_mask = 0, shader_mask = 0, depth_fmt = 0;
+    u32 vtx_layer = 0, layer_topology = 0, flat = 0;
+  };
+  MTLRenderPipelineDescriptor *RenderDescriptor(const RenderPipeState &s) {
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    if (s.vtx_layer) {
+      d.inputPrimitiveTopology = static_cast<MTLPrimitiveTopologyClass>(s.layer_topology);
+    }
+    if (s.nvbufs) {
+      MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+      for (u32 k = 0; k < s.nvbufs; ++k) {
+        const RenderPipeState::Vb &vb = s.vbufs[k];
+        vd.attributes[k].format = static_cast<MTLVertexFormat>(vb.format);
+        vd.attributes[k].offset = 0;
+        vd.attributes[k].bufferIndex = kVertexBufferBase + k;
+        MTLVertexBufferLayoutDescriptor *l = vd.layouts[kVertexBufferBase + k];
+        l.stride = vb.stride ? vb.stride : (vb.bytes + 3) & ~3u;
+        l.stepFunction = vb.stride ? MTLVertexStepFunctionPerVertex : MTLVertexStepFunctionConstant;
+        l.stepRate = vb.stride ? 1 : 0;
+      }
+      d.vertexDescriptor = vd;
+    }
+    for (u32 k = 0; k < 8; ++k) {
+      if (!((s.colors >> k) & 1)) {
+        continue;
+      }
+      MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[k];
+      ca.pixelFormat = static_cast<MTLPixelFormat>(s.color_fmt[k]);
+      const u32 b = s.blend[k];
+      const u32 wm = (s.write_mask >> (4 * k)) & 0xF;
+      ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) | ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
+                     ((wm & 4) ? MTLColorWriteMaskBlue : 0) | ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
+      // CB_SHADER_MASK without alpha: the hardware blends with source alpha 1
+      // (shadPS4 swaps SrcAlpha factors for One/Zero).
+      const bool alpha_masked = !((s.shader_mask >> (4 * k + 3)) & 1);
+      if ((b >> 30) & 1 && ((s.blendable >> k) & 1) && !s.flat) {
+        ca.blendingEnabled = YES;
+        auto fixa = [&](u32 f) {
+          return !alpha_masked ? BlendFactor(f)
+                 : f == 4      ? MTLBlendFactorOne
+                 : f == 5      ? MTLBlendFactorZero
+                               : BlendFactor(f);
+        };
+        ca.sourceRGBBlendFactor = fixa(b & 0x1F);
+        ca.rgbBlendOperation = BlendOp((b >> 5) & 7);
+        ca.destinationRGBBlendFactor = fixa((b >> 8) & 0x1F);
+        if ((b >> 29) & 1) {
+          ca.sourceAlphaBlendFactor = BlendFactor((b >> 16) & 0x1F);
+          ca.alphaBlendOperation = BlendOp((b >> 21) & 7);
+          ca.destinationAlphaBlendFactor = BlendFactor((b >> 24) & 0x1F);
+        } else {
+          ca.sourceAlphaBlendFactor = ca.sourceRGBBlendFactor;
+          ca.alphaBlendOperation = ca.rgbBlendOperation;
+          ca.destinationAlphaBlendFactor = ca.destinationRGBBlendFactor;
+        }
+      }
+    }
+    d.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(s.depth_fmt);
+    if (s.depth_fmt == MTLPixelFormatDepth32Float_Stencil8) {
+      d.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(s.depth_fmt);
+    }
+    return d;
+  }
+  // Pipeline key of the vertex function. `fused_key` (fused GS copy VS) and
+  // `tess_pw` (partition | winding << 8 of a domain VS) are optional.
+  static u64 VsKey(const Program &vs, const Shader::MslOptions &vo, const u64 *fused_key, const u64 *tess_pw,
+                   u32 layer_topology) {
+    u64 vs_key = Hash(vs.hash);
+    if (fused_key) {
+      vs_key = Hash(*fused_key, vs_key);
+    }
+    vs_key = Hash(vo.map_hoist, vs_key);
+    vs_key = Hash(vo.linear_mask, vs_key);
+    vs_key = Hash(vo.linear_aligned, vs_key);
+    for (const auto &a : vo.vertex_attrs) {
+      vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
+    }
+    vs_key = Hash(vo.rect_list, vs_key);
+    if (tess_pw) {
+      vs_key = Fnv(&vo.tess, sizeof(vo.tess), vs_key);
+      vs_key = Hash(*tess_pw, vs_key);
+    }
+    vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1) | (u32(vo.vtx_layer) << 2) |
+                      (vo.vtx_layer ? layer_topology << 3 : 0),
+                  vs_key);
+    vs_key = Hash(vo.debug_capture, vs_key);
+    vs_key = Fnv(vo.textures.data(), vo.textures.size() * sizeof(TextureType), vs_key);
+    return vs_key;
+  }
+  // Only what the pixel shader reads goes into its options and key: inputs
+  // and MRTs it does not use keep values from earlier draws, which made new
+  // keys (and pipeline compiles, during which draws are skipped) for the same
+  // shader.
+  static void PsOptionsInUse(const Program &ps, Shader::MslOptions &fo) {
+    for (u32 k = 0; k < 32; ++k) {
+      if (!((ps.attr_mask >> k) & 1)) {
+        fo.ps_input_cntl[k] = 0;
+      }
+    }
+    const u32 used_mrt = ps.mrt_mask | (fo.dual_source ? 2u : 0u);
+    for (u32 k = 0; k < 8; ++k) {
+      if (!((used_mrt >> k) & 1)) {
+        fo.col_format &= ~(0xFu << (4 * k));
+        fo.mrt_type[k] = Shader::OutType::Float;
+        fo.mrt_ufloat &= ~(1u << k);
+      }
+    }
+  }
+  static u64 PsKey(const Program &ps, const Shader::MslOptions &fo) {
+    u64 ps_key = Hash(ps.hash);
+    ps_key = Hash(fo.probe_pc, ps_key);
+    ps_key = Hash(fo.depth_target, ps_key);
+    ps_key = Hash(fo.depth_bounds, ps_key);
+    ps_key = Hash(fo.alpha_to_mask, ps_key);
+    ps_key = Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), ps_key);
+    ps_key = Hash(fo.vs_param_mask, ps_key);
+    ps_key = Hash(fo.ps_input_addr, ps_key);
+    ps_key = Hash(fo.col_format, ps_key);
+    ps_key = Hash(fo.dual_source, ps_key);
+    ps_key = Hash(fo.map_hoist, ps_key);
+    ps_key = Hash(fo.linear_mask, ps_key);
+    ps_key = Hash(fo.linear_aligned, ps_key);
+    ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
+    ps_key = Hash(fo.mrt_ufloat, ps_key);
+    ps_key = Fnv(fo.textures.data(), fo.textures.size() * sizeof(TextureType), ps_key);
+    return ps_key;
+  }
+  static u64 VertexLayoutKey(const RenderPipeState &s) {
+    u64 vlayout = 0;
+    for (u32 k = 0; k < s.nvbufs; ++k) {
+      const RenderPipeState::Vb &vb = s.vbufs[k];
+      vlayout = Hash(u64(vb.format) | (u64(vb.stride) << 32), vlayout + 1);
+    }
+    return vlayout;
+  }
+  static u64 RenderPipelineKey(const RenderPipeState &s, u64 vs_key, u64 ps_key) {
+    PipelineKey pk;
+    std::memset(&pk, 0, sizeof(pk)); // its tail padding is hashed too
+    const u64 vlayout = VertexLayoutKey(s);
+    pk.vs = vlayout ? Hash(vlayout, vs_key) : vs_key; // formats and strides live in the pipeline
+    pk.ps = ps_key;
+    for (u32 k = 0; k < 8; ++k) {
+      pk.color_fmt[k] = s.color_fmt[k];
+      pk.blend[k] = s.blend[k];
+    }
+    pk.write_mask = s.write_mask;
+    pk.shader_mask = s.shader_mask;
+    pk.depth_fmt = s.depth_fmt;
+    return s.flat ? Hash(u64(0xF1A7), Hash(pk)) : Hash(pk);
+  }
+  // One recorded render pipeline. Options are stored as the draw set them,
+  // before PsOptionsInUse (which depends on the translator).
+  struct RenderRecord {
+    u64 pkey = 0;
+    u64 vs_addr = 0, ps_addr = 0;
+    u32 vs_nus = 0, vs_vcc = 0, ps_nus = 0, has_ps = 0;
+    std::array<u32, 16> vud{};
+    std::vector<u32> vs_code, vs_fetch, ps_code;
+    // Vertex options.
+    u32 rect_list = 0, points = 0, vtx_point_size = 0, vtx_layer = 0, vmap_hoist = 0, vlinear_mask = 0,
+        vlinear_aligned = 0;
+    std::vector<Shader::MslOptions::VertexAttr> vattrs;
+    std::vector<TextureType> vtypes;
+    // Pixel options.
+    std::array<u32, 32> ps_input_cntl{};
+    u32 ps_input_addr = 0, col_format = 0, mrt_ufloat = 0, depth_target = 0, depth_bounds = 0,
+        alpha_to_mask = 0, dual_source = 0, pmap_hoist = 0, plinear_mask = 0, plinear_aligned = 0;
+    std::array<u8, 8> mrt_type{};
+    std::vector<TextureType> ptypes;
+    RenderPipeState state;
+  };
+  static constexpr u32 kRenderRecordMagic = 0x31575052; // "RPW1"; change when RenderRecord changes
+  std::unordered_set<u64> render_known;
+  std::unordered_set<u64> prewarm_queued; // GPU thread: prewarm keys never promoted
+  u64 stat_prewarm_promoted = 0;
+  static std::string RenderPrewarmPath() {
+    const char *home = std::getenv("HOME");
+    return home ? std::string(home) + "/Library/Caches/DriveclubNative/render_pipelines.bin" : "";
+  }
+  // Guest code from `addr` as BuildProgram decodes it, plus 64 bytes so a
+  // decode that peeks past the end reads what it read in guest memory.
+  static std::vector<u32> GuestCode(u64 addr, u32 bytes = 0) {
+    const auto *code = reinterpret_cast<const u32 *>(addr);
+    if (!bytes) {
+      bytes = Shader::Gcn::ProgramSize(code);
+      if (Readable(addr, bytes + 64)) {
+        bytes += 64;
+      }
+    }
+    return std::vector<u32>(code, code + bytes / 4);
+  }
+  void RenderPrewarmRecord(const RenderRecord &e) {
+    const std::string path = RenderPrewarmPath();
+    std::string b;
+    auto put = [&](const void *d, size_t n) { b.append(static_cast<const char *>(d), n); };
+    auto put32 = [&](u32 v) { put(&v, 4); };
+    auto putv = [&](const auto &v) {
+      put32(static_cast<u32>(v.size()));
+      put(v.data(), v.size() * sizeof(v[0]));
+    };
+    put(&e.pkey, 8); put(&e.vs_addr, 8); put(&e.ps_addr, 8);
+    for (u32 v : {e.vs_nus, e.vs_vcc, e.ps_nus, e.has_ps}) put32(v);
+    put(e.vud.data(), 64);
+    putv(e.vs_code); putv(e.vs_fetch); putv(e.ps_code);
+    for (u32 v : {e.rect_list, e.points, e.vtx_point_size, e.vtx_layer, e.vmap_hoist, e.vlinear_mask,
+                  e.vlinear_aligned})
+      put32(v);
+    put32(static_cast<u32>(e.vattrs.size()));
+    for (const auto &a : e.vattrs) {
+      put32(a.pc); put32(a.kind); put32(a.swizzle);
+    }
+    putv(e.vtypes);
+    put(e.ps_input_cntl.data(), 128);
+    for (u32 v : {e.ps_input_addr, e.col_format, e.mrt_ufloat, e.depth_target, e.depth_bounds, e.alpha_to_mask,
+                  e.dual_source, e.pmap_hoist, e.plinear_mask, e.plinear_aligned})
+      put32(v);
+    put(e.mrt_type.data(), 8);
+    putv(e.ptypes);
+    const RenderPipeState &s = e.state;
+    put32(s.nvbufs);
+    for (u32 k = 0; k < s.nvbufs; ++k) {
+      put32(s.vbufs[k].format); put32(s.vbufs[k].stride); put32(s.vbufs[k].bytes);
+    }
+    for (u32 v : {s.colors, s.blendable}) put32(v);
+    put(s.color_fmt, 32); put(s.blend, 32);
+    for (u32 v : {s.write_mask, s.shader_mask, s.depth_fmt, s.vtx_layer, s.layer_topology, s.flat}) put32(v);
+    std::scoped_lock lk(prewarm_lock);
+    if (path.empty() || !render_known.insert(e.pkey).second) {
+      return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    const u32 head[2] = {kRenderRecordMagic, static_cast<u32>(b.size())};
+    f.write(reinterpret_cast<const char *>(head), 8);
+    f.write(b.data(), b.size());
+  }
+  static bool ParseRenderRecord(const char *p, size_t n, RenderRecord &e) {
+    size_t at = 0;
+    bool ok = true;
+    auto get = [&](void *d, size_t k) {
+      if (!ok || at + k > n) {
+        ok = false;
+        return;
+      }
+      std::memcpy(d, p + at, k);
+      at += k;
+    };
+    auto get32 = [&]() {
+      u32 v = 0;
+      get(&v, 4);
+      return v;
+    };
+    auto getv = [&](auto &v, u32 max) {
+      const u32 c = get32();
+      if (c > max) {
+        ok = false;
+        return;
+      }
+      v.resize(c);
+      get(v.data(), c * sizeof(v[0]));
+    };
+    get(&e.pkey, 8); get(&e.vs_addr, 8); get(&e.ps_addr, 8);
+    for (u32 *v : {&e.vs_nus, &e.vs_vcc, &e.ps_nus, &e.has_ps}) *v = get32();
+    get(e.vud.data(), 64);
+    getv(e.vs_code, 1u << 18); getv(e.vs_fetch, 1u << 12); getv(e.ps_code, 1u << 18);
+    for (u32 *v : {&e.rect_list, &e.points, &e.vtx_point_size, &e.vtx_layer, &e.vmap_hoist, &e.vlinear_mask,
+                   &e.vlinear_aligned})
+      *v = get32();
+    const u32 na = get32();
+    if (na > 64) {
+      return false;
+    }
+    e.vattrs.resize(na);
+    for (auto &a : e.vattrs) {
+      a.pc = get32();
+      a.kind = static_cast<Shader::MslOptions::VertexAttr::Kind>(get32());
+      a.swizzle = get32();
+    }
+    getv(e.vtypes, 128);
+    get(e.ps_input_cntl.data(), 128);
+    for (u32 *v : {&e.ps_input_addr, &e.col_format, &e.mrt_ufloat, &e.depth_target, &e.depth_bounds,
+                   &e.alpha_to_mask, &e.dual_source, &e.pmap_hoist, &e.plinear_mask, &e.plinear_aligned})
+      *v = get32();
+    get(e.mrt_type.data(), 8);
+    getv(e.ptypes, 128);
+    RenderPipeState &s = e.state;
+    s.nvbufs = get32();
+    if (s.nvbufs > 16) {
+      return false;
+    }
+    for (u32 k = 0; k < s.nvbufs; ++k) {
+      RenderPipeState::Vb &vb = s.vbufs[k];
+      vb.format = get32(); vb.stride = get32(); vb.bytes = get32();
+    }
+    for (u32 *v : {&s.colors, &s.blendable}) *v = get32();
+    get(s.color_fmt, 32); get(s.blend, 32);
+    for (u32 *v : {&s.write_mask, &s.shader_mask, &s.depth_fmt, &s.vtx_layer, &s.layer_topology, &s.flat})
+      *v = get32();
+    return ok && at == n && !e.vs_code.empty() && (!e.has_ps || !e.ps_code.empty());
+  }
+  // Vertex and pixel options of a record (spans borrow from `e`).
+  static void RecordOptions(const RenderRecord &e, Shader::MslOptions &vo, Shader::MslOptions &fo) {
+    vo.rect_list = e.rect_list;
+    vo.points = e.points;
+    vo.vtx_point_size = e.vtx_point_size;
+    vo.vtx_layer = e.vtx_layer;
+    vo.map_hoist = e.vmap_hoist;
+    vo.linear_mask = e.vlinear_mask;
+    vo.linear_aligned = e.vlinear_aligned;
+    vo.vertex_attrs = e.vattrs;
+    vo.textures = e.vtypes;
+    fo.ps_input_cntl = e.ps_input_cntl;
+    fo.ps_input_addr = e.ps_input_addr;
+    fo.col_format = e.col_format;
+    fo.mrt_ufloat = e.mrt_ufloat;
+    fo.depth_target = e.depth_target;
+    fo.depth_bounds = e.depth_bounds;
+    fo.alpha_to_mask = e.alpha_to_mask;
+    fo.dual_source = e.dual_source;
+    fo.map_hoist = e.pmap_hoist;
+    fo.linear_mask = e.plinear_mask;
+    fo.linear_aligned = e.plinear_aligned;
+    for (u32 k = 0; k < 8; ++k) {
+      fo.mrt_type[k] = static_cast<Shader::OutType>(e.mrt_type[k]);
+    }
+    fo.textures = e.ptypes;
+  }
+  std::atomic<u32> prewarm_render_total{0}, prewarm_render_done{0}, prewarm_render_dropped{0};
+  const std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point prewarm_t0;
+  void RenderPrewarmStart(bool run) {
+    const std::string path = RenderPrewarmPath();
+    if (path.empty()) {
+      return;
+    }
+    std::ifstream f(path, std::ios::binary);
+    std::vector<RenderRecord> entries;
+    std::vector<char> buf;
+    u64 bytes = 0;
+    for (;;) {
+      u32 head[2];
+      if (!f.read(reinterpret_cast<char *>(head), 8) || head[0] != kRenderRecordMagic || head[1] > (8u << 20)) {
+        break;
+      }
+      buf.resize(head[1]);
+      if (!f.read(buf.data(), head[1])) {
+        break;
+      }
+      bytes += 8 + head[1];
+      RenderRecord e;
+      if (!ParseRenderRecord(buf.data(), buf.size(), e)) {
+        break;
+      }
+      if (render_known.insert(e.pkey).second) {
+        entries.push_back(std::move(e));
+      }
+    }
+    if (!run || std::getenv("DC_NO_RENDER_PREWARM")) {
+      DC_INFO("gpu: %zu render pipelines recorded, prewarm off", entries.size());
+      return;
+    }
+    prewarm_t0 = std::chrono::steady_clock::now();
+    prewarm_render_total = static_cast<u32>(entries.size());
+    DC_INFO("gpu: prewarming %zu render pipelines (%llu KB recorded)", entries.size(),
+            (unsigned long long)(bytes >> 10));
+    for (auto &e : entries) {
+      const u64 pkey = e.pkey;
+      pending.insert(pkey);
+      prewarm_queued.insert(pkey);
+      compiler->Submit([this, e = std::move(e)] { RenderPrewarmJob(e); }, /*urgent=*/false, pkey, /*background=*/true);
+    }
+  }
+  void RenderPrewarmJob(const RenderRecord &e) {
+    id<MTLRenderPipelineState> pso = nil;
+    auto finish = [&] {
+      {
+        std::scoped_lock lk(done_lock);
+        if (pso) {
+          done_render.emplace_back(e.pkey, pso);
+        } else {
+          done_failed.push_back(e.pkey); // the draw compiles it the old way
+        }
+      }
+      done_cv.notify_all();
+      if (!pso) {
+        ++prewarm_render_dropped;
+      }
+      if (++prewarm_render_done == prewarm_render_total) {
+        DC_INFO("gpu: render prewarm done: %u pipelines in %.1f s, %u dropped", prewarm_render_total.load(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - prewarm_t0).count(),
+                prewarm_render_dropped.load());
+      }
+    };
+    Shader::BuildInput vin{Stage::Vertex, e.vs_addr, e.vud.data(), e.vs_nus, e.vs_vcc, e.vs_code.data()};
+    vin.fetch_code = e.vs_fetch.empty() ? nullptr : e.vs_fetch.data();
+    auto vs = Shader::BuildProgram(vin);
+    std::unique_ptr<Program> ps;
+    if (e.has_ps) {
+      static const std::array<u32, 16> no_ud{};
+      Shader::BuildInput pin{Stage::Fragment, e.ps_addr, no_ud.data(), e.ps_nus, 0, e.ps_code.data()};
+      ps = Shader::BuildProgram(pin);
+    }
+    if (!vs || (e.has_ps && !ps)) {
+      finish();
+      return;
+    }
+    Shader::MslOptions vo, fo;
+    RecordOptions(e, vo, fo);
+    const u64 vs_key = VsKey(*vs, vo, nullptr, nullptr, e.state.layer_topology);
+    u64 ps_key = 0;
+    if (ps) {
+      PsOptionsInUse(*ps, fo);
+      fo.vs_param_mask = vs->param_mask;
+      ps_key = PsKey(*ps, fo);
+    }
+    if (RenderPipelineKey(e.state, vs_key, ps_key) != e.pkey) {
+      finish(); // the key's inputs changed meaning
+      return;
+    }
+    id<MTLFunction> vfn = compiler->Function(
+        vs_key, compiler->Has(vs_key) ? std::string() : Shader::GenerateMsl(*vs, vo, nullptr), e.vs_addr, true);
+    id<MTLFunction> ffn =
+        !ps ? nil
+            : compiler->Function(ps_key, compiler->Has(ps_key) ? std::string() : Shader::GenerateMsl(*ps, fo, nullptr),
+                                 e.ps_addr, true);
+    if (vfn && (!ps || ffn)) {
+      MTLRenderPipelineDescriptor *d = RenderDescriptor(e.state);
+      d.vertexFunction = vfn;
+      d.fragmentFunction = e.state.flat ? debug_fs : ffn;
+      NSError *err = nil;
+      pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+    }
+    finish();
   }
 
   void TakeCompiled() {
@@ -3124,8 +3587,12 @@ struct MetalRenderer::Impl {
       compute_pipelines[k] = pso;
       pending.erase(k);
     }
+    for (u64 k : done_failed) {
+      pending.erase(k);
+    }
     done_render.clear();
     done_compute.clear();
+    done_failed.clear();
   }
 
   // Blocks until the pipeline `key` has been compiled. A job still queued
@@ -3150,7 +3617,7 @@ struct MetalRenderer::Impl {
       {
         std::unique_lock lk(done_lock);
         done_cv.wait(
-            lk, [&] { return !done_render.empty() || !done_compute.empty(); });
+            lk, [&] { return !done_render.empty() || !done_compute.empty() || !done_failed.empty(); });
       }
       TakeCompiled();
     }
@@ -7041,21 +7508,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
     vo.vertex_attrs = draw_vattrs;
   }
-  u64 vs_key = Hash(vs->hash);
   if (fused_pending.on) { // the copy VS of a GS pipeline, ES and GS fused in
     vo.fused = fused_pending.fused;
-    vs_key = Hash(fused_pending.key, vs_key);
-  }
-  vs_key = Hash(vo.map_hoist, vs_key);
-  vs_key = Hash(vo.linear_mask, vs_key);
-  vs_key = Hash(vo.linear_aligned, vs_key);
-  for (const auto &a : vo.vertex_attrs) {
-    vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
-  }
-  vs_key = Hash(rect, vs_key);
-  if (tess_draw) {
-    vs_key = Fnv(&vo.tess, sizeof(vo.tess), vs_key);
-    vs_key = Hash(u64(tess_draw->partition) | u64(tess_draw->winding) << 8, vs_key);
   }
   // A layered pipeline states its topology class, so that goes in the key too.
   const MTLPrimitiveTopologyClass layer_topology =
@@ -7063,12 +7517,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       : prim == PrimType::LineList || prim == PrimType::LineStrip
           ? MTLPrimitiveTopologyClassLine
           : MTLPrimitiveTopologyClassTriangle;
-  vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1) |
-                    (u32(vo.vtx_layer) << 2) |
-                    (vo.vtx_layer ? u32(layer_topology) << 3 : 0),
-                vs_key);
-  vs_key = Hash(capture, vs_key);
-  vs_key = Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), vs_key);
+  const u64 tess_pw = tess_draw ? u64(tess_draw->partition) | u64(tess_draw->winding) << 8 : 0;
+  const u64 vs_key = VsKey(*vs, vo, fused_pending.on ? &fused_pending.key : nullptr,
+                           tess_draw ? &tess_pw : nullptr, u32(layer_topology));
   u64 ps_key = 0;
   Shader::MslOptions fo;
   if (ps) {
@@ -7087,22 +7538,6 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         fo.mrt_ufloat |= 1u << k;
       }
     }
-    // Only what the shader reads goes into its key: inputs and MRTs it does
-    // not use keep values from earlier draws, which made new keys (and
-    // pipeline compiles, during which draws are skipped) for the same shader.
-    for (u32 k = 0; k < 32; ++k) {
-      if (!((ps->attr_mask >> k) & 1)) {
-        fo.ps_input_cntl[k] = 0;
-      }
-    }
-    const u32 used_mrt = ps->mrt_mask | (dual_source ? 2u : 0u);
-    for (u32 k = 0; k < 8; ++k) {
-      if (!((used_mrt >> k) & 1)) {
-        fo.col_format &= ~(0xFu << (4 * k));
-        fo.mrt_type[k] = Shader::OutType::Float;
-        fo.mrt_ufloat &= ~(1u << k);
-      }
-    }
     fo.textures = ps_types; // borrowed, like vo.textures
     fo.depth_target = depth != nullptr;
     fo.depth_bounds = depth_bounds;
@@ -7114,44 +7549,37 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       fo.probe_x = probe.x;
       fo.probe_y = probe.y;
     }
-    ps_key = Hash(ps->hash);
-    ps_key = Hash(fo.probe_pc, ps_key);
-    ps_key = Hash(fo.depth_target, ps_key);
-    ps_key = Hash(fo.depth_bounds, ps_key);
-    ps_key = Hash(fo.alpha_to_mask, ps_key);
-    ps_key = Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), ps_key);
-    ps_key = Hash(fo.vs_param_mask, ps_key);
-    ps_key = Hash(fo.ps_input_addr, ps_key);
-    ps_key = Hash(fo.col_format, ps_key);
-    ps_key = Hash(fo.dual_source, ps_key);
-    ps_key = Hash(fo.map_hoist, ps_key);
-    ps_key = Hash(fo.linear_mask, ps_key);
-    ps_key = Hash(fo.linear_aligned, ps_key);
-    ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
-    ps_key = Hash(fo.mrt_ufloat, ps_key);
-    ps_key =
-        Fnv(ps_types.data(), ps_types.size() * sizeof(TextureType), ps_key);
+    PsOptionsInUse(*ps, fo);
+    ps_key = PsKey(*ps, fo);
   }
 
   // ---- pipeline ----
   DrawLap(5);
-  PipelineKey pk;
-  pk.vs = vlayout ? Hash(vlayout, vs_key) : vs_key; // formats and strides live in the pipeline
-  pk.ps = ps_key;
-  for (u32 k = 0; k < 8; ++k) {
-    pk.color_fmt[k] = static_cast<u32>(color_fmt[k]);
-    pk.blend[k] = colors[k] ? r[Reg::CB_BLEND0_CONTROL + k] : 0;
-  }
-  pk.write_mask = target_mask;
-  pk.shader_mask = r[Reg::CB_SHADER_MASK];
-  pk.depth_fmt = static_cast<u32>(depth_fmt);
   // DC_DEBUG_FLAT_RT=<addr>: magenta PS only for draws into that color target.
   static const u64 flat_rt =
       std::getenv("DC_DEBUG_FLAT_RT") ? std::strtoull(std::getenv("DC_DEBUG_FLAT_RT"), nullptr, 16) : 0;
   const bool flat_draw = debug_fs && (tess_flat ? tess_draw != nullptr
                                       : flat_rt ? (u64(r.ColorTarget(0, Reg::CB_BASE)) << 8) == flat_rt
                                                 : true);
-  const u64 pkey = flat_draw ? Hash(u64(0xF1A7), Hash(pk)) : Hash(pk);
+  static_assert(kMaxVertexBuffers <= 16);
+  RenderPipeState pstate;
+  pstate.nvbufs = nvbufs;
+  for (u32 k = 0; k < nvbufs; ++k) {
+    pstate.vbufs[k] = {static_cast<u32>(vbufs[k].format), vbufs[k].stride, vbufs[k].bytes};
+  }
+  for (u32 k = 0; k < 8; ++k) {
+    pstate.color_fmt[k] = static_cast<u32>(color_fmt[k]);
+    pstate.blend[k] = colors[k] ? r[Reg::CB_BLEND0_CONTROL + k] : 0;
+    pstate.colors |= colors[k] ? 1u << k : 0;
+    pstate.blendable |= out_type[k] == OutType::Float && color_fmt[k] != MTLPixelFormatRGBA32Float ? 1u << k : 0;
+  }
+  pstate.write_mask = target_mask;
+  pstate.shader_mask = r[Reg::CB_SHADER_MASK];
+  pstate.depth_fmt = static_cast<u32>(depth_fmt);
+  pstate.vtx_layer = vo.vtx_layer;
+  pstate.layer_topology = static_cast<u32>(layer_topology);
+  pstate.flat = flat_draw;
+  const u64 pkey = RenderPipelineKey(pstate, vs_key, ps_key);
   TakeCompiled();
   auto pit = pipelines.find(pkey);
   // A draw whose pipeline is not compiled yet is skipped, except:
@@ -7214,12 +7642,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       DC_INFO("gpu:   skipped: pipeline compiling (DC_FAKE_COMPILING)");
     return;
   }
-  if (pit == pipelines.end()) {
+  // A prewarm job that gave up on this key leaves it compiling nowhere: then
+  // it is compiled here the old way (second round).
+  for (int round = 0; pit == pipelines.end() && round < 2; ++round) {
     if (!pending.count(pkey)) {
-      MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-      if (vo.vtx_layer) {
-        d.inputPrimitiveTopology = layer_topology;
-      }
+      MTLRenderPipelineDescriptor *d = RenderDescriptor(pstate);
       if (tess_draw) {
         d.tessellationPartitionMode = tess_draw->partition;
         d.maxTessellationFactor = 64;
@@ -7228,65 +7655,6 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
         d.tessellationOutputWindingOrder = tess_draw->winding;
         d.tessellationFactorScaleEnabled = NO;
-      }
-      if (nvbufs) {
-        MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-        for (u32 k = 0; k < nvbufs; ++k) {
-          const VertexBuffer &vb = vbufs[k];
-          vd.attributes[k].format = vb.format;
-          vd.attributes[k].offset = 0;
-          vd.attributes[k].bufferIndex = kVertexBufferBase + k;
-          MTLVertexBufferLayoutDescriptor *l = vd.layouts[kVertexBufferBase + k];
-          l.stride = vb.stride ? vb.stride : (vb.bytes + 3) & ~3u;
-          l.stepFunction = vb.stride ? MTLVertexStepFunctionPerVertex
-                                     : MTLVertexStepFunctionConstant;
-          l.stepRate = vb.stride ? 1 : 0;
-        }
-        d.vertexDescriptor = vd;
-      }
-      for (u32 k = 0; k < 8; ++k) {
-        if (!colors[k]) {
-          continue;
-        }
-        MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[k];
-        ca.pixelFormat = color_fmt[k];
-        const u32 b = pk.blend[k];
-        const u32 wm = (target_mask >> (4 * k)) & 0xF;
-        ca.writeMask = ((wm & 1) ? MTLColorWriteMaskRed : 0) |
-                       ((wm & 2) ? MTLColorWriteMaskGreen : 0) |
-                       ((wm & 4) ? MTLColorWriteMaskBlue : 0) |
-                       ((wm & 8) ? MTLColorWriteMaskAlpha : 0);
-        const bool blendable = out_type[k] == OutType::Float &&
-                               color_fmt[k] != MTLPixelFormatRGBA32Float;
-        // CB_SHADER_MASK without alpha: the hardware blends with source alpha 1
-        // (shadPS4 swaps SrcAlpha factors for One/Zero).
-        const bool alpha_masked =
-            !((r[Reg::CB_SHADER_MASK] >> (4 * k + 3)) & 1);
-        if ((b >> 30) & 1 && blendable && !flat_draw) {
-          ca.blendingEnabled = YES;
-          auto fixa = [&](u32 f) {
-            return !alpha_masked ? BlendFactor(f)
-                   : f == 4      ? MTLBlendFactorOne
-                   : f == 5      ? MTLBlendFactorZero
-                                 : BlendFactor(f);
-          };
-          ca.sourceRGBBlendFactor = fixa(b & 0x1F);
-          ca.rgbBlendOperation = BlendOp((b >> 5) & 7);
-          ca.destinationRGBBlendFactor = fixa((b >> 8) & 0x1F);
-          if ((b >> 29) & 1) {
-            ca.sourceAlphaBlendFactor = BlendFactor((b >> 16) & 0x1F);
-            ca.alphaBlendOperation = BlendOp((b >> 21) & 7);
-            ca.destinationAlphaBlendFactor = BlendFactor((b >> 24) & 0x1F);
-          } else {
-            ca.sourceAlphaBlendFactor = ca.sourceRGBBlendFactor;
-            ca.alphaBlendOperation = ca.rgbBlendOperation;
-            ca.destinationAlphaBlendFactor = ca.destinationRGBBlendFactor;
-          }
-        }
-      }
-      d.depthAttachmentPixelFormat = depth_fmt;
-      if (depth_fmt == MTLPixelFormatDepth32Float_Stencil8) {
-        d.stencilAttachmentPixelFormat = depth_fmt;
       }
       pending.insert(pkey);
       ++stat_pipe_miss;
@@ -7306,8 +7674,55 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       const bool has_ps = ps != nullptr;
       const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
       const bool will_wait = must_run;
+      // For the next launch's prewarm (RenderPrewarmStart): ordinary draws.
+      RenderRecord rec;
+      if (!tess_draw && !fused_pending.on && !capture && probe_slot < 0 && !flat_draw) {
+        rec.pkey = pkey;
+        rec.vs_addr = vs_addr;
+        rec.vs_nus = Bits(r[Reg::SPI_SHADER_PGM_RSRC2_VS], 1, 5);
+        rec.vs_vcc = Bits(r[Reg::SPI_SHADER_PGM_RSRC1_VS], 24, 2);
+        std::copy(vs_ud, vs_ud + 16, rec.vud.begin());
+        rec.vs_code = GuestCode(vs_addr);
+        if (vs->fetch_address && vs->fetch_bytes) {
+          rec.vs_fetch = GuestCode(vs->fetch_address, vs->fetch_bytes);
+        }
+        rec.rect_list = vo.rect_list;
+        rec.points = vo.points;
+        rec.vtx_point_size = vo.vtx_point_size;
+        rec.vtx_layer = vo.vtx_layer;
+        rec.vmap_hoist = vo.map_hoist;
+        rec.vlinear_mask = vo.linear_mask;
+        rec.vlinear_aligned = vo.linear_aligned;
+        rec.vattrs.assign(vo.vertex_attrs.begin(), vo.vertex_attrs.end());
+        rec.vtypes.assign(vs_types.begin(), vs_types.end());
+        if (ps) {
+          rec.has_ps = 1;
+          rec.ps_addr = ps_addr;
+          rec.ps_nus = Bits(r[Reg::SPI_SHADER_PGM_RSRC2_PS], 1, 5);
+          rec.ps_code = GuestCode(ps_addr);
+          // As the draw set them before PsOptionsInUse.
+          for (u32 k = 0; k < 32; ++k) {
+            rec.ps_input_cntl[k] = r[Reg::SPI_PS_INPUT_CNTL_0 + k];
+          }
+          rec.col_format = col_format;
+          for (u32 k = 0; k < 8; ++k) {
+            rec.mrt_type[k] = static_cast<u8>(out_type[k]);
+            rec.mrt_ufloat |= color_fmt[k] == MTLPixelFormatRG11B10Float ? 1u << k : 0;
+          }
+          rec.ps_input_addr = fo.ps_input_addr;
+          rec.depth_target = fo.depth_target;
+          rec.depth_bounds = fo.depth_bounds;
+          rec.alpha_to_mask = fo.alpha_to_mask;
+          rec.dual_source = fo.dual_source;
+          rec.pmap_hoist = fo.map_hoist;
+          rec.plinear_mask = fo.linear_mask;
+          rec.plinear_aligned = fo.linear_aligned;
+          rec.ptypes.assign(ps_types.begin(), ps_types.end());
+        }
+        rec.state = pstate;
+      }
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
-                        vs_key, ps_key, pkey, flat, vs_addr, ps_addr, has_ps] {
+                        vs_key, ps_key, pkey, flat, vs_addr, ps_addr, has_ps, rec = std::move(rec)] {
         id<MTLRenderPipelineState> pso = nil;
         id<MTLFunction> vfn = compiler->Function(vs_key, vsrc, vs_addr);
         id<MTLFunction> ffn =
@@ -7324,6 +7739,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
                      err ? err.localizedDescription.UTF8String : "?");
           }
         }
+        if (pso && rec.pkey) {
+          RenderPrewarmRecord(rec);
+        }
         {
           std::scoped_lock lk(done_lock);
           done_render.emplace_back(pkey, pso);
@@ -7332,7 +7750,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }, will_wait, pkey);
     }
     if (!must_run) {
-      compiler->Touch(pkey);
+      // A prewarm job not reached yet: the urgent worker takes it next.
+      static const bool no_promote = std::getenv("DC_PREWARM_NO_PROMOTE") != nullptr;
+      if (!no_promote && prewarm_queued.erase(pkey)) {
+        compiler->Promote(pkey);
+        ++stat_prewarm_promoted;
+      } else {
+        compiler->Touch(pkey);
+      }
       ++stat_skip[skip_class];
       ++frame_skip[skip_class];
       ++frame_skips;
@@ -7361,6 +7786,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }
     }
     pit = pipelines.find(pkey);
+  }
+  if (pit == pipelines.end()) {
+    return;
   }
   id<MTLRenderPipelineState> pso = pit->second;
   if (!pso) {
@@ -8577,8 +9005,12 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     } else if (const double dt = std::chrono::duration<double>(now - perf_t0).count(); dt >= 10.0) {
       const u64 frames = perf_frames - 1;
       const double gpu_s = perf_gpu_ns.exchange(0) / 1e9;
-      DC_INFO("perf: %.1f fps, gpu %.1f ms/frame (busy %.0f%%), %zu pipelines compiling",
-              frames / dt, gpu_s * 1e3 / frames, gpu_s / dt * 100, pending.size());
+      DC_INFO("perf: %.1f fps, gpu %.1f ms/frame (busy %.0f%%), %zu pipelines compiling, %zu render pipelines, "
+              "prewarm %u/%u (%u dropped, %llu promoted), t=%.0f s",
+              frames / dt, gpu_s * 1e3 / frames, gpu_s / dt * 100, pending.size(), pipelines.size(),
+              prewarm_render_done.load(), prewarm_render_total.load(), prewarm_render_dropped.load(),
+              (unsigned long long)stat_prewarm_promoted,
+              std::chrono::duration<double>(now - start_time).count());
       DC_INFO("perf: skipped draws (pipeline compiling) %llu: depth-only %llu, color+depth %llu, "
               "color %llu, memory %llu; max %llu in a frame, %llu frames held; waits: compute %llu/%llu ms, "
               "draw %llu/%llu ms, depth-only %llu/%llu ms, gs/tess %llu/%llu ms, %llu compiled inline, "

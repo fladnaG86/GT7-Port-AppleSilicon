@@ -1,6 +1,7 @@
 #include "gpu/metal/mtl_compiler.h"
 
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
@@ -32,13 +33,13 @@ ShaderCompiler::~ShaderCompiler() {
     }
 }
 
-void ShaderCompiler::Submit(std::function<void()> job, bool urgent, u64 key) {
+void ShaderCompiler::Submit(std::function<void()> job, bool urgent, u64 key, bool background) {
     // DC_NO_URGENT_SHADERS: one FIFO queue for everything (A/B).
     static const bool no_urgent = std::getenv("DC_NO_URGENT_SHADERS") != nullptr;
     urgent = urgent && !no_urgent;
     {
         std::scoped_lock lk(lock);
-        (urgent ? urgent_jobs : jobs).push_back(Job{key, ++next_stamp, std::move(job)});
+        (urgent ? urgent_jobs : jobs).push_back(Job{key, ++next_stamp, std::move(job), background});
         if (key && !urgent) {
             touched[key] = next_stamp;
         }
@@ -56,6 +57,24 @@ void ShaderCompiler::Touch(u64 key) {
     if (auto it = touched.find(key); it != touched.end()) {
         it->second = ++next_stamp;
     }
+}
+
+bool ShaderCompiler::Promote(u64 key) {
+    if (!key) {
+        return false;
+    }
+    {
+        std::scoped_lock lk(lock);
+        auto it = std::find_if(jobs.begin(), jobs.end(), [&](const Job& j) { return j.key == key; });
+        if (it == jobs.end()) {
+            return false;
+        }
+        urgent_jobs.push_back(std::move(*it));
+        jobs.erase(it);
+        touched.erase(key);
+    }
+    cv.notify_all();
+    return true;
 }
 
 bool ShaderCompiler::RunNow(u64 key) {
@@ -122,8 +141,13 @@ size_t ShaderCompiler::Queued() {
 void ShaderCompiler::Worker(bool urgent_only) {
     pthread_setname_np(urgent_only ? "GPU shader compiler (urgent)" : "GPU shader compiler");
     static const bool fifo = std::getenv("DC_COMPILE_FIFO") != nullptr;
+    static const bool qos_off = [] {
+        const char* q = std::getenv("DC_PREWARM_QOS");
+        return q && std::strcmp(q, "default") == 0;
+    }();
     while (true) {
         std::function<void()> job;
+        bool background = false;
         {
             std::unique_lock lk(lock);
             cv.wait(lk, [&] {
@@ -152,12 +176,19 @@ void ShaderCompiler::Worker(bool urgent_only) {
                 if (best->key) {
                     touched.erase(best->key);
                 }
+                background = best->background && !qos_off;
                 job = std::move(best->fn);
                 jobs.erase(best);
             }
         }
+        if (background) {
+            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        }
         @autoreleasepool {
             job();
+        }
+        if (background) {
+            pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0);
         }
     }
 }
@@ -167,7 +198,7 @@ bool ShaderCompiler::Has(u64 key) {
     return functions.count(key) != 0;
 }
 
-id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 address) {
+id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 address, bool prewarm) {
     {
         std::scoped_lock lk(fn_lock);
         if (auto it = functions.find(key); it != functions.end()) {
@@ -199,7 +230,7 @@ id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 ad
     // key replay off.
     static const char* salt_env = std::getenv("DC_MSL_SALT");
     static const bool salt_early = std::getenv("DC_MSL_SALT_EARLY") != nullptr;
-    const char* salt = salt_env && (salt_early || g_course_loaded.load(std::memory_order_relaxed)) ? salt_env
+    const char* salt = salt_env && (prewarm || salt_early || g_course_loaded.load(std::memory_order_relaxed)) ? salt_env
                                                                                                   : nullptr;
     const std::string salted = salt ? "// " + std::string(salt) + "\n" + src : std::string();
     const auto t0 = std::chrono::steady_clock::now();

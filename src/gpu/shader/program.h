@@ -163,6 +163,9 @@ struct BuildInput {
     u32 vgpr_comp_cnt;
     const u32* code = nullptr; // tools: decode from here instead of guest memory
     u32 compute_rsrc2 = 0;
+    // The fetch subroutine's code (prewarm: saved bytes) instead of guest
+    // memory at the address in user data.
+    const u32* fetch_code = nullptr;
 };
 
 // Decodes and analyzes a program. Returns null if the code is unreadable.

@@ -28,8 +28,9 @@ public:
     ~ShaderCompiler();
 
     // The "main0" function of MSL `src`, cached by `key`; nil if it does not
-    // compile. Thread-safe.
-    id<MTLFunction> Function(u64 key, const std::string& src, u64 address);
+    // compile. Thread-safe. `prewarm`: a pipeline prewarm compile, which
+    // DC_MSL_SALT salts at any time (it stands for a cold first run).
+    id<MTLFunction> Function(u64 key, const std::string& src, u64 address, bool prewarm = false);
 
     // Whether Function(key, ...) is already cached (it then ignores `src`).
     // Entries are never removed, so a true answer stays true.
@@ -39,12 +40,19 @@ public:
     // wait for them) go before every queued normal job, and one worker serves
     // only them, so they never sit behind long pipeline compiles. `key`
     // (0: none) names the job for Touch and RunNow.
-    void Submit(std::function<void()> job, bool urgent = false, u64 key = 0);
+    // `background` (prewarm): a normal worker runs it at utility QoS
+    // (DC_PREWARM_QOS=default: off), so it yields the cores to the game.
+    void Submit(std::function<void()> job, bool urgent = false, u64 key = 0, bool background = false);
 
     // A queued job `key` is wanted again (its draw was skipped once more):
     // normal jobs run most recently wanted first, so what is on screen now
     // compiles before what was on screen long ago. DC_COMPILE_FIFO=1: FIFO.
     void Touch(u64 key);
+
+    // Moves queued normal job `key` to the urgent queue (a prewarm job that a
+    // draw now needs: the urgent worker takes it next instead of it waiting
+    // behind long background compiles). False if it is not queued.
+    bool Promote(u64 key);
 
     // Takes job `key` out of the queues and runs it on the calling thread;
     // false if it is not queued (done, running, or never submitted). The
@@ -65,6 +73,7 @@ private:
         u64 key = 0;
         u64 stamp = 0; // Touch: newest first
         std::function<void()> fn;
+        bool background = false;
     };
     void Worker(bool urgent_only);
 
