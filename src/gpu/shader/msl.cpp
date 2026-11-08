@@ -300,28 +300,53 @@ private:
     // "no lane has the bit" for S_CBRANCH_EXECZ/VCCZ: wave-uniform in compute
     // programs that read other lanes (dc_wave_zero in the prelude), this
     // lane's bit elsewhere (cheaper, and what every shader ran with so far).
-    // DC_WAVE_EXECZ=1 opts in: with it GT7 stalled on the boot logo 2 runs of
-    // 3 and Driveclub's race lost ~12% GPU time (2026-11-05), while the GDS
-    // fix alone already lit the cockpit; kept for the Hi-Z vote sums (ryGT7
-    // FIX-190) once the stall is understood.
     std::string WaveZero(const std::string& mask) {
-        // DC_WAVE_EXECZ_AT=<hex>[,<hex>...]: only these compute programs.
-        static const bool all_in = std::getenv("DC_WAVE_EXECZ") != nullptr;
-        static const std::vector<u64> only_at = [] {
-            std::vector<u64> v;
-            if (const char* e = std::getenv("DC_WAVE_EXECZ_AT")) {
-                for (char* q = const_cast<char*>(e); *q;) {
-                    v.push_back(std::strtoull(q, &q, 16));
-                    if (*q == ',') ++q; else break;
-                }
-            }
-            return v;
-        }();
-        const bool opt_in = all_in || std::find(only_at.begin(), only_at.end(), p.address) != only_at.end();
-        if (opt_in && p.stage == Stage::Compute && o.tess.stage == TessStage::None && p.cross_lane && WaveOn("execz")) {
+        if (WaveUniformBranches()) {
             return "dc_wave_zero(" + mask + ", dc_wz, dc_lidx, dc_tpg, dc_zg)";
         }
         return mask + " == 0u";
+    }
+    // Which programs branch wave-uniformly. A lane whose EXEC bit is clear then
+    // runs into the branch's fall-through block, so Program::lane_on (which
+    // assumes such lanes jumped away) does not hold there and every lane write
+    // keeps its guard (DC_WAVE_LANE_ON=1: old, unguarded -- which is what made
+    // DC_WAVE_EXECZ look broken before: lanes outside EXEC wrote their results).
+    // Default: GT7's two GPU occlusion tests, cs 0x9000f73800 (per object) and
+    // 0x9000f73e00 (second pass over the undecided ones). Each lane tests one
+    // Hi-Z cell of the object's rectangle; the votes are summed over the wave
+    // with ds_swizzle + v_readlane 31/63 after s_orn2_saveexec turned every
+    // lane on, inside an s_cbranch_execz the lanes past the cell count took.
+    // Branching per lane, those lanes left, the shuffles and the lane-63 slot
+    // read them anyway (undefined values), and the CPU, which builds the next
+    // frame's draws from these results, dropped objects on random frames:
+    // power-line spans flickered and ended mid-air (ryGT7 FIX-190).
+    // DC_WAVE_EXECZ_AT=<hex>[,<hex>...] replaces the list (0: none);
+    // DC_WAVE_EXECZ=1: every compute program that reads other lanes.
+    bool WaveUniformBranches() {
+        if (wave_uniform < 0) {
+            wave_uniform = ComputeWaveUniform() ? 1 : 0;
+        }
+        return wave_uniform != 0;
+    }
+    int wave_uniform = -1;
+    bool ComputeWaveUniform() const {
+        static const bool all_in = std::getenv("DC_WAVE_EXECZ") != nullptr;
+        static const std::vector<u64> only_at = [] {
+            const char* e = std::getenv("DC_WAVE_EXECZ_AT");
+            std::vector<u64> v;
+            for (const char* q = e ? e : "9000f73800,9000f73e00"; *q;) {
+                char* end = nullptr;
+                const u64 a = std::strtoull(q, &end, 16);
+                if (end == q) break;
+                v.push_back(a);
+                q = *end == ',' ? end + 1 : end;
+            }
+            return v;
+        }();
+        if (p.stage != Stage::Compute || o.tess.stage != TessStage::None || !p.cross_lane || !WaveOn("execz")) {
+            return false;
+        }
+        return all_in || std::find(only_at.begin(), only_at.end(), p.address) != only_at.end();
     }
     void End() {
         if (p.stage == Stage::Fragment) {
@@ -473,7 +498,9 @@ void Emitter::Emit(const Inst& i) {
     // Where the lane is surely on (see LaneOn) the guards are dead weight that
     // makes the Metal compiler take seconds on big shaders.
     const size_t index = static_cast<size_t>(&i - p.code.data());
-    guard = p.writes_exec && !(index < p.lane_on.size() && p.lane_on[index]);
+    static const bool lane_on_wave = std::getenv("DC_WAVE_LANE_ON") != nullptr; // old: trust lane_on there too
+    guard = p.writes_exec && !(index < p.lane_on.size() && p.lane_on[index] &&
+                               (lane_on_wave || !WaveUniformBranches()));
     if (i.pc == o.probe_pc && p.stage != Stage::Vertex) {
         body += "    /*DC_PROBE*/\n";
     }
