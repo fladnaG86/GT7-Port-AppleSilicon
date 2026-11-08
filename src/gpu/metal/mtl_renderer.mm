@@ -1623,6 +1623,7 @@ struct MetalRenderer::Impl {
   // stencil only, [1] color + depth/stencil, [2] color only, [3] storing to
   // memory. Logged with "perf:"; frame_skips feeds DC_HOLD_SKIPPED.
   u64 stat_skip[4] = {}, frame_skips = 0, stat_skip_max = 0, stat_held = 0, frame_skip[4] = {};
+  u64 stat_eq_wait = 0; // z-EQUAL draws that waited for their pipeline (DC_WAIT_EQUAL)
   u32 held_run = 0;
   // DC_GPU_STATS: draws that reopened a pass over the same attachments:
   // [0] pending clear, [1] it samples an attachment (by pixel shader).
@@ -7148,6 +7149,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   //   stencil; =0: those are skipped too;
   // - DC_WAIT_MEM=1 (default): draws whose shaders store to memory (later
   //   work reads it); =0 skips them.
+  // - DC_WAIT_EQUAL=1 (default): draws testing depth EQUAL. They shade what a
+  //   depth prepass laid down, and that prepass waited (DC_WAIT_DEPTH), so
+  //   skipping the EQUAL draw leaves a hole the shape of the prepass: GT7's
+  //   trees came out as clouds of dark alpha-tested leaf fragments with no
+  //   trunk or crown while their colour pipelines compiled. =0 skips them.
   static const int wait_depth = [] {
     const char *e = std::getenv("DC_WAIT_DEPTH");
     return e ? std::atoi(e) : 1;
@@ -7156,14 +7162,42 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     const char *e = std::getenv("DC_WAIT_MEM");
     return e ? std::atoi(e) != 0 : true;
   }();
+  static const bool wait_equal = [] {
+    const char *e = std::getenv("DC_WAIT_EQUAL");
+    return e ? std::atoi(e) != 0 : true;
+  }();
+  const bool z_equal = depth && ((db_control >> 1) & 1) && ((db_control >> 4) & 7) == 2;
   const bool depth_out = depth && ((((db_control >> 1) & 1) && ((db_control >> 2) & 1)) ||
                                    (stencil_valid && (db_control & 1)));
   const bool mem_out = (vs && vs->writes_memory) || (ps && ps->writes_memory);
-  const bool must_run =
-      sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) || probe_slot >= 0 ||
-      fused_pending.on || capture || (depth_out && (wait_depth >= 2 || (wait_depth == 1 && !any_color))) ||
-      (mem_out && wait_mem);
+  const bool rule_wait = (depth_out && (wait_depth >= 2 || (wait_depth == 1 && !any_color))) ||
+                         (mem_out && wait_mem) || (z_equal && wait_equal);
+  const bool must_run = sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) || probe_slot >= 0 ||
+                        fused_pending.on || capture || rule_wait;
   const u32 skip_class = mem_out ? 3 : depth_out ? (any_color ? 1 : 0) : 2;
+  // DC_FAKE_COMPILING=<hex ps>,...: (test) draws of these pixel shaders act as
+  // if their pipeline were still compiling: skipped unless one of the wait
+  // rules above applies (DC_SYNC_SHADERS does not count, so a replay can run
+  // everything else synchronously). Reproduces a cold-cache frame.
+  static const std::vector<u64> fake_compiling = [] {
+    std::vector<u64> v;
+    for (const char *p = std::getenv("DC_FAKE_COMPILING"); p && *p;) {
+      char *q = nullptr;
+      v.push_back(std::strtoull(p, &q, 16));
+      if (q == p) break;
+      p = *q == ',' ? q + 1 : q;
+    }
+    return v;
+  }();
+  if (!fake_compiling.empty() && !rule_wait && probe_slot < 0 && !fused_pending.on && !capture &&
+      std::find(fake_compiling.begin(), fake_compiling.end(), ps_addr) != fake_compiling.end()) {
+    ++stat_skip[skip_class];
+    ++frame_skip[skip_class];
+    ++frame_skips;
+    if (trace)
+      DC_INFO("gpu:   skipped: pipeline compiling (DC_FAKE_COMPILING)");
+    return;
+  }
   if (pit == pipelines.end()) {
     if (!pending.count(pkey)) {
       MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -7291,13 +7325,15 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       return;
     }
     {
+      if (z_equal && wait_equal)
+        ++stat_eq_wait;
       const auto w0 = std::chrono::steady_clock::now();
       WaitCompiled(pkey, depth_out && !any_color ? kWaitDepth : kWaitDraw);
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
       if (ms > 100) {
-        DC_INFO("gpu:   (that wait: draw vs %#llx ps %#llx, %s%s%s%s)", (unsigned long long)vs_addr,
-                (unsigned long long)ps_addr, depth_out ? "writes depth " : "", any_color ? "color " : "",
-                mem_out ? "stores to memory " : "", fused_pending.on ? "fused gs" : "");
+        DC_INFO("gpu:   (that wait: draw vs %#llx ps %#llx, %s%s%s%s%s)", (unsigned long long)vs_addr,
+                (unsigned long long)ps_addr, depth_out ? "writes depth " : "", z_equal ? "z-equal " : "",
+                any_color ? "color " : "", mem_out ? "stores to memory " : "", fused_pending.on ? "fused gs" : "");
       }
     }
     pit = pipelines.find(pkey);
@@ -8521,7 +8557,8 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
               frames / dt, gpu_s * 1e3 / frames, gpu_s / dt * 100, pending.size());
       DC_INFO("perf: skipped draws (pipeline compiling) %llu: depth-only %llu, color+depth %llu, "
               "color %llu, memory %llu; max %llu in a frame, %llu frames held; waits: compute %llu/%llu ms, "
-              "draw %llu/%llu ms, depth-only %llu/%llu ms, gs/tess %llu/%llu ms, %llu compiled inline",
+              "draw %llu/%llu ms, depth-only %llu/%llu ms, gs/tess %llu/%llu ms, %llu compiled inline, "
+              "%llu z-equal draws waited",
               (unsigned long long)(stat_skip[0] + stat_skip[1] + stat_skip[2] + stat_skip[3]),
               (unsigned long long)stat_skip[0], (unsigned long long)stat_skip[1],
               (unsigned long long)stat_skip[2], (unsigned long long)stat_skip[3],
@@ -8530,11 +8567,11 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
               (unsigned long long)stat_wait_n[1], (unsigned long long)stat_wait_ms[1],
               (unsigned long long)stat_wait_n[2], (unsigned long long)stat_wait_ms[2],
               (unsigned long long)stat_wait_n[3], (unsigned long long)stat_wait_ms[3],
-              (unsigned long long)stat_wait_inline);
+              (unsigned long long)stat_wait_inline, (unsigned long long)stat_eq_wait);
       std::fill(std::begin(stat_skip), std::end(stat_skip), 0);
       std::fill(std::begin(stat_wait_n), std::end(stat_wait_n), 0);
       std::fill(std::begin(stat_wait_ms), std::end(stat_wait_ms), 0);
-      stat_skip_max = stat_held = stat_wait_inline = 0;
+      stat_skip_max = stat_held = stat_wait_inline = stat_eq_wait = 0;
       LogMemory();
       perf_frames = 1;
       perf_t0 = now;
