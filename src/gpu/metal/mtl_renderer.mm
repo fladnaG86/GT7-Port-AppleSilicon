@@ -250,6 +250,19 @@ struct PipelineKey {
   u32 write_mask = 0;
   u32 depth_fmt = 0;
   u32 shader_mask = 0;
+  // Hashed as raw bytes: the tail padding was never written, so one draw
+  // state gave a new key (and a pipeline compile, skipped draws) at random.
+  u32 pad = 0;
+};
+static_assert(std::has_unique_object_representations_v<PipelineKey>, "PipelineKey is hashed raw: no padding");
+
+// One render pipeline of a variant family (see CompatibleVariant): what it
+// assumes beyond the family key.
+struct Variant {
+  u64 pkey = 0;
+  u32 vs_linear = 0, vs_aligned = 0; // MslOptions::linear_mask / linear_aligned
+  u32 ps_linear = 0, ps_aligned = 0;
+  u64 vfetch = 0; // Metal vertex fetch (attributes + layout), 0 = fetch in the shader
 };
 
 constexpr const char *kCopyShader = R"(
@@ -539,6 +552,68 @@ struct MetalRenderer::Impl {
   };
   std::unordered_map<u64, std::vector<ShaderEntry>> shaders;
   std::unordered_map<u64, id<MTLRenderPipelineState>> pipelines;
+  // Render pipelines by variant family: the same shaders and fixed-function
+  // state, built for other linear bases (where the draw's constant and vertex
+  // buffers landed in memory) or another vertex fetch.
+  std::unordered_map<u64, std::vector<Variant>> variant_families;
+  std::unordered_map<u64, u64> variant_family_of; // render pipeline key -> its family key
+  u64 stat_variant_used = 0; // draws drawn with a compatible variant (perf line)
+
+  // A built pipeline of family `fam` that renders `want`'s draw the same way,
+  // while `want` itself compiles: every linear base it assumes is one for
+  // the draw too (a base left out walks the page table, which is always
+  // right; one too many would read through a wrong range), its aligned bases
+  // likewise, and it fetches vertices as `want` does or in the shader. The
+  // one with the most linear bases wins. DC_VARIANT_FALLBACK=0: none (skip or
+  // wait as before), =1 (default): same vertex fetch only, =2: also shader
+  // fetch for a Metal-fetch draw (NOT identical: the race6001 replay differs
+  // in ~30% of pixels, cockpit), =3 (test): like 1, but the variant with the
+  // fewest linear bases is taken even when the draw's own pipeline is built,
+  // also under DC_SYNC_SHADERS (pixel diff against a DC_SYNC_SHADERS run).
+  // A variant is the same computation, but compiled from other MSL under
+  // relaxed math (DC_MATH_MODE) its results can differ in the last bits
+  // (race6001, DC_NO_LINEAR: ~0.5% of pixels by 1-2 levels, edges): draws
+  // that must match a prepass's depth exactly never take one (exact_depth).
+  int VariantMode() const {
+    static const int mode = [] {
+      const char *e = std::getenv("DC_VARIANT_FALLBACK");
+      return e ? std::atoi(e) : 1;
+    }();
+    return mode;
+  }
+  const Variant *CompatibleVariant(u64 fam, const Variant &want) {
+    const int mode = VariantMode();
+    if (!mode) {
+      return nullptr;
+    }
+    auto it = variant_families.find(fam);
+    if (it == variant_families.end()) {
+      return nullptr;
+    }
+    const Variant *best = nullptr;
+    int best_score = -1;
+    for (const Variant &v : it->second) {
+      if (v.pkey == want.pkey || (v.vs_linear & ~want.vs_linear) || (v.vs_aligned & ~want.vs_aligned) ||
+          (v.ps_linear & ~want.ps_linear) || (v.ps_aligned & ~want.ps_aligned) ||
+          (v.vfetch != want.vfetch && (v.vfetch || mode != 2))) {
+        continue;
+      }
+      auto pit = pipelines.find(v.pkey);
+      if (pit == pipelines.end() || !pit->second) {
+        continue;
+      }
+      int score = std::popcount(v.vs_linear) + std::popcount(v.ps_linear) + std::popcount(v.vs_aligned) +
+                  std::popcount(v.ps_aligned) + (v.vfetch ? 64 : 0);
+      if (mode == 3) {
+        score = 1000 - score;
+      }
+      if (score > best_score) {
+        best = &v;
+        best_score = score;
+      }
+    }
+    return best;
+  }
 
   // Pipelines compile on `compiler`'s threads; draws whose pipeline is not
   // ready yet are skipped (DC_SYNC_SHADERS waits instead), dispatches wait.
@@ -7610,8 +7685,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
           ? MTLPrimitiveTopologyClassLine
           : MTLPrimitiveTopologyClassTriangle;
   const u64 tess_pw = tess_draw ? u64(tess_draw->partition) | u64(tess_draw->winding) << 8 : 0;
-  const u64 vs_key = VsKey(*vs, vo, fused_pending.on ? &fused_pending.key : nullptr,
-                           tess_draw ? &tess_pw : nullptr, u32(layer_topology));
+  // The vertex key from the draw's options; its variant family (see
+  // CompatibleVariant) is the same key with no linear base and no Metal
+  // vertex attributes.
+  auto vs_key_of = [&](const Shader::MslOptions &o) {
+    return VsKey(*vs, o, fused_pending.on ? &fused_pending.key : nullptr, tess_draw ? &tess_pw : nullptr,
+                 u32(layer_topology));
+  };
+  const u64 vs_key = vs_key_of(vo);
   u64 ps_key = 0;
   Shader::MslOptions fo;
   if (ps) {
@@ -7672,6 +7753,32 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   pstate.layer_topology = static_cast<u32>(layer_topology);
   pstate.flat = flat_draw;
   const u64 pkey = RenderPipelineKey(pstate, vs_key, ps_key);
+  // The pipeline's variant family: its key with no linear base and shader
+  // vertex fetch (CompatibleVariant), from the same VsKey/PsKey/
+  // RenderPipelineKey recipe as `pkey`. Only computed when needed.
+  auto family_key = [&] {
+    Shader::MslOptions fv = vo;
+    fv.linear_mask = fv.linear_aligned = 0;
+    fv.vertex_attrs = {};
+    u64 fps = 0;
+    if (ps) {
+      Shader::MslOptions ff = fo;
+      ff.linear_mask = ff.linear_aligned = 0;
+      fps = PsKey(*ps, ff);
+    }
+    RenderPipeState fs = pstate;
+    fs.nvbufs = 0;
+    return RenderPipelineKey(fs, vs_key_of(fv), fps);
+  };
+  // What this draw's pipeline assumes beyond its family.
+  u64 vfetch = 0; // Metal vertex fetch: attributes and layout (0 = all in the shader)
+  if (nvbufs) {
+    vfetch = Hash(vlayout);
+    for (const auto &a : vo.vertex_attrs) {
+      vfetch = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vfetch);
+    }
+  }
+  const Variant vwant{pkey, vo.linear_mask, vo.linear_aligned, fo.linear_mask, fo.linear_aligned, vfetch};
   TakeCompiled();
   auto pit = pipelines.find(pkey);
   // A draw whose pipeline is not compiled yet is skipped, except:
@@ -7734,6 +7841,44 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       DC_INFO("gpu:   skipped: pipeline compiling (DC_FAKE_COMPILING)");
     return;
   }
+  // A compatible variant of the pipeline already built draws this one while
+  // it compiles (CompatibleVariant): no skip, no wait; the exact pipeline
+  // compiles on (its prewarm job promoted or touched as for a skip). Not for
+  // draws that must use their own pipeline (DC_SYNC_SHADERS reference runs,
+  // probes, captures).
+  std::optional<Variant> fallback; // a copy: the family vector may grow
+  // Draws that need their depth bit-equal to an earlier draw's: z EQUAL, or
+  // LEQUAL/GEQUAL without depth writes (shading over a prepass).
+  const u32 zfunc = (db_control >> 4) & 7;
+  const bool exact_depth = depth && ((db_control >> 1) & 1) &&
+                           (zfunc == 2 || (!((db_control >> 2) & 1) && (zfunc == 3 || zfunc == 6)));
+  const bool variant_ok = probe_slot < 0 && !capture && !exact_depth;
+  // Every pipeline key a draw meets joins its family once, whoever builds it
+  // (this draw, a prewarm job): CompatibleVariant takes only built ones.
+  u64 fam = 0;
+  bool has_fam = false;
+  if (VariantMode() && probe_slot < 0 && !capture) {
+    auto [fit, fresh] = variant_family_of.try_emplace(pkey, 0);
+    if (fresh) {
+      fit->second = family_key();
+      variant_families[fit->second].push_back(vwant);
+    }
+    fam = fit->second;
+    has_fam = true;
+  }
+  if (has_fam && variant_ok) {
+    if (VariantMode() == 3 && pit != pipelines.end()) {
+      if (const Variant *v = CompatibleVariant(fam, vwant)) {
+        fallback = *v;
+        ++stat_variant_used;
+      }
+    } else if (pit == pipelines.end() &&
+               (VariantMode() == 3 || (!sync_shaders && !g_sync_shaders_now.load(std::memory_order_relaxed)))) {
+      if (const Variant *v = CompatibleVariant(fam, vwant)) {
+        fallback = *v;
+      }
+    }
+  }
   // A prewarm job that gave up on this key leaves it compiling nowhere: then
   // it is compiled here the old way (second round).
   for (int round = 0; pit == pipelines.end() && round < 2; ++round) {
@@ -7744,6 +7889,40 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }
       pending.insert(pkey);
       ++stat_pipe_miss;
+      // DC_LOG_KEYS=1: every new render pipeline key with the inputs it was
+      // hashed from (which of them make variants of one shader pair).
+      static const bool log_keys = std::getenv("DC_LOG_KEYS") != nullptr;
+      if (log_keys) {
+        u64 va = 0;
+        for (const auto &a : vo.vertex_attrs) {
+          va = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), va);
+        }
+        std::string ptd; // pixel texture types: dim sample compare cube ufloat unnorm per slot
+        for (const TextureType &t : ps_types) {
+          char b[16];
+          std::snprintf(b, sizeof(b), "%u%u%u%u%u%u.", u32(t.dim), u32(t.sample), u32(t.compare), u32(t.cube),
+                        u32(t.ufloat), u32(t.unnorm));
+          ptd += b;
+        }
+        DC_INFO("gpu: newkey f%llu vs %#llx ps %#llx pkey %#llx vh %llx ph %llx vm %x/%x pm %x/%x va %llx vl %llx "
+                "vt %llx rpl %x%x%x fu %d te %d | pr %x dt %d db %d a2m %d cntl %llx vpm %llx pia %x cf %x ds %d "
+                "mrt %llx uf %x pt %llx ptd %s | cfm %llx bl %llx wm %x sm %x df %x fl %d wait %d",
+                (unsigned long long)frame_count, (unsigned long long)vs_addr, (unsigned long long)ps_addr,
+                (unsigned long long)pkey, (unsigned long long)vs->hash, (unsigned long long)(ps ? ps->hash : 0),
+                vo.linear_mask, vo.linear_aligned, fo.linear_mask, fo.linear_aligned, (unsigned long long)va,
+                (unsigned long long)vlayout,
+                (unsigned long long)Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), 0),
+                u32(vo.rect_list), u32(vo.points), u32(vo.vtx_layer), int(fused_pending.on), int(tess_draw != nullptr),
+                fo.probe_pc, int(fo.depth_target), int(fo.depth_bounds), int(fo.alpha_to_mask),
+                (unsigned long long)Fnv(fo.ps_input_cntl.data(), sizeof(fo.ps_input_cntl), 0),
+                (unsigned long long)fo.vs_param_mask, fo.ps_input_addr, fo.col_format, int(fo.dual_source),
+                (unsigned long long)Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), 0), fo.mrt_ufloat,
+                (unsigned long long)Fnv(ps_types.data(), ps_types.size() * sizeof(TextureType), 0),
+                ptd.empty() ? "-" : ptd.c_str(),
+                (unsigned long long)Fnv(pstate.color_fmt, sizeof(pstate.color_fmt), 0),
+                (unsigned long long)Fnv(pstate.blend, sizeof(pstate.blend), 0), pstate.write_mask,
+                pstate.shader_mask, pstate.depth_fmt, int(flat_draw), int(must_run));
+      }
       // A new pipeline often reuses compiled functions (same shaders, other
       // blend/format/vertex layout): generating their MSL again was most of
       // the GPU thread's time in a race. DC_ALWAYS_MSL=1 restores it (A/B).
@@ -7759,7 +7938,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }
       const bool has_ps = ps != nullptr;
       const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
-      const bool will_wait = must_run;
+      const bool will_wait = must_run && !fallback;
       // For the next launch's prewarm (RenderPrewarmStart): ordinary draws.
       // Tessellated and fused GS draws too (render_pipelines_ext.bin) unless
       // DC_NO_EXT_PREWARM=1.
@@ -7838,7 +8017,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         done_cv.notify_all();
       }, will_wait, pkey);
     }
-    if (!must_run) {
+    if (fallback || !must_run) {
       // A prewarm job not reached yet: the urgent worker takes it next.
       static const bool no_promote = std::getenv("DC_PREWARM_NO_PROMOTE") != nullptr;
       if (!no_promote && prewarm_queued.erase(pkey)) {
@@ -7847,6 +8026,17 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       } else {
         compiler->Touch(pkey);
       }
+    }
+    if (fallback) {
+      ++stat_variant_used;
+      if (trace)
+        DC_INFO("gpu:   pipeline compiling: drawn with variant %#llx (linear %x/%x %x/%x of %x/%x %x/%x, %s fetch)",
+                (unsigned long long)fallback->pkey, fallback->vs_linear, fallback->vs_aligned, fallback->ps_linear,
+                fallback->ps_aligned, vwant.vs_linear, vwant.vs_aligned, vwant.ps_linear, vwant.ps_aligned,
+                fallback->vfetch ? "metal" : "shader");
+      break;
+    }
+    if (!must_run) {
       ++stat_skip[skip_class];
       ++frame_skip[skip_class];
       ++frame_skips;
@@ -7876,10 +8066,21 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
     pit = pipelines.find(pkey);
   }
-  if (pit == pipelines.end()) {
+  if (pit == pipelines.end() && !fallback) {
     return;
   }
-  id<MTLRenderPipelineState> pso = pit->second;
+  id<MTLRenderPipelineState> pso = fallback ? pipelines[fallback->pkey] : pit->second;
+  if (fallback) {
+    // Bind as the variant was built: its linear bases (entries of the others
+    // stay unread), no vertex buffers for a shader-fetch variant.
+    vo.linear_mask = fallback->vs_linear;
+    vo.linear_aligned = fallback->vs_aligned;
+    fo.linear_mask = fallback->ps_linear;
+    fo.linear_aligned = fallback->ps_aligned;
+    if (!fallback->vfetch) {
+      nvbufs = 0;
+    }
+  }
   if (!pso) {
     if (trace)
       DC_INFO("gpu:   skipped: no pipeline");
@@ -9103,7 +9304,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       DC_INFO("perf: skipped draws (pipeline compiling) %llu: depth-only %llu, color+depth %llu, "
               "color %llu, memory %llu; max %llu in a frame, %llu frames held; waits: compute %llu/%llu ms, "
               "draw %llu/%llu ms, depth-only %llu/%llu ms, gs/tess %llu/%llu ms, %llu compiled inline, "
-              "%llu z-equal draws waited",
+              "%llu z-equal draws waited, %llu drawn with a variant",
               (unsigned long long)(stat_skip[0] + stat_skip[1] + stat_skip[2] + stat_skip[3]),
               (unsigned long long)stat_skip[0], (unsigned long long)stat_skip[1],
               (unsigned long long)stat_skip[2], (unsigned long long)stat_skip[3],
@@ -9112,11 +9313,12 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
               (unsigned long long)stat_wait_n[1], (unsigned long long)stat_wait_ms[1],
               (unsigned long long)stat_wait_n[2], (unsigned long long)stat_wait_ms[2],
               (unsigned long long)stat_wait_n[3], (unsigned long long)stat_wait_ms[3],
-              (unsigned long long)stat_wait_inline, (unsigned long long)stat_eq_wait);
+              (unsigned long long)stat_wait_inline, (unsigned long long)stat_eq_wait,
+              (unsigned long long)stat_variant_used);
       std::fill(std::begin(stat_skip), std::end(stat_skip), 0);
       std::fill(std::begin(stat_wait_n), std::end(stat_wait_n), 0);
       std::fill(std::begin(stat_wait_ms), std::end(stat_wait_ms), 0);
-      stat_skip_max = stat_held = stat_wait_inline = stat_eq_wait = 0;
+      stat_skip_max = stat_held = stat_wait_inline = stat_eq_wait = stat_variant_used = 0;
       LogMemory();
       perf_frames = 1;
       perf_t0 = now;
