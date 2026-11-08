@@ -28,18 +28,27 @@ id<MTLBuffer> tess_lds = nil;
 id<MTLComputePipelineState> tess_tf_pso = nil;
 
 // Compiles (or finds) the compute pipeline of an LS or HS.
-id<MTLComputePipelineState> TessKernel(Program *p, const Shader::MslOptions &o, u64 addr,
-                                      const std::vector<TextureType> &types) {
-  u64 key = Hash(p->hash);
-  key = Hash(o.map_hoist, key);
-  key = Fnv(&o.tess, sizeof(o.tess), key ^ 0x7e55);
+// `ud` and `nus`: for the prewarm record (KernelRecord).
+static u64 TessKernelKey(u64 hash, bool map_hoist, const Shader::TessInfo &tess,
+                         const std::vector<TextureType> &types) {
+  u64 key = Hash(hash);
+  key = Hash(map_hoist, key);
+  key = TessHash(tess, key ^ 0x7e55);
   key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
+  return key;
+}
+id<MTLComputePipelineState> TessKernel(Program *p, const Shader::MslOptions &o, u64 addr,
+                                      const std::vector<TextureType> &types, const u32 *ud, u32 nus) {
+  const u64 key = TessKernelKey(p->hash, o.map_hoist, o.tess, types);
   TakeCompiled();
   auto it = compute_pipelines.find(key);
-  if (it == compute_pipelines.end()) {
+  // A prewarm job that gave up on this key leaves it compiling nowhere:
+  // then it is compiled here (second round).
+  for (int round = 0; it == compute_pipelines.end() && round < 2; ++round) {
     if (!pending.count(key)) {
       pending.insert(key);
-      compiler->Submit([this, src = MslSource(*p, o, key), key, addr] {
+      KernelRecord rec = KernelRecordOf(*p, o, addr, types, ud, nus, key);
+      compiler->Submit([this, src = MslSource(*p, o, key), key, addr, rec = std::move(rec)] {
         id<MTLComputePipelineState> pso = nil;
         if (id<MTLFunction> fn = compiler->Function(key, src, addr)) {
           NSError *err = nil;
@@ -49,6 +58,9 @@ id<MTLComputePipelineState> TessKernel(Program *p, const Shader::MslOptions &o, 
                      err ? err.localizedDescription.UTF8String : "?");
           }
         }
+        if (pso && rec.pkey) {
+          KernelPrewarmRecord(rec);
+        }
         {
           std::scoped_lock lk(done_lock);
           done_compute.emplace_back(key, pso);
@@ -56,10 +68,16 @@ id<MTLComputePipelineState> TessKernel(Program *p, const Shader::MslOptions &o, 
         done_cv.notify_all();
       }, /*urgent=*/true, key);
     }
+    const auto w0 = std::chrono::steady_clock::now();
     WaitCompiled(key);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    if (ms > 100) {
+      DC_INFO("gpu:   (that wait: tess %s %#llx)", o.tess.stage == Shader::TessStage::Hull ? "hs" : "ls",
+              (unsigned long long)addr);
+    }
     it = compute_pipelines.find(key);
   }
-  return it->second;
+  return it == compute_pipelines.end() ? nil : it->second;
 }
 
 bool RunTessKernel(const Shader::TessInfo &info, u64 addr, const u32 *ud, u32 rsrc2,
@@ -77,7 +95,7 @@ bool RunTessKernel(const Shader::TessInfo &info, u64 addr, const u32 *ud, u32 rs
   resolving_shader = addr;
   Resolve(*p, ud, types, res); // GT7's terrain HS samples a texture to cull patches
   o.textures = types;
-  id<MTLComputePipelineState> pso = TessKernel(p, o, addr, types);
+  id<MTLComputePipelineState> pso = TessKernel(p, o, addr, types, ud, Bits(rsrc2, 1, 5));
   if (!pso || pso.maxTotalThreadsPerThreadgroup < group) {
     return false;
   }

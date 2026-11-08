@@ -3204,6 +3204,32 @@ struct MetalRenderer::Impl {
     }
     return d;
   }
+  // TessInfo by its fields: hashing the struct took its padding bytes along,
+  // left as they were on DrawTess's stack (the key, so the pipeline, could
+  // change from one draw to the next, and no prewarm record matched).
+  static u64 TessHash(const Shader::TessInfo &t, u64 seed) {
+    const u32 w[10] = {u32(t.stage), t.patches,   t.cp_in,         t.cp_out,
+                       t.lds_dwords, t.oc_bytes,  t.tf_bytes,      u32(t.oc_sgpr),
+                       t.tf_sgpr,    u32(t.index_size) | u32(t.domain) << 8};
+    return Fnv(w, sizeof(w), seed);
+  }
+  // The tessellator state of a domain-pass pipeline (DrawTess); `pw` is
+  // partition | winding << 8, as in VsKey.
+  static void TessDescriptor(MTLRenderPipelineDescriptor *d, u64 pw) {
+    d.tessellationPartitionMode = static_cast<MTLTessellationPartitionMode>(pw & 0xFF);
+    d.maxTessellationFactor = 64;
+    d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+    d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+    d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+    d.tessellationOutputWindingOrder = static_cast<MTLWinding>((pw >> 8) & 0xFF);
+    d.tessellationFactorScaleEnabled = NO;
+  }
+  // Key of a fused ES or GS (DrawGs; its MSL is part of the copy VS's).
+  static u64 FusedRingKey(const Shader::RingInfo &q, u64 key) {
+    return Hash(u64(q.stage) | u64(q.esgs_itemsize) << 8 | u64(q.vert_itemsize) << 24 | u64(q.slots) << 40 |
+                    u64(q.input_verts) << 48 | u64(q.index_size) << 52 | 2ull << 56,
+                key);
+  }
   // Pipeline key of the vertex function. `fused_key` (fused GS copy VS) and
   // `tess_pw` (partition | winding << 8 of a domain VS) are optional.
   static u64 VsKey(const Program &vs, const Shader::MslOptions &vo, const u64 *fused_key, const u64 *tess_pw,
@@ -3220,7 +3246,7 @@ struct MetalRenderer::Impl {
     }
     vs_key = Hash(vo.rect_list, vs_key);
     if (tess_pw) {
-      vs_key = Fnv(&vo.tess, sizeof(vo.tess), vs_key);
+      vs_key = TessHash(vo.tess, vs_key);
       vs_key = Hash(*tess_pw, vs_key);
     }
     vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1) | (u32(vo.vtx_layer) << 2) |
@@ -3291,9 +3317,26 @@ struct MetalRenderer::Impl {
     pk.depth_fmt = s.depth_fmt;
     return s.flat ? Hash(u64(0xF1A7), Hash(pk)) : Hash(pk);
   }
+  // Extended prewarm (render_pipelines_ext.bin, see mtl_prewarm_ext.inc):
+  // what a tessellated domain draw or a fused GS draw adds to RenderRecord.
+  enum : u32 { kRecPlain = 0, kRecTess = 1, kRecFused = 2 };
+  struct RingProgRecord { // an ES or GS fused into the copy VS
+    u64 addr = 0;
+    u32 nus = 0;
+    std::array<u32, 16> ud{};
+    std::vector<u32> code, fetch;
+  };
+  struct RenderRecordExt {
+    Shader::TessInfo tess; // kRecTess: the domain stage's
+    u64 tess_pw = 0;       // partition | winding << 8
+    RingProgRecord es, gs; // kRecFused
+    Shader::RingInfo ring; // the ES's (Export stage, its index size)
+  };
   // One recorded render pipeline. Options are stored as the draw set them,
   // before PsOptionsInUse (which depends on the translator).
   struct RenderRecord {
+    u32 kind = kRecPlain; // not serialized in RPW1: the ext file states it
+    RenderRecordExt ext;
     u64 pkey = 0;
     u64 vs_addr = 0, ps_addr = 0;
     u32 vs_nus = 0, vs_vcc = 0, ps_nus = 0, has_ps = 0;
@@ -3367,6 +3410,10 @@ struct MetalRenderer::Impl {
     for (u32 v : {s.colors, s.blendable}) put32(v);
     put(s.color_fmt, 32); put(s.blend, 32);
     for (u32 v : {s.write_mask, s.shader_mask, s.depth_fmt, s.vtx_layer, s.layer_topology, s.flat}) put32(v);
+    if (e.kind != kRecPlain) {
+      ExtPrewarmRecord(e, b); // tessellated / fused GS: their own file
+      return;
+    }
     std::scoped_lock lk(prewarm_lock);
     if (path.empty() || !render_known.insert(e.pkey).second) {
       return;
@@ -3469,6 +3516,7 @@ struct MetalRenderer::Impl {
     }
     fo.textures = e.ptypes;
   }
+#include "gpu/metal/mtl_prewarm_ext.inc"
   std::atomic<u32> prewarm_render_total{0}, prewarm_render_done{0}, prewarm_render_dropped{0};
   const std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point prewarm_t0;
@@ -3499,19 +3547,48 @@ struct MetalRenderer::Impl {
         entries.push_back(std::move(e));
       }
     }
+    const size_t plain = entries.size();
+    std::vector<KernelRecord> kernels;
+    const u64 ext_bytes = ExtPrewarmLoad(entries, kernels); // tessellated, fused GS (appended)
     if (!run || std::getenv("DC_NO_RENDER_PREWARM")) {
       DC_INFO("gpu: %zu render pipelines recorded, prewarm off", entries.size());
       return;
     }
     prewarm_t0 = std::chrono::steady_clock::now();
-    prewarm_render_total = static_cast<u32>(entries.size());
-    DC_INFO("gpu: prewarming %zu render pipelines (%llu KB recorded)", entries.size(),
-            (unsigned long long)(bytes >> 10));
+    prewarm_render_total = static_cast<u32>(entries.size() + kernels.size());
+    DC_INFO("gpu: prewarming %zu render pipelines (%llu KB recorded)", plain, (unsigned long long)(bytes >> 10));
+    if (entries.size() > plain || !kernels.empty()) {
+      DC_INFO("gpu: prewarming %zu tessellated / fused GS render pipelines and %zu tess kernels (%llu KB recorded)",
+              entries.size() - plain, kernels.size(), (unsigned long long)(ext_bytes >> 10));
+    }
+    // Normal jobs run newest first (ShaderCompiler::Touch). Records are in the
+    // order the game first needed them, so the plain ones are queued last to
+    // first: they compile in the game's order (menus, then the course), not
+    // the last race's newest first, which left a cold course start skipping
+    // for minutes. The ext ones (slowest, and every draw that needs one
+    // waits or loses its pass) are queued after them, kernels last of all.
+    // DC_PREWARM_ORDER=lifo: record order (newest records first, as before).
+    static const bool lifo = [] {
+      const char *o = std::getenv("DC_PREWARM_ORDER");
+      return o && std::strcmp(o, "lifo") == 0;
+    }();
+    if (!lifo) {
+      std::reverse(entries.begin(), entries.begin() + plain);
+      std::reverse(entries.begin() + plain, entries.end());
+    }
     for (auto &e : entries) {
       const u64 pkey = e.pkey;
       pending.insert(pkey);
       prewarm_queued.insert(pkey);
       compiler->Submit([this, e = std::move(e)] { RenderPrewarmJob(e); }, /*urgent=*/false, pkey, /*background=*/true);
+    }
+    if (!lifo) {
+      std::reverse(kernels.begin(), kernels.end());
+    }
+    for (auto &k : kernels) {
+      const u64 key = k.pkey;
+      pending.insert(key);
+      compiler->Submit([this, k = std::move(k)] { KernelPrewarmJob(k); }, /*urgent=*/false, key, /*background=*/true);
     }
   }
   void RenderPrewarmJob(const RenderRecord &e) {
@@ -3550,7 +3627,14 @@ struct MetalRenderer::Impl {
     }
     Shader::MslOptions vo, fo;
     RecordOptions(e, vo, fo);
-    const u64 vs_key = VsKey(*vs, vo, nullptr, nullptr, e.state.layer_topology);
+    std::string es_src, gs_src; // a fused copy VS's dc_es / dc_gs (vo.fused borrows them)
+    u64 fused_key = 0;
+    if (e.kind != kRecPlain && !ExtPrewarmOptions(e, vo, es_src, gs_src, fused_key)) {
+      finish();
+      return;
+    }
+    const u64 vs_key = VsKey(*vs, vo, e.kind == kRecFused ? &fused_key : nullptr,
+                             e.kind == kRecTess ? &e.ext.tess_pw : nullptr, e.state.layer_topology);
     u64 ps_key = 0;
     if (ps) {
       PsOptionsInUse(*ps, fo);
@@ -3569,6 +3653,9 @@ struct MetalRenderer::Impl {
                                  e.ps_addr, true);
     if (vfn && (!ps || ffn)) {
       MTLRenderPipelineDescriptor *d = RenderDescriptor(e.state);
+      if (e.kind == kRecTess) {
+        TessDescriptor(d, e.ext.tess_pw);
+      }
       d.vertexFunction = vfn;
       d.fragmentFunction = e.state.flat ? debug_fs : ffn;
       NSError *err = nil;
@@ -6075,6 +6162,10 @@ struct MetalRenderer::Impl {
     u64 es_index_va = 0; // ES vertex indices (base vertex folded in), or 0
     // The guest's ring bases and the offsets to this draw's arena copies.
     u64 esgs_base = 0, esgs_bias = 0, gsvs_base = 0, gsvs_bias = 0;
+    // For the prewarm record (ExtFillRecord): the ES's ring, the programs.
+    Shader::RingInfo ring;
+    u32 es_nus = 0, gs_nus = 0;
+    const Program *esp = nullptr, *gsp = nullptr;
   } fused_pending;
   std::unordered_map<u64, std::string> fused_src; // dc_es / dc_gs sources by their keys
 
@@ -6443,11 +6534,7 @@ struct MetalRenderer::Impl {
     fused_pending = {};
     Program *esp = GetProgram(Stage::Compute, es_addr, es_ud, es_nus, 0);
     Program *gsp2 = GetProgram(Stage::Compute, gs_addr, gs_ud, gs_nus, 0);
-    auto ring_key = [](const Shader::RingInfo &q, u64 key) {
-      return Hash(u64(q.stage) | u64(q.esgs_itemsize) << 8 | u64(q.vert_itemsize) << 24 | u64(q.slots) << 40 |
-                      u64(q.input_verts) << 48 | u64(q.index_size) << 52 | 2ull << 56,
-                  key);
-    };
+    auto ring_key = [](const Shader::RingInfo &q, u64 key) { return FusedRingKey(q, key); };
     bool fused = false;
     // This draw's own rings in the arena: draws in flight at once must not
     // share the guest's (the fused VS of a later draw would overwrite them
@@ -6489,6 +6576,11 @@ struct MetalRenderer::Impl {
       f.key = Hash(ke, kg);
       f.es_addr = es_addr;
       f.gs_addr = gs_addr;
+      f.ring = ring;
+      f.es_nus = es_nus;
+      f.gs_nus = gs_nus;
+      f.esp = esp;
+      f.gsp = gsp2;
       std::memcpy(f.es_ud, es_ud, sizeof(f.es_ud));
       std::memcpy(f.gs_ud, gs_ud, sizeof(f.gs_ud));
       f.es_index_va = es_index_va;
@@ -7648,13 +7740,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     if (!pending.count(pkey)) {
       MTLRenderPipelineDescriptor *d = RenderDescriptor(pstate);
       if (tess_draw) {
-        d.tessellationPartitionMode = tess_draw->partition;
-        d.maxTessellationFactor = 64;
-        d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
-        d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
-        d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
-        d.tessellationOutputWindingOrder = tess_draw->winding;
-        d.tessellationFactorScaleEnabled = NO;
+        TessDescriptor(d, tess_pw);
       }
       pending.insert(pkey);
       ++stat_pipe_miss;
@@ -7675,8 +7761,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
       const bool will_wait = must_run;
       // For the next launch's prewarm (RenderPrewarmStart): ordinary draws.
+      // Tessellated and fused GS draws too (render_pipelines_ext.bin) unless
+      // DC_NO_EXT_PREWARM=1.
       RenderRecord rec;
-      if (!tess_draw && !fused_pending.on && !capture && probe_slot < 0 && !flat_draw) {
+      if ((ext_prewarm_on || (!tess_draw && !fused_pending.on)) && !capture && probe_slot < 0 && !flat_draw) {
+        ExtFillRecord(rec, tess_pw);
         rec.pkey = pkey;
         rec.vs_addr = vs_addr;
         rec.vs_nus = Bits(r[Reg::SPI_SHADER_PGM_RSRC2_VS], 1, 5);
