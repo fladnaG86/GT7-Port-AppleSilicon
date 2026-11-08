@@ -579,6 +579,7 @@ struct MetalRenderer::Impl {
     bool has_crops = false;          // a shorter T# reads it (see CropOf)
     u32 comp_swap = 0;               // CB_INFO.COMP_SWAP it was last bound with
     bool three_channels = false;     // its format has no alpha (10_11_11, 11_11_10)
+    bool htile = false;              // depth bound with HTILE (DB_Z_INFO.TILE_SURFACE_ENABLE)
   };
   using TargetMap =
       std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
@@ -1528,6 +1529,11 @@ struct MetalRenderer::Impl {
     if (src_sel == 2 && dst_sel != 1 && value != ~0u && !expanding_htile &&
         MarkMetaCleared(dst, bytes)) {
       EndPass(); // the next pass over the surface loads its clear value
+    } else if (src_sel == 2 && dst_sel != 1 && !expanding_htile) {
+      if (early_fills.size() > 4096) {
+        early_fills.clear();
+      }
+      early_fills[dst & kGpuAddrMask] = 0; // a CP DMA fill
     }
     EndPass();
     EnsureCommandBuffer();
@@ -3645,6 +3651,30 @@ struct MetalRenderer::Impl {
                         MTLPixelFormatInvalid, base_array, slice_count);
     }
 
+    // DC_LOG_INNER_READS=1: a T# read from guest memory whose address lies
+    // inside a color target's memory (a slice or level of a layered target
+    // the GPU drew): the guest memory never holds that picture.
+    static const bool log_inner = std::getenv("DC_LOG_INNER_READS") != nullptr;
+    if (log_inner) {
+      static std::set<u64> logged;
+      for (const auto &[ta, list] : color_targets) {
+        for (const auto &rt : list) {
+          const u64 bpp = PixelBytes(rt->tex.pixelFormat);
+          const u64 approx = u64(rt->width) * rt->height * bpp *
+                             std::max<u32>(rt->depth_or_layers, 1) * 2;
+          if (addr > ta && addr < ta + approx && logged.insert(addr).second) {
+            DC_INFO("gpu: inner read %#llx %ux%u type %u lvl %u-%u arr %u-%u dfmt %u (shader %#llx)"
+                    " inside target %#llx %ux%u d/l %u lv %u fmt %lu written %llu, +%#llx%s",
+                    (unsigned long long)addr, width, height, ttype, base_level, last_level,
+                    base_array, last_array, dfmt, (unsigned long long)resolving_shader,
+                    (unsigned long long)ta, rt->width, rt->height, rt->depth_or_layers,
+                    rt->levels, (unsigned long)rt->tex.pixelFormat,
+                    (unsigned long long)rt->written, (unsigned long long)(addr - ta),
+                    mip_alias.count(addr) ? " (mip alias, size mismatch)" : "");
+          }
+        }
+      }
+    }
     if (fi.format == MTLPixelFormatInvalid || fi.gpu_only) {
       ReportOnce("texture format dfmt=" + std::to_string(dfmt) +
                  " nfmt=" + std::to_string(nfmt) + " not supported");
@@ -4631,7 +4661,18 @@ struct MetalRenderer::Impl {
     return GetTarget(depth_targets, addr, fmt, width, height, true);
   }
 
+  // Destinations of memset-shaped dispatches and their fill value, for the
+  // log of metadata that was fast-cleared before the surface was first bound.
+  std::unordered_map<u64, u32> early_fills;
   void NoteMeta(u64 meta, u64 target, bool depth, u32 width = 0, u32 height = 0) {
+    if (meta && !metas.count(meta)) {
+      if (const auto f = early_fills.find(meta); f != early_fills.end()) {
+        DC_INFO("gpu: %s %#llx %ux%u: its metadata %#llx was filled (cs %#x00) before it was "
+                "first bound (a fast clear the renderer could not see)",
+                depth ? "depth" : "color", (unsigned long long)target, width, height,
+                (unsigned long long)meta, f->second);
+      }
+    }
     if (meta) {
       metas[meta] = {target, depth, width, height};
     }
@@ -4763,6 +4804,20 @@ struct MetalRenderer::Impl {
       h = std::min(h, std::max(rt.height >> rt.bind_level, 1u));
     }
     if (depth) {
+      // A depth surface with HTILE the GPU never drew into starts out cleared
+      // to its DB_DEPTH_CLEAR value: GT7 may fast-clear the HTILE before the
+      // surface is first bound (its metadata is unknown then, so the clear is
+      // missed), and 1.0 under a reverse-Z GREATER test rejects everything.
+      // DC_NO_NEW_HTILE_CLEAR=1: the old 1.0 (A/B).
+      static const bool no_new_htile_clear = std::getenv("DC_NO_NEW_HTILE_CLEAR") != nullptr;
+      const bool fresh_htile = !clear_depth && !depth->clear_pending && !depth->initialized &&
+                               depth->htile && !no_new_htile_clear;
+      if (!clear_depth && !depth->clear_pending && !depth->initialized) {
+        DC_INFO("gpu: new depth %#llx %ux%u first pass without a clear: DB_DEPTH_CLEAR %g, "
+                "htile %d -> clears to %g",
+                (unsigned long long)depth->addr, depth->width, depth->height, depth->clear_depth,
+                (int)depth->htile, fresh_htile ? depth->clear_depth : 1.0);
+      }
       const bool clear =
           clear_depth || depth->clear_pending || !depth->initialized;
       const u32 depth_slice = draw_layers ? 0 : depth->bind_slice;
@@ -4771,7 +4826,7 @@ struct MetalRenderer::Impl {
       rp.depthAttachment.loadAction =
           clear ? MTLLoadActionClear : MTLLoadActionLoad;
       rp.depthAttachment.clearDepth = clear_depth ? depth_value
-                                      : depth->clear_pending
+                                      : depth->clear_pending || fresh_htile
                                           ? depth->clear_depth
                                           : 1.0;
       rp.depthAttachment.storeAction = MTLStoreActionStore;
@@ -4783,7 +4838,7 @@ struct MetalRenderer::Impl {
         rp.stencilAttachment.loadAction =
             sclear ? MTLLoadActionClear : MTLLoadActionLoad;
         rp.stencilAttachment.clearStencil = clear_stencil ? stencil_value
-                                            : depth->clear_pending
+                                            : depth->clear_pending || fresh_htile
                                                 ? depth->clear_stencil
                                                 : 0;
         rp.stencilAttachment.storeAction = MTLStoreActionStore;
@@ -6507,6 +6562,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       DepthFromColor(*depth);
       depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
       depth->clear_stencil = r[Reg::DB_STENCIL_CLEAR] & 0xFF;
+      depth->htile = ZInfo::TileSurface(z_info);
       if (ZInfo::TileSurface(z_info)) {
         NoteMeta(u64(r[Reg::DB_HTILE_DATA_BASE]) << 8, zbase, true, w, h);
       }
@@ -7746,6 +7802,12 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   // Memset shape: 256 threads in one line, destination V# of dwords in user data.
   if (tx == 256 && ty == 1 && tz == 1 && gy == 1 && gz == 1 && ((ud[1] >> 16) & 0x3FFF) == 4) {
     const u64 dst = ud[0] | (u64(ud[1] & 0xFFF) << 32);
+    if (!metas.count(dst & kGpuAddrMask)) {
+      if (early_fills.size() > 4096) {
+        early_fills.clear();
+      }
+      early_fills[dst & kGpuAddrMask] = static_cast<u32>(addr >> 8); // the filling shader
+    }
     if (color_targets.count(dst)) {
       memory_fills[dst] = ++write_seq;
       BumpEpoch(__LINE__);
