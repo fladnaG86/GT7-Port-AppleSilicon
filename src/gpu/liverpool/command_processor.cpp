@@ -91,6 +91,181 @@ bool Compare(u32 func, u32 value, u32 ref) {
 
 } // namespace
 
+namespace {
+// DC_LABEL_HIST=1 (debug): keeps the last 1M CP events in memory. On a
+// WaitRegMem timeout it dumps the submits/jobs and the events near the label
+// (then polls the label for 60 s); on a chain/IB to nowhere it dumps the
+// command buffer and the history of the chain and of the ring's last wait on
+// CPU memory. DC_POLL_CPU_WAITS=1 also polls those CPU flags (~10 us),
+// DC_HIST_DUMP_SUBMIT=<n> dumps such a history once past gfx submit n.
+// Kinds: R fence recorded, W fence written, D WRITE_DATA, F/C CP DMA fill/copy,
+// f/c host GPU DMA fill/copy, S wait start, T wait timeout, P/p wait passed on a
+// pending fence, Q gfx wait on CPU memory (value seen), V polled value change,
+// G gfx submit (dwords; ring 256 = flip), K compute submit, J/X ring job
+// start/end (packets so far), I/i (chained) indirect buffer.
+struct LabelEvent {
+    u64 t;
+    u64 addr;
+    u32 value;
+    u32 ring;
+    char kind;
+};
+struct LabelHist {
+    std::mutex lock;
+    std::vector<LabelEvent> ev = std::vector<LabelEvent>(1u << 20);
+    u64 n = 0;
+};
+bool HistOn() {
+    static const bool on = std::getenv("DC_LABEL_HIST") != nullptr;
+    return on;
+}
+LabelHist& Hist() {
+    static LabelHist h;
+    return h;
+}
+thread_local u64 t_hist_packets = 0;
+thread_local u64 t_last_q = 0;
+u64 HistNow() {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+void HistAdd(char kind, u64 addr, u32 value, u32 ring) {
+    if (!HistOn()) {
+        return;
+    }
+    LabelHist& h = Hist();
+    std::scoped_lock lk(h.lock);
+    h.ev[h.n++ & (h.ev.size() - 1)] = {HistNow(), addr, value, ring, kind};
+}
+// DC_POLL_CPU_WAITS=1 (debug): a thread polls (every ~10 us) each CPU-memory
+// address the graphics ring has waited on, and logs every change ('V').
+std::atomic<u64> g_poll_addrs[16];
+void HistPoll(u64 a) {
+    static const bool on = std::getenv("DC_POLL_CPU_WAITS") != nullptr;
+    if (!on || !HistOn()) {
+        return;
+    }
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            u32 last[16] = {};
+            u64 seen[16] = {};
+            for (;;) {
+                for (int k = 0; k < 16; ++k) {
+                    const u64 a = g_poll_addrs[k].load(std::memory_order_relaxed);
+                    if (!a) {
+                        break;
+                    }
+                    const u32 v = *reinterpret_cast<const volatile u32*>(a);
+                    if (seen[k] != a || v != last[k]) {
+                        seen[k] = a;
+                        last[k] = v;
+                        HistAdd('V', a, v, 0);
+                    }
+                }
+                usleep(10);
+            }
+        }).detach();
+    });
+    for (int k = 0; k < 16; ++k) {
+        u64 cur = g_poll_addrs[k].load();
+        if (cur == a) {
+            return;
+        }
+        if (!cur && g_poll_addrs[k].compare_exchange_strong(cur, a)) {
+            return;
+        }
+        if (cur == a) {
+            return;
+        }
+    }
+}
+// Every history event at exactly `addr` (last `max`).
+void HistDumpAddr(u64 addr, size_t max, const char* why) {
+    LabelHist& h = Hist();
+    std::vector<LabelEvent> out;
+    {
+        std::scoped_lock lk(h.lock);
+        const u64 cnt = std::min<u64>(h.n, h.ev.size());
+        for (u64 k = h.n - cnt; k < h.n; ++k) {
+            const LabelEvent& e = h.ev[k & (h.ev.size() - 1)];
+            if (((e.kind == 'J' || e.kind == 'X') && e.ring == 0) || e.kind == 'Q' || e.kind == 'V' || (e.addr <= addr && addr < e.addr + ((e.kind == 'c' || e.kind == 'C' || e.kind == 'f' || e.kind == 'F') ? std::max<u64>(e.value, 4) : 4)) ||
+                e.kind == 'G') {
+                out.push_back(e);
+            }
+        }
+    }
+    if (out.size() > max) {
+        out.erase(out.begin(), out.end() - max);
+    }
+    const u64 now = HistNow();
+    DC_WARN("gpu: history of %#llx (%s), with gfx submits:", (unsigned long long)addr, why);
+    for (const auto& e : out) {
+        DC_WARN("gpu:   %c %#llx = %#x ring %u, %.3f ms ago", e.kind, (unsigned long long)e.addr, e.value, e.ring,
+                (now - e.t) / 1e6);
+    }
+}
+void HistDump(u64 addr, u32 ring) {
+    if (!HistOn()) {
+        return;
+    }
+    LabelHist& h = Hist();
+    std::vector<LabelEvent> out, subs, tail;
+    {
+        std::scoped_lock lk(h.lock);
+        const u64 cnt = std::min<u64>(h.n, h.ev.size());
+        for (u64 k = h.n - cnt; k < h.n; ++k) {
+            const LabelEvent& e = h.ev[k & (h.ev.size() - 1)];
+            if (e.addr + 0x100 >= addr && e.addr <= addr + 0x100) {
+                out.push_back(e);
+            } else if (e.kind == 'G' || e.kind == 'I' || e.kind == 'i' || e.kind == 'Q' || e.kind == 'V' || ((e.kind == 'K' || e.kind == 'J' || e.kind == 'X') && e.ring < 3)) {
+                subs.push_back(e);
+            }
+            if (k + 40 >= h.n) {
+                tail.push_back(e);
+            }
+        }
+    }
+    if (subs.size() > 300) {
+        subs.erase(subs.begin(), subs.end() - 300);
+    }
+    const u64 now0 = HistNow();
+    DC_WARN("gpu: last submits/jobs (G gfx submit: dwords, ring 256 = flip; K compute: dwords; J/X job start/end: "
+            "packets so far):");
+    for (const auto& e : subs) {
+        DC_WARN("gpu:   %c %#llx = %#x ring %u, %.3f s ago", e.kind, (unsigned long long)e.addr, e.value, e.ring,
+                (now0 - e.t) / 1e9);
+    }
+    const u64 now = HistNow();
+    DC_WARN("gpu: label hist for %#llx (ring %u): %zu events near it", (unsigned long long)addr, ring, out.size());
+    if (out.size() > 400) {
+        out.erase(out.begin(), out.end() - 400);
+    }
+    for (const auto& e : out) {
+        DC_WARN("gpu:   %c %#llx = %#x ring %u, %.3f s ago", e.kind, (unsigned long long)e.addr, e.value, e.ring,
+                (now - e.t) / 1e9);
+    }
+    DC_WARN("gpu: last label events:");
+    for (const auto& e : tail) {
+        DC_WARN("gpu:   %c %#llx = %#x ring %u, %.3f s ago", e.kind, (unsigned long long)e.addr, e.value, e.ring,
+                (now - e.t) / 1e9);
+    }
+    std::thread([addr] {
+        const volatile u32* p = reinterpret_cast<const volatile u32*>(addr);
+        u32 last = *p;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60)) {
+            if (*p != last) {
+                DC_WARN("gpu: label %#llx changed %#x -> %#x %.3f s after its timeout", (unsigned long long)addr,
+                        last, *p,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                last = *p;
+            }
+            usleep(200);
+        }
+    }).detach();
+}
+} // namespace
+
 thread_local CommandProcessor::Ring* CommandProcessor::t_ring = nullptr;
 thread_local RegFile* CommandProcessor::t_regs = nullptr;
 
@@ -161,12 +336,36 @@ void CommandProcessor::SubmitGraphics(std::vector<CmdBuffers> bufs, std::functio
         DC_INFO("lt %.0f submit %zu bufs", LtUs(LtNow()), bufs.size());
     }
     const bool flip = static_cast<bool>(after);
+    if (HistOn()) {
+        u32 dw = 0;
+        for (const auto& b : bufs) {
+            dw += u32(b.dcb.size());
+        }
+        HistAdd('G', bufs.empty() ? 0 : reinterpret_cast<u64>(bufs[0].dcb.data()), dw, flip ? 256 : 0);
+        // GT7 frame heads: 0x116 dwords whose chain lands on the 4 dwords right after them.
+        static std::atomic<u64> heads{0}, unpatched{0};
+        for (const auto& b : bufs) {
+            if (b.dcb.size() == 0x116) {
+                const u32* tail = b.dcb.data() + 0x116;
+                const u64 n = ++heads;
+                if ((tail[3] & 0xFFFFF) == 0 || tail[1] == 0) {
+                    const u64 u = ++unpatched;
+                    if (u <= 20 || u % 100 == 0) {
+                        DC_WARN("gpu: frame head %p submitted with its tail chain unpatched (%08x %08x %08x %08x), "
+                                "%llu of %llu heads", (const void*)b.dcb.data(), tail[0], tail[1], tail[2], tail[3],
+                                (unsigned long long)u, (unsigned long long)n);
+                    }
+                }
+            }
+        }
+    }
     Capture::BeforeGraphics(bufs, flip);
     Push(0, {std::move(bufs), std::move(after)});
     Capture::AfterGraphics(flip);
 }
 
 void CommandProcessor::SubmitCompute(u32 queue, std::span<const u32> acb) {
+    HistAdd('K', reinterpret_cast<u64>(acb.data()), u32(acb.size()), queue);
     Capture::BeforeCompute(queue, acb);
     Push(queue, {{CmdBuffers{acb, {}}}, {}});
 }
@@ -348,6 +547,7 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             ring.jobs.pop_front();
             ring.busy = true;
         }
+        HistAdd('J', 0, u32(t_hist_packets), ring.index);
         const bool lt = ring.index == 0 && LtOn();
         double lt_user = 0, lt_sys = 0;
         if (lt) {
@@ -398,6 +598,7 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             DC_INFO("lt %.0f job end cpu user %.0f sys %.0f lock %.0f us", LtUs(LtNow()), user - lt_user, sys - lt_sys,
                     lt_lock_ns / 1e3);
         }
+        HistAdd('X', 0, u32(t_hist_packets), ring.index);
         {
             std::scoped_lock lk(ring.lock);
             ring.busy = false;
@@ -426,6 +627,8 @@ void CommandProcessor::AfterGpu(std::function<void()> fn) {
 }
 
 void CommandProcessor::FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 irq) {
+    const u32 hist_ring = t_ring ? t_ring->index : 99;
+    HistAdd('R', addr, lo, hist_ring);
     if (data_sel == kData32 || data_sel == kData64) {
         std::scoped_lock lk(fence_lock);
         pending_fences[addr] = lo;
@@ -442,6 +645,7 @@ void CommandProcessor::FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 ir
             DC_INFO("lt %.0f label write %#x", LtUs(LtNow()), lo);
         }
         WriteFence(data_sel, static_cast<u32>(addr), static_cast<u32>(addr >> 32), lo, hi);
+        HistAdd('W', addr, lo, hist_ring);
         if (data_sel == kData32 || data_sel == kData64) {
             std::scoped_lock lk(fence_lock);
             // A later write to the same label may still be on its way.
@@ -724,6 +928,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         const u32 body_n = HeaderBodyDwords(header);
         const u32* body = p + 1;
         ++stats.packets;
+        ++t_hist_packets;
 
         // DC_FIND_DWORD=<value>[,<value>]: log PM4 packets whose body contains
         // one of these dwords. Used to find where a resource address is set.
@@ -829,9 +1034,87 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
 
         case Op::IndirectBuffer: {
+            constexpr u32 kIbChain = 1u << 20;
+            // GT7 submits a frame's head (0x116 dwords) whose chain leads, through
+            // a stub, to the 4 dwords right after it, a chain the game fills in
+            // with the rest of the frame. It is almost always written before the
+            // submit, but now and then a little after (0.06-0.5 ms seen): a real
+            // CP is still busy with the previous frame then, ours is idle when
+            // nothing compiles (render pipeline prewarm) and read zeros. The frame
+            // then ended there, its end-of-frame labels were never written, async
+            // compute waited for them (WaitRegMem timeout) and the game stopped
+            // submitting. A chain to nowhere (no size, or no address above 4 GB)
+            // is a packet still being written: wait for the game to finish it.
+            // DC_NO_CHAIN_WAIT=1: old behavior (end the command buffer there).
+            if ((body[2] & kIbChain) && ((body[2] & 0xFFFFF) == 0 || (body[1] & 0xFFFF) == 0)) {
+                static const bool no_wait = std::getenv("DC_NO_CHAIN_WAIT") != nullptr;
+                const volatile u32* vb = body;
+                const auto t0 = std::chrono::steady_clock::now();
+                while (!no_wait && ((vb[2] & 0xFFFFF) == 0 || (vb[1] & 0xFFFF) == 0) &&
+                       std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500)) {
+                    sched_yield();
+                }
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                static std::atomic<u32> reports{0};
+                if (!no_wait && reports.fetch_add(1) < 20) {
+                    DC_INFO("gpu: chain at %p was still being written: %s after %.3f ms (-> %#llx, %u dwords)",
+                            (const void*)p, ((vb[2] & 0xFFFFF) && (vb[1] & 0xFFFF)) ? "done" : "gave up", ms,
+                            (unsigned long long)(u64(vb[0]) | (u64(vb[1] & 0xFFFF) << 32)), vb[2] & 0xFFFFF);
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+            }
             const u32* ib = Ptr<const u32>(body[0], body[1] & 0xFFFF);
             const u32 size = body[2] & 0xFFFFF;
-            constexpr u32 kIbChain = 1u << 20;
+            if (!compute && depth < 2) {
+                HistAdd(depth ? 'i' : 'I', reinterpret_cast<u64>(ib), size | (body[2] & kIbChain ? 0x80000000u : 0),
+                        0);
+            }
+            if ((!ib || !size) && HistOn()) {
+                const u32* pkt = p;
+                DC_WARN("gpu: INDIRECT_BUFFER%s to %p size %u at %p (+%#zx of %zu dwords, depth %d%s)",
+                        body[2] & kIbChain ? " chain" : "", (const void*)ib, size, (const void*)pkt,
+                        static_cast<size_t>(pkt - cmds.data()), cmds.size(), depth, compute ? ", compute" : "");
+                for (size_t k = 0; k + 8 <= cmds.size() && k < 320; k += 8) {
+                    const u32* q = cmds.data() + k;
+                    DC_WARN("gpu:   +%02zx: %08x %08x %08x %08x %08x %08x %08x %08x", k, q[0], q[1], q[2], q[3], q[4],
+                            q[5], q[6], q[7]);
+                }
+                const u32 snap[4] = {pkt[0], pkt[1], pkt[2], pkt[3]};
+                DC_WARN("gpu:   packet now %08x %08x %08x %08x", snap[0], snap[1], snap[2], snap[3]);
+                if (t_last_q) {
+                    HistDumpAddr(t_last_q, 200, "last CPU-memory wait of this ring");
+                }
+                HistDumpAddr(reinterpret_cast<u64>(pkt + 2), 200, "the chain size dword");
+                {
+                    LabelHist& h = Hist();
+                    std::scoped_lock lk(h.lock);
+                    const u64 cnt = std::min<u64>(h.n, h.ev.size());
+                    int shown = 0;
+                    const u64 now = HistNow();
+                    for (u64 k = h.n; k > h.n - cnt && shown < 12; --k) {
+                        const LabelEvent& e = h.ev[(k - 1) & (h.ev.size() - 1)];
+                        if ((e.kind == 'P' || e.kind == 'p' || e.kind == 'S') && e.ring == (t_ring ? t_ring->index : 99)) {
+                            DC_WARN("gpu:   wait %c %#llx = %#x ring %u, %.3f ms ago", e.kind,
+                                    (unsigned long long)e.addr, e.value, e.ring, (now - e.t) / 1e6);
+                            ++shown;
+                        }
+                    }
+                }
+                std::thread([pkt, snap] {
+                    u32 last[4] = {snap[0], snap[1], snap[2], snap[3]};
+                    const auto t0 = std::chrono::steady_clock::now();
+                    while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+                        if (std::memcmp(last, pkt, 16) != 0) {
+                            std::memcpy(last, pkt, 16);
+                            DC_WARN("gpu: IB packet at %p now %08x %08x %08x %08x, %.3f ms after it ran",
+                                    (const void*)pkt, last[0], last[1], last[2], last[3],
+                                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                                        .count());
+                        }
+                        usleep(20);
+                    }
+                }).detach();
+            }
             // A chained buffer replaces the current one, however many links there are.
             if (body[2] & kIbChain) {
                 p = ib;
@@ -887,6 +1170,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 }
                 u32* dst = Ptr<u32>(body[1], body[2]);
                 std::memcpy(dst, body + 3, (body_n - 3) * 4);
+                HistAdd('D', reinterpret_cast<u64>(dst), body_n > 3 ? body[3] : 0, t_ring ? t_ring->index : 99);
                 // Like a CE dump: draws recorded before this one must still read the
                 // old data when the host GPU runs them, later ones the new data.
                 if (renderer && body_n - 3 > 2) {
@@ -927,6 +1211,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                         break;
                     }
                 }
+                if (bytes && !patches_ib && !dsel) {
+                    HistAdd(ssel == 2 ? 'f' : 'c', dst_addr, bytes, t_ring ? t_ring->index : 99);
+                }
                 if (bytes && !patches_ib && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
                     break;
                 }
@@ -951,6 +1238,8 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                             bytes, compute ? " (compute)" : "");
                 }
             }
+            HistAdd(src_sel == 2 ? 'F' : 'C', reinterpret_cast<u64>(dst), bytes,
+                    t_ring ? t_ring->index : 99);
             if (src_sel == 2) {
                 for (u32 k = 0; k + 4 <= bytes; k += 4) {
                     std::memcpy(dst + k, &body[1], 4);
@@ -977,17 +1266,31 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 while (Capture::ReplayApplying()) {
                     sched_yield(); // frame replay: the label may come before its data
                 }
+                if (HistOn() && !compute && reinterpret_cast<u64>(addr) >= 0x7000000000ull) {
+                    HistAdd('Q', reinterpret_cast<u64>(addr), *addr, 0);
+                    HistPoll(reinterpret_cast<u64>(addr));
+                    t_last_q = reinterpret_cast<u64>(addr);
+                    static std::atomic<int> dumps{0};
+                    static const u64 dump_at = std::getenv("DC_HIST_DUMP_SUBMIT")
+                                                   ? std::strtoull(std::getenv("DC_HIST_DUMP_SUBMIT"), nullptr, 10)
+                                                   : 0;
+                    if (dump_at && stats.submits.load() >= dump_at && dumps.fetch_add(1) < 3) {
+                        HistDumpAddr(t_last_q, 200, "sample");
+                    }
+                }
                 if (Compare(func, *addr & mask, ref)) {
                     break;
                 }
                 u32 pending = 0;
                 if (PendingFence(reinterpret_cast<u64>(addr), &pending) && Compare(func, pending & mask, ref)) {
+                    HistAdd('P', reinterpret_cast<u64>(addr), pending, t_ring ? t_ring->index : 99);
                     break;
                 }
                 // Whatever produces the value may sit in recorded host work.
                 if (renderer) {
                     renderer->OnSubmit();
                 }
+                HistAdd('S', reinterpret_cast<u64>(addr), ref, t_ring ? t_ring->index : 99);
                 const u64 t = LtOn() ? LtNow() : 0;
                 struct Report {
                     u64 t;
@@ -1021,12 +1324,26 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     // runs before anything this queue records after the wait.
                     if (!Capture::ReplayApplying() && PendingFence(reinterpret_cast<u64>(addr), &pending) &&
                         Compare(func, pending & mask, ref)) {
-                        break;
+                        HistAdd('p', reinterpret_cast<u64>(addr), pending, t_ring ? t_ring->index : 99);
+                            break;
                     }
                     const auto waited = std::chrono::steady_clock::now() - t0;
                     if (waited > std::chrono::seconds(1)) {
                         DC_WARN("gpu: WaitRegMem timeout (addr=%p val=%#x ref=%#x mask=%#x func=%u)",
                                 addr, *addr, ref, mask, func);
+                        HistAdd('T', reinterpret_cast<u64>(addr), *addr, t_ring ? t_ring->index : 99);
+                        HistDump(reinterpret_cast<u64>(addr), t_ring ? t_ring->index : 99);
+                        if (HistOn()) {
+                            std::scoped_lock rl(rings_lock);
+                            for (auto& r : rings) {
+                                if (r) {
+                                    DC_WARN("gpu:   ring %u: busy %d waiting %d jobs queued %zu", r->index,
+                                            int(r->busy), int(r->waiting.load()), r->jobs.size());
+                                }
+                            }
+                            DC_WARN("gpu:   submits %llu draws %llu", (unsigned long long)stats.submits.load(),
+                                    (unsigned long long)stats.draws.load());
+                        }
                         break;
                     }
                     if (no_sleep || waited < kWaitSpin) {
