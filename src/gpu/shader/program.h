@@ -121,6 +121,7 @@ struct Program {
     bool uses_lds = false;     // any DS instruction
     bool uses_barrier = false; // S_BARRIER
     bool uses_atomic = false;  // buffer atomics (not idempotent: cannot run more than once)
+    bool writes_memory = false; // buffer/image stores or atomics: later work may read what it writes
     u8 group_id_dims = 0;      // compute: work group dims (bits 0-2) image descriptors depend on
     // Per instruction index: this lane is surely on before it (see LaneOn).
     std::vector<bool> lane_on;

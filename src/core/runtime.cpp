@@ -28,6 +28,7 @@
 #include "core/tls.h"
 
 extern std::atomic<bool> g_sync_shaders_now; // gpu/metal/mtl_renderer.mm
+extern std::atomic<bool> g_course_loaded;     // gpu/metal/mtl_compiler.mm (DC_MSL_SALT)
 
 namespace Core::Runtime {
 
@@ -178,6 +179,9 @@ extern "C" void DcGt7Log(void*, int level, void*, void*, const char* file, int l
     }
     DC_INFO("game[%d] %s:%d %s", level, name, line, text);
     Hle::Pad::OnGameLog(name, line, text);
+    if (std::strstr(text, "loading course file") && !g_course_loaded.exchange(true)) {
+        DC_INFO("gpu: course loading");
+    }
     static const bool sync_on_course = std::getenv("DC_SYNC_ON_COURSE") != nullptr;
     if (sync_on_course && std::strstr(text, "loading course file") &&
         !g_sync_shaders_now.exchange(true)) {

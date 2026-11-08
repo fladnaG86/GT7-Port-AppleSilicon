@@ -54,7 +54,7 @@ id<MTLComputePipelineState> TessKernel(Program *p, const Shader::MslOptions &o, 
           done_compute.emplace_back(key, pso);
         }
         done_cv.notify_all();
-      }, /*urgent=*/true);
+      }, /*urgent=*/true, key);
     }
     WaitCompiled(key);
     it = compute_pipelines.find(key);

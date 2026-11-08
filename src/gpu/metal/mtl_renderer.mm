@@ -1243,7 +1243,11 @@ struct MetalRenderer::Impl {
       [device sampleTimestamps:&ts_cpu0 gpuTimestamp:&ts_gpu0];
       DC_INFO("gpu: pass timing %s", pass_timing ? "on" : "unavailable");
     }
-    compiler = std::make_unique<ShaderCompiler>(device, 4);
+    // DC_COMPILE_THREADS=<n>: background compile workers (default 4), plus
+    // one that only serves urgent jobs.
+    const char *ct = std::getenv("DC_COMPILE_THREADS");
+    compiler = std::make_unique<ShaderCompiler>(
+        device, ct ? std::clamp<u32>(static_cast<u32>(std::atoi(ct)), 1, 32) : 4u);
     PrewarmStart();
     signal_event = [device newSharedEvent];
     signal_listener = [[MTLSharedEventListener alloc]
@@ -1615,6 +1619,11 @@ struct MetalRenderer::Impl {
   std::unordered_map<void *, u64> split_by;
   u64 stat_passes = 0, stat_split = 0;
   u64 stat_pipe_miss = 0, stat_msl_gen = 0; // DC_GPU_STATS: render pipeline misses
+  // Draws skipped because their pipeline was compiling, by class: [0] depth or
+  // stencil only, [1] color + depth/stencil, [2] color only, [3] storing to
+  // memory. Logged with "perf:"; frame_skips feeds DC_HOLD_SKIPPED.
+  u64 stat_skip[4] = {}, frame_skips = 0, stat_skip_max = 0, stat_held = 0, frame_skip[4] = {};
+  u32 held_run = 0;
   // DC_GPU_STATS: draws that reopened a pass over the same attachments:
   // [0] pending clear, [1] it samples an attachment (by pixel shader).
   u64 stat_break[2] = {};
@@ -3118,12 +3127,24 @@ struct MetalRenderer::Impl {
     done_compute.clear();
   }
 
-  // Blocks until the pipeline `key` has been compiled.
-  void WaitCompiled(u64 key) {
+  // Blocks until the pipeline `key` has been compiled. A job still queued
+  // runs right here (ShaderCompiler::RunNow) instead of waiting for a worker
+  // to reach it; meanwhile the workers start nothing new.
+  u64 stat_wait_ms[4] = {}, stat_wait_n[4] = {}, stat_wait_inline = 0; // by WaitKind
+  enum WaitKind { kWaitCompute, kWaitDraw, kWaitDepth, kWaitOther };
+  static constexpr const char *kWaitNames[4] = {"compute", "draw", "depth-only draw", "gs/tess"};
+  void WaitCompiled(u64 key, WaitKind kind = kWaitOther) {
     if (!pending.count(key)) {
       return;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    const size_t queued = compiler->Queued();
+    compiler->BeginWait();
+    const bool inline_run = compiler->RunNow(key);
+    stat_wait_inline += inline_run;
+    if (inline_run) {
+      TakeCompiled();
+    }
     while (pending.count(key)) {
       {
         std::unique_lock lk(done_lock);
@@ -3132,12 +3153,16 @@ struct MetalRenderer::Impl {
       }
       TakeCompiled();
     }
+    compiler->EndWait();
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
+    stat_wait_ms[kind] += static_cast<u64>(ms);
+    ++stat_wait_n[kind];
     if (ms > 100) {
-      DC_WARN("gpu: waited %.0f ms for a pipeline (%zu still compiling)", ms,
-              pending.size());
+      DC_WARN("gpu: waited %.0f ms for a pipeline (%s, %s; %zu still compiling, %zu queued)", ms,
+              kWaitNames[kind], inline_run ? "compiled here" : "already compiling", pending.size(),
+              queued);
     }
   }
 
@@ -5659,7 +5684,7 @@ struct MetalRenderer::Impl {
               done_render.emplace_back(pkey, pso);
             }
             done_cv.notify_all();
-          }, /*urgent=*/true);
+          }, /*urgent=*/true, pkey);
         }
         WaitCompiled(pkey);
         it = pipelines.find(pkey);
@@ -5758,7 +5783,7 @@ struct MetalRenderer::Impl {
             done_compute.emplace_back(key, pso);
           }
           done_cv.notify_all();
-        }, /*urgent=*/true);
+        }, /*urgent=*/true, key);
       }
       WaitCompiled(key);
       it = compute_pipelines.find(key);
@@ -7112,6 +7137,33 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   const u64 pkey = flat_draw ? Hash(u64(0xF1A7), Hash(pk)) : Hash(pk);
   TakeCompiled();
   auto pit = pipelines.find(pkey);
+  // A draw whose pipeline is not compiled yet is skipped, except:
+  // - probed draws, DC_DEBUG_VSOUT captures (one-off pipelines), fused GS
+  //   draws (text glyphs: each ES+GS+VS combination is its own pipeline,
+  //   skipping it loses letters), and everything under DC_SYNC_SHADERS;
+  // - DC_WAIT_DEPTH=1 (default): draws writing depth or stencil in a pass
+  //   with no color output (depth prepasses, shadow maps, one-off bakes: a
+  //   skipped depth prepass leaves holes under the EQUAL color pass, a
+  //   skipped bake is lost for the session); =2: every draw writing depth or
+  //   stencil; =0: those are skipped too;
+  // - DC_WAIT_MEM=1 (default): draws whose shaders store to memory (later
+  //   work reads it); =0 skips them.
+  static const int wait_depth = [] {
+    const char *e = std::getenv("DC_WAIT_DEPTH");
+    return e ? std::atoi(e) : 1;
+  }();
+  static const bool wait_mem = [] {
+    const char *e = std::getenv("DC_WAIT_MEM");
+    return e ? std::atoi(e) != 0 : true;
+  }();
+  const bool depth_out = depth && ((((db_control >> 1) & 1) && ((db_control >> 2) & 1)) ||
+                                   (stencil_valid && (db_control & 1)));
+  const bool mem_out = (vs && vs->writes_memory) || (ps && ps->writes_memory);
+  const bool must_run =
+      sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) || probe_slot >= 0 ||
+      fused_pending.on || capture || (depth_out && (wait_depth >= 2 || (wait_depth == 1 && !any_color))) ||
+      (mem_out && wait_mem);
+  const u32 skip_class = mem_out ? 3 : depth_out ? (any_color ? 1 : 0) : 2;
   if (pit == pipelines.end()) {
     if (!pending.count(pkey)) {
       MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -7203,8 +7255,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }
       const bool has_ps = ps != nullptr;
       const bool flat = flat_draw && ps && out_type[0] == OutType::Float;
-      const bool will_wait = sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) ||
-                             probe_slot >= 0 || capture;
+      const bool will_wait = must_run;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr, has_ps] {
         id<MTLRenderPipelineState> pso = nil;
@@ -7228,18 +7279,27 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
           done_render.emplace_back(pkey, pso);
         }
         done_cv.notify_all();
-      }, will_wait);
+      }, will_wait, pkey);
     }
-    // Probed draws must run, and so must fused GS draws (text glyphs: each
-    // ES+GS+VS combination is its own pipeline, skipping it loses letters).
-    // A DC_DEBUG_VSOUT capture is a one-off pipeline: wait for it too.
-    if (!sync_shaders && !g_sync_shaders_now.load(std::memory_order_relaxed) &&
-        probe_slot < 0 && !fused_pending.on && !capture) {
+    if (!must_run) {
+      compiler->Touch(pkey);
+      ++stat_skip[skip_class];
+      ++frame_skip[skip_class];
+      ++frame_skips;
       if (trace)
         DC_INFO("gpu:   skipped: pipeline compiling");
       return;
     }
-    WaitCompiled(pkey);
+    {
+      const auto w0 = std::chrono::steady_clock::now();
+      WaitCompiled(pkey, depth_out && !any_color ? kWaitDepth : kWaitDraw);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+      if (ms > 100) {
+        DC_INFO("gpu:   (that wait: draw vs %#llx ps %#llx, %s%s%s%s)", (unsigned long long)vs_addr,
+                (unsigned long long)ps_addr, depth_out ? "writes depth " : "", any_color ? "color " : "",
+                mem_out ? "stores to memory " : "", fused_pending.on ? "fused gs" : "");
+      }
+    }
     pit = pipelines.find(pkey);
   }
   id<MTLRenderPipelineState> pso = pit->second;
@@ -8144,10 +8204,10 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
           done_compute.emplace_back(pkey, pso);
         }
         done_cv.notify_all();
-      }, /*urgent=*/true); // waited for right below
+      }, /*urgent=*/true, pkey); // waited for right below
     }
     // Dispatches often produce data later work depends on: wait.
-    WaitCompiled(pkey);
+    WaitCompiled(pkey, kWaitCompute);
     it = compute_pipelines.find(pkey);
   }
   id<MTLComputePipelineState> pso = it->second;
@@ -8459,6 +8519,22 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       const double gpu_s = perf_gpu_ns.exchange(0) / 1e9;
       DC_INFO("perf: %.1f fps, gpu %.1f ms/frame (busy %.0f%%), %zu pipelines compiling",
               frames / dt, gpu_s * 1e3 / frames, gpu_s / dt * 100, pending.size());
+      DC_INFO("perf: skipped draws (pipeline compiling) %llu: depth-only %llu, color+depth %llu, "
+              "color %llu, memory %llu; max %llu in a frame, %llu frames held; waits: compute %llu/%llu ms, "
+              "draw %llu/%llu ms, depth-only %llu/%llu ms, gs/tess %llu/%llu ms, %llu compiled inline",
+              (unsigned long long)(stat_skip[0] + stat_skip[1] + stat_skip[2] + stat_skip[3]),
+              (unsigned long long)stat_skip[0], (unsigned long long)stat_skip[1],
+              (unsigned long long)stat_skip[2], (unsigned long long)stat_skip[3],
+              (unsigned long long)stat_skip_max, (unsigned long long)stat_held,
+              (unsigned long long)stat_wait_n[0], (unsigned long long)stat_wait_ms[0],
+              (unsigned long long)stat_wait_n[1], (unsigned long long)stat_wait_ms[1],
+              (unsigned long long)stat_wait_n[2], (unsigned long long)stat_wait_ms[2],
+              (unsigned long long)stat_wait_n[3], (unsigned long long)stat_wait_ms[3],
+              (unsigned long long)stat_wait_inline);
+      std::fill(std::begin(stat_skip), std::end(stat_skip), 0);
+      std::fill(std::begin(stat_wait_n), std::end(stat_wait_n), 0);
+      std::fill(std::begin(stat_wait_ms), std::end(stat_wait_ms), 0);
+      stat_skip_max = stat_held = stat_wait_inline = 0;
       LogMemory();
       perf_frames = 1;
       perf_t0 = now;
@@ -8770,7 +8846,35 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     }
   }
   Commit(false);
-  if (src) {
+  // DC_HOLD_SKIPPED=<n> (default 100, 0: off): a frame that skipped n or more
+  // draws (pipelines compiling) is not shown; the previous one stays on
+  // screen, for at most DC_HOLD_MAX (default 20) frames in a row.
+  static const u64 hold_at = [] {
+    const char *e = std::getenv("DC_HOLD_SKIPPED");
+    return e ? std::strtoull(e, nullptr, 10) : 100ull;
+  }();
+  static const u32 hold_max = [] {
+    const char *e = std::getenv("DC_HOLD_MAX");
+    return e ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : 20u;
+  }();
+  static const bool log_skips = std::getenv("DC_LOG_SKIPS") != nullptr;
+  if (log_skips && frame_skips) {
+    DC_INFO("gpu: flip #%llu: %llu draws skipped (pipelines compiling: depth-only %llu, color+depth %llu, "
+            "color %llu, memory %llu), %zu compiling",
+            (unsigned long long)frame_count, (unsigned long long)frame_skips,
+            (unsigned long long)frame_skip[0], (unsigned long long)frame_skip[1],
+            (unsigned long long)frame_skip[2], (unsigned long long)frame_skip[3], pending.size());
+  }
+  std::fill(std::begin(frame_skip), std::end(frame_skip), 0);
+  stat_skip_max = std::max(stat_skip_max, frame_skips);
+  const bool hold = src && hold_at && frame_skips >= hold_at && held_run < hold_max &&
+                    latest_frame.load(std::memory_order_relaxed) != nullptr;
+  frame_skips = 0;
+  if (hold) {
+    ++held_run;
+    ++stat_held;
+  } else if (src) {
+    held_run = 0;
     latest_boost.store((__bridge void *)edr_frame, std::memory_order_release);
     latest_frame.store((__bridge void *)dst, std::memory_order_release);
     frame_index = (frame_index + 1) % 3;

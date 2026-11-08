@@ -972,6 +972,12 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
         p->uses_barrier |= i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_BARRIER;
         p->uses_atomic |= i.enc == Enc::MUBUF && static_cast<Mubuf>(i.op) >= Mubuf::BUFFER_ATOMIC_SWAP &&
                           static_cast<Mubuf>(i.op) <= Mubuf::BUFFER_ATOMIC_FMAX;
+        {
+            const u16 op = i.op;
+            p->writes_memory |= (i.enc == Enc::MUBUF && ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || op >= 48)) ||
+                                (i.enc == Enc::MTBUF && op >= 4 && op <= 7) ||
+                                (i.enc == Enc::MIMG && ((op >= 8 && op <= 9) || (op >= 15 && op <= 31)));
+        }
 
         switch (i.enc) {
         case Enc::EXP:
