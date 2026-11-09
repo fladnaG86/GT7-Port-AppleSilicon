@@ -521,6 +521,36 @@ s64 sceNetRecv(s32 s, void* buf, size_t len, s32 flags) {
     return VRecv(s, buf, len, (flags & 2) != 0); // MSG_PEEK
 }
 
+// Datagram reads: nothing arrives on this Mac. Blocks a while (a blocking
+// socket would wait forever), then EAGAIN.
+s64 sceNetRecvfrom(s32 s, void* buf, size_t len, s32 flags, void* from, u32* fromlen) {
+    (void)from;
+    (void)fromlen;
+    {
+        std::scoped_lock lk(g_sock_mutex);
+        auto it = g_socks.find(s);
+        if (it != g_socks.end() && it->second.connected) {
+            // A stream socket read through recvfrom.
+        } else {
+            it = g_socks.end();
+        }
+        if (it == g_socks.end()) {
+            goto idle;
+        }
+    }
+    return VRecv(s, buf, len, (flags & 2) != 0);
+idle:
+    usleep(250000);
+    return NetFail(kNetEAGAIN);
+}
+
+s32 sceNetBind(s32 s, const void* addr, u32 addrlen) {
+    (void)s;
+    (void)addr;
+    (void)addrlen;
+    return 0;
+}
+
 s32 sceNetGetpeername(s32 s, u8* addr, u32* addrlen) {
     if (addr && addrlen && *addrlen >= 16) {
         std::memset(addr, 0, 16);
@@ -560,11 +590,14 @@ struct NetEpollEvent {
 std::map<s32, std::map<s32, NetEpollEvent>> g_epolls;
 s32 g_next_epoll = 0x4000;
 
+// Only sockets connected to the asset server are ever ready; the others (a
+// UDP listener, say) never receive anything here, so they stay quiet instead of
+// waking their reader for an empty read in a loop.
 u32 ReadyMask(s32 sock, u32 want) {
     auto it = g_socks.find(sock);
-    if (it == g_socks.end()) return 0;
+    if (it == g_socks.end() || !it->second.connected) return 0;
     u32 got = want & 4u;
-    if ((want & 1u) && (!it->second.out.empty() || it->second.shut || !it->second.connected)) got |= 1u;
+    if ((want & 1u) && (!it->second.out.empty() || it->second.shut)) got |= 1u;
     return got;
 }
 
@@ -809,6 +842,8 @@ void RegisterNet() {
     DC_HLE("libSceNet", sceNetConnect);
     DC_HLE("libSceNet", sceNetSend);
     DC_HLE("libSceNet", sceNetRecv);
+    DC_HLE("libSceNet", sceNetRecvfrom);
+    DC_HLE("libSceNet", sceNetBind);
     DC_HLE("libSceNet", sceNetGetpeername);
     DC_HLE("libSceNet", sceNetGetsockname);
     DC_HLE("libSceNet", sceNetEpollCreate);
