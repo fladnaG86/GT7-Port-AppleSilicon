@@ -142,6 +142,11 @@ int lci_rename(const char* from, const char* to) {
 
 } // namespace
 
+// The guest's libSceNet errno (sceNetErrnoLoc), for the net HLE.
+int* NetErrno() {
+    return sceNetErrnoLoc();
+}
+
 int* GuestErrno() {
     return &t_errno;
 }

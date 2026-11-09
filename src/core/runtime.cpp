@@ -2,6 +2,7 @@
 #include <cstdio>
 
 #include "hle/pad/pad.h"
+#include "hle/net/net.h"
 #include "core/guest_profile.h"
 #include "core/guest_trace.h"
 #include "core/runtime.h"
@@ -218,6 +219,12 @@ void HookGt7Log(const Loader::Module& exe) {
 }
 
 void RelocateFixedHeap(const Loader::Module& exe) {
+    if (IsGt7V100(exe)) {
+        // GT7 v1.00's Vegas message keys (base64, next to its online transport):
+        // the local asset server encodes its files with them.
+        Hle::Net::SetVegasKeys(reinterpret_cast<const char*>(exe.Base() + 0x4735b43),
+                               reinterpret_cast<const char*>(exe.Base() + 0x4735b70));
+    }
     if (RelocateGt7Arenas(exe)) {
         RelocateGt7PrtApertures(exe);
         HookGt7Log(exe);
