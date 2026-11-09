@@ -48,6 +48,7 @@ set(DC_CORE_SOURCES
     src/core/runtime.h
     src/core/signals.cpp
     src/core/guest_profile.cpp
+    src/core/gt7_cipher.cpp
     src/core/guest_trace.cpp
     src/core/signals.h
     src/core/tls.cpp
