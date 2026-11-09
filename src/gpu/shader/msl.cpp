@@ -27,8 +27,11 @@ namespace Gpu::Shader {
 using namespace Gcn;
 
 bool TessBakedConsts() {
-    static const bool baked = std::getenv("DC_TESS_BAKED") != nullptr;
-    return baked;
+    // Opt-in (DC_TESS_UNIFORMS=1): with the uniforms the game stalled at boot in
+    // about 1 run in 4 (logic stops ~14 s in, frames still submitted; 5 of ~20
+    // runs, 0 of 16 baked). Cause not found yet (it hides under the guest profiler).
+    static const bool uniforms = std::getenv("DC_TESS_UNIFORMS") != nullptr && std::getenv("DC_TESS_BAKED") == nullptr;
+    return !uniforms;
 }
 
 namespace {

@@ -231,8 +231,8 @@ std::string GenerateMsl(const Program& p, const MslOptions& o, std::vector<std::
 // TessInfo::patches and ::lds_dwords reach the LS / HS / domain shaders as
 // Binding::TessParams, so they are not part of the pipeline key: the game
 // changes both from draw to draw (NUM_PATCHES and the LS's LDS_SIZE follow
-// the patch count) and every pair was a new compile. DC_TESS_BAKED=1: baked
-// into the MSL as constants, as before.
+// the patch count) and every pair was a new compile. Opt-in for now:
+// DC_TESS_UNIFORMS=1 (default: baked into the MSL as constants, as before).
 bool TessBakedConsts();
 
 } // namespace Gpu::Shader
