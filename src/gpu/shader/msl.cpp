@@ -26,6 +26,11 @@ namespace Gpu::Shader {
 
 using namespace Gcn;
 
+bool TessBakedConsts() {
+    static const bool baked = std::getenv("DC_TESS_BAKED") != nullptr;
+    return baked;
+}
+
 namespace {
 
 // Back edges one invocation may take before it gives up (see LoopGuard).
@@ -45,6 +50,11 @@ std::string Hex64(u64 v) {
 
 std::string N(u32 v) {
     return std::to_string(v);
+}
+
+// Patches per HS threadgroup in a tess shader expression (TessBakedConsts).
+std::string TessPatches(const MslOptions& o) {
+    return TessBakedConsts() ? N(o.tess.patches) + "u" : std::string("dc_np");
 }
 
 u32 FloatBits(float f) {
@@ -2185,10 +2195,11 @@ std::string Emitter::Run() {
             if (o.tess.oc_sgpr) {
                 sinit[k2++] = "dc_gid.x * " + N(o.tess.oc_bytes) + "u";
             }
-            sinit[k2] = "dc_gid.x * " + N(o.tess.patches * o.tess.tf_bytes) + "u";
+            sinit[k2] = TessBakedConsts() ? "dc_gid.x * " + N(o.tess.patches * o.tess.tf_bytes) + "u"
+                                          : "dc_gid.x * dc_np * " + N(o.tess.tf_bytes) + "u";
         }
     } else if (p.stage == Stage::Vertex && o.tess.stage == TessStage::Domain && o.tess.oc_sgpr) {
-        sinit[nud] = "(vid / " + N(o.tess.patches) + "u) * " + N(o.tess.oc_bytes) + "u"; // off-chip offset
+        sinit[nud] = "(vid / " + TessPatches(o) + ") * " + N(o.tess.oc_bytes) + "u"; // off-chip offset
     }
     for (u32 k = 0; k < std::max(max_sgpr, nud); ++k) {
         dl("uint s" + N(k) + " = " + sinit[k] + ";");
@@ -2202,7 +2213,7 @@ std::string Emitter::Run() {
     if (p.stage == Stage::Vertex && o.tess.stage == TessStage::Domain) {
         // u, v, relative patch id, patch id (vid is the Metal patch id).
         const char* dv[4] = {"as_type<uint>(dc_uv.x)", "as_type<uint>(dc_uv.y)", "", "vid"};
-        const std::string rel = "(vid % " + N(o.tess.patches) + "u)";
+        const std::string rel = "(vid % " + TessPatches(o) + ")";
         for (u32 k = 0; k < 4 && k < vinit.size(); ++k) vinit[k] = k == 2 ? rel : dv[k];
     } else if (p.stage == Stage::Compute && o.tess.stage == TessStage::Local) {
         // Vertex index, relative vertex in the threadgroup, instance 0.
@@ -2211,7 +2222,7 @@ std::string Emitter::Run() {
     } else if (p.stage == Stage::Compute && o.tess.stage == TessStage::Hull) {
         // Patch id, then relative patch id | control point id << 8.
         const std::string rel = "(dc_lidx / " + N(o.tess.cp_out) + "u)";
-        if (vinit.size() > 0) vinit[0] = "(dc_gid.x * " + N(o.tess.patches) + "u + " + rel + ")";
+        if (vinit.size() > 0) vinit[0] = "(dc_gid.x * " + TessPatches(o) + " + " + rel + ")";
         if (vinit.size() > 1) vinit[1] = "(" + rel + " | ((dc_lidx % " + N(o.tess.cp_out) + "u) << 8))";
     } else if (p.stage == Stage::Vertex) {
         if (!vinit.empty()) vinit[0] = "vid";
@@ -2371,7 +2382,7 @@ std::string Emitter::Run() {
         if (o.fused.on) {
             src += *o.fused.es_src + "\n" + *o.fused.gs_src + "\n";
         }
-        src += "static VsOut dc_run(uint vid, uint iid, " + std::string(domain ? "float2 dc_uv, device uint* lds, " : "") +
+        src += "static VsOut dc_run(uint vid, uint iid, " + std::string(domain ? (TessBakedConsts() ? "float2 dc_uv, device uint* lds, " : "float2 dc_uv, device uint* lds, uint dc_np, ") : "") +
                std::string(o.fused.on ? "ulong dc_gsvs, ulong dc_gsvs_bias, " : "") + "constant uint* ud, thread const DcMem& mem" +
                std::string(stage_in ? ", thread const VsIn& in_" : "") + TexParams(false) +
                ") {\n    VsOut out = {};\n" + (o.points ? "    out.psize = 1.0f;\n" : "") + decl + wrapped + "}\n\n";
@@ -2380,7 +2391,8 @@ std::string Emitter::Run() {
         src += domain ? std::string(o.tess.domain == 1 ? "[[patch(triangle)]] " : "[[patch(quad)]] ") +
                             "vertex VsOut main0(uint vid [[patch_id]], " +
                             (o.tess.domain == 1 ? "float3" : "float2") + " dc_pos [[position_in_patch]], uint iid [[instance_id]], " +
-                            "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]], "
+                            "device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]], " +
+                            (TessBakedConsts() ? std::string() : "constant uint4& dc_tp [[buffer(" + N(Binding::TessParams) + ")]], ")
                       : std::string("vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], ");
         src +=                std::string(stage_in ? "VsIn in_ [[stage_in]], " : "") + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
@@ -2429,8 +2441,11 @@ std::string Emitter::Run() {
             }
             src += "        }\n    }\n";
         } else {
-            src += domain ? "    o = dc_run(vid, iid, dc_pos.xy, dc_ldsm + (vid / " + N(o.tess.patches) + "u) * " +
-                                N(o.tess.lds_dwords) + "u, " + args + ");\n"
+            src += domain ? (TessBakedConsts()
+                                  ? "    o = dc_run(vid, iid, dc_pos.xy, dc_ldsm + (vid / " + N(o.tess.patches) + "u) * " +
+                                        N(o.tess.lds_dwords) + "u, " + args + ");\n"
+                                  : "    o = dc_run(vid, iid, dc_pos.xy, dc_ldsm + (vid / dc_tp.x) * dc_tp.y, dc_tp.x, " + args +
+                                        ");\n")
                           : "    o = dc_run(vid, iid, " + args + ");\n";
         }
         if (o.debug_capture) {
@@ -2527,7 +2542,9 @@ std::string Emitter::Run() {
                                           "uint3 dc_gtid [[thread_position_in_grid]], uint3 dc_tpg3 [[threads_per_threadgroup]], ")) +
                mem_params + ", device uint* gds [[buffer(5)]]" +
                (ring_vertex ? std::string()
-                : tess_lds  ? ", device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]"
+                : tess_lds  ? ", device uint* dc_ldsm [[buffer(" + N(Binding::TessLds) + ")]]" +
+                                  (TessBakedConsts() ? std::string()
+                                                     : ", constant uint4& dc_tp [[buffer(" + N(Binding::TessParams) + ")]]")
                             : std::string(", threadgroup uint* lds [[threadgroup(0)]]")) +
                (o.tess.stage == TessStage::Hull ? ", device uint* dc_tf [[buffer(" + N(Binding::TessFactors) + ")]]" : "") +
                (o.tess.index_size ? std::string(", device const ") + (o.tess.index_size == 2 ? "ushort" : "uint") +
@@ -2560,7 +2577,8 @@ std::string Emitter::Run() {
                    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         }
         if (tess_lds) {
-            src += "    device uint* lds = dc_ldsm + dc_gid.x * " + N(o.tess.lds_dwords) + "u;\n";
+            src += TessBakedConsts() ? "    device uint* lds = dc_ldsm + dc_gid.x * " + N(o.tess.lds_dwords) + "u;\n"
+                                     : "    uint dc_np = dc_tp.x; device uint* lds = dc_ldsm + dc_gid.x * dc_tp.y; (void)dc_np;\n";
         }
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
         if (o.ring.stage != RingStage::None) {

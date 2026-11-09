@@ -113,6 +113,8 @@ bool RunTessKernel(const Shader::TessInfo &info, u64 addr, const u32 *ud, u32 rs
   [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
   [e setBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
   [e setBuffer:tess_lds offset:0 atIndex:Shader::Binding::TessLds];
+  const u32 tp[4] = {info.patches, info.lds_dwords, 0, 0};
+  [e setBytes:tp length:sizeof(tp) atIndex:Shader::Binding::TessParams];
   if (tf) {
     [e setBuffer:tf offset:0 atIndex:Shader::Binding::TessFactors];
   }

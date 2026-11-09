@@ -3287,10 +3287,12 @@ struct MetalRenderer::Impl {
   // TessInfo by its fields: hashing the struct took its padding bytes along,
   // left as they were on DrawTess's stack (the key, so the pipeline, could
   // change from one draw to the next, and no prewarm record matched).
+  // patches and lds_dwords are left out unless baked (Shader::TessBakedConsts).
   static u64 TessHash(const Shader::TessInfo &t, u64 seed) {
-    const u32 w[10] = {u32(t.stage), t.patches,   t.cp_in,         t.cp_out,
-                       t.lds_dwords, t.oc_bytes,  t.tf_bytes,      u32(t.oc_sgpr),
-                       t.tf_sgpr,    u32(t.index_size) | u32(t.domain) << 8};
+    const bool baked = Shader::TessBakedConsts();
+    const u32 w[10] = {u32(t.stage),  baked ? t.patches : 0u, t.cp_in,    t.cp_out,
+                       baked ? t.lds_dwords : 0x7e55u, t.oc_bytes, t.tf_bytes, u32(t.oc_sgpr),
+                       t.tf_sgpr,     u32(t.index_size) | u32(t.domain) << 8};
     return Fnv(w, sizeof(w), seed);
   }
   // The tessellator state of a domain-pass pipeline (DrawTess); `pw` is
@@ -8576,6 +8578,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
     [enc setVertexBuffer:tess_lds offset:0 atIndex:Shader::Binding::TessLds];
     bound.buf[0][Shader::Binding::TessLds] = nil;
+    {
+      const u32 tp[4] = {tess_draw->info.patches, tess_draw->info.lds_dwords, 0, 0};
+      [enc setVertexBytes:tp length:sizeof(tp) atIndex:Shader::Binding::TessParams];
+      bound.buf[0][Shader::Binding::TessParams] = nil;
+    }
     [enc setTessellationFactorBuffer:tess_draw->factors offset:0 instanceStride:0];
     [enc drawPatches:0
               patchStart:0

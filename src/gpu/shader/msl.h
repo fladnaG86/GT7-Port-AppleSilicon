@@ -34,6 +34,7 @@ constexpr u32 TessLds = 10; // device uint*: LS/HS LDS slices (MslOptions::tess)
 constexpr u32 TessFactors = 11; // device uint*: tess factors the HS stores (MslOptions::tess)
 constexpr u32 RingEsUd = 12;    // constant uint[16]: the ES's user data (MslOptions::fused)
 constexpr u32 RingGsUd = 13;    // constant uint[16]: the GS's user data (MslOptions::fused)
+constexpr u32 TessParams = 14;  // constant uint4: patches per group, LDS dwords per group (MslOptions::tess)
 } // namespace Binding
 
 // Geometry-shader emulation. Metal has no GS stage: the ES and the GS of a GS
@@ -226,5 +227,12 @@ struct MslOptions {
 // Returns the MSL source; the entry point is "main0". Opcodes that could not
 // be translated are appended to `unsupported`.
 std::string GenerateMsl(const Program& p, const MslOptions& o, std::vector<std::string>* unsupported);
+
+// TessInfo::patches and ::lds_dwords reach the LS / HS / domain shaders as
+// Binding::TessParams, so they are not part of the pipeline key: the game
+// changes both from draw to draw (NUM_PATCHES and the LS's LDS_SIZE follow
+// the patch count) and every pair was a new compile. DC_TESS_BAKED=1: baked
+// into the MSL as constants, as before.
+bool TessBakedConsts();
 
 } // namespace Gpu::Shader
