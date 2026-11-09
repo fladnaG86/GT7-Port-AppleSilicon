@@ -1,5 +1,9 @@
 // libkernel memory: direct/flexible memory and the POSIX mmap family.
 
+#include <cstdlib>
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 
@@ -119,8 +123,59 @@ enum BatchMapOp : s32 {
     kBatchTypeProtect = 4,
 };
 
+// DC_DIAG_BATCHMAP=1: batches, entries by op and time each second, and every
+// batch over 5 ms (GT7 streams textures through these).
+struct BatchDiag {
+    std::atomic<u64> calls{0}, entries{0}, maps{0}, unmaps{0}, other{0}, ns{0}, max_ns{0};
+};
+static BatchDiag* BatchDiagOn() {
+    static BatchDiag* d = [] () -> BatchDiag* {
+        if (!std::getenv("DC_DIAG_BATCHMAP")) return nullptr;
+        auto* p = new BatchDiag();
+        std::thread([p] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const u64 c = p->calls.exchange(0);
+                if (!c) continue;
+                DC_INFO("batchmap: %llu calls, %llu entries (%llu map, %llu unmap, %llu other), %.1f ms, max %.1f ms",
+                        (unsigned long long)c, (unsigned long long)p->entries.exchange(0),
+                        (unsigned long long)p->maps.exchange(0), (unsigned long long)p->unmaps.exchange(0),
+                        (unsigned long long)p->other.exchange(0), p->ns.exchange(0) / 1e6, p->max_ns.exchange(0) / 1e6);
+            }
+        }).detach();
+        return p;
+    }();
+    return d;
+}
+
+static s32 BatchMapImpl(BatchMapEntry* entries, int count, int* done, int flags);
+
 // Stops at the first failure; `*done` tells the guest how many entries applied.
 s32 sceKernelBatchMap2(BatchMapEntry* entries, int count, int* done, int flags) {
+    BatchDiag* d = BatchDiagOn();
+    if (!d) {
+        return BatchMapImpl(entries, count, done, flags);
+    }
+    for (int i = 0; i < count; ++i) {
+        (entries[i].op == kBatchMapDirect ? d->maps : entries[i].op == kBatchUnmap ? d->unmaps : d->other)++;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const s32 r = BatchMapImpl(entries, count, done, flags);
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    d->calls++;
+    d->entries += static_cast<u64>(count);
+    d->ns += ns;
+    u64 m = d->max_ns.load();
+    while (ns > m && !d->max_ns.compare_exchange_weak(m, ns)) {
+    }
+    if (ns > 5000000) {
+        DC_INFO("batchmap: slow batch %.1f ms, %d entries", ns / 1e6, count);
+    }
+    return r;
+}
+
+static s32 BatchMapImpl(BatchMapEntry* entries, int count, int* done, int flags) {
     s32 result = ORBIS_OK;
     int applied = 0;
     for (; applied < count; ++applied) {
