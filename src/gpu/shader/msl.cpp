@@ -1548,6 +1548,20 @@ void Emitter::EmitBuffer(const Inst& i) {
             for (u32 k = 0; k < n; ++k) {
                 Line("  " + store_guard() + "dc_st(" + M + ", a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
             }
+        } else if (i.dfmt == 0 || i.dfmt == 15) {
+            // No data format (0) or none the hardware names (15): a null
+            // buffer, the store writes nothing. GT7 leaves other data in
+            // descriptor slots it does not use (shadgt7 FIX-GT7-126).
+            Line("  /* data format " + N(i.dfmt) + ": null buffer, store dropped */");
+        } else if (i.dfmt == 1 || i.dfmt == 2 || i.dfmt == 3 || i.dfmt == 5 || i.dfmt == 10 || i.dfmt == 12) {
+            // Packed 8/16-bit formats: packed as BUFFER_STORE_FORMAT does.
+            const u32 n = op - static_cast<u32>(Mtbuf::TBUFFER_STORE_FORMAT_X) + 1;
+            std::string v = "uint4(";
+            for (u32 k = 0; k < 4; ++k) {
+                v += (k ? ", " : "") + (k < n ? VName(i.vdata + k) : std::string("0u"));
+            }
+            Line("  " + store_guard() + "dc_store_fmt(" + M + ", a_, " + v + "), " + N(i.dfmt) + "u, " +
+                 N(i.nfmt) + "u);");
         } else {
             Unsupported(i);
         }
