@@ -8,6 +8,10 @@ under Rosetta 2, with a GCN-to-Metal renderer.
 > files, keys or decryption tools are included: you need your own legitimate copy of
 > the game.*
 
+![GT7 Music Rally at Alsace Village, Porsche 356 Speedster, running on a MacBook Pro M1 Max at 24 fps](media/gt7-music-rally-m1max.jpg)
+
+*Music Rally at Alsace Village on a MacBook Pro M1 Max under Rosetta 2, 24 fps (2026-11-09).*
+
 **Status: work in progress.** Boot, menus, display settings and races work. In a race
 on an M1 Max it runs at roughly 20-30 fps, with visual differences from the console and
 shader-compile stutters the first time a scene is seen. Current state, recent work and
