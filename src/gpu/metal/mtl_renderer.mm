@@ -789,6 +789,16 @@ struct MetalRenderer::Impl {
   // Target address -> write_seq of a compute memset over it. GT7 clears transient
   // images that way, and a host target there keeps the pixels of the last surface.
   std::unordered_map<u64, u64> memory_fills;
+  // Address -> (write_seq, bytes) of the last CP DMA fill or compute memset
+  // starting there, target or not: a draw into a colour target a fill rewrote
+  // whole since it was last drawn must not be skipped (Draw, DC_WAIT_AFTER_FILL).
+  std::unordered_map<u64, std::pair<u64, u64>> whole_fills;
+  void NoteWholeFill(u64 addr, u64 bytes) {
+    if (whole_fills.size() > 8192) {
+      whole_fills.clear();
+    }
+    whole_fills[addr] = {++write_seq, bytes};
+  }
   // Linear images in GT7's per-frame memory, filled from the guest memory
   // buffer on the GPU timeline at each bind (see GetTexture).
   std::unordered_map<u64, id<MTLTexture>> gpu_linear_tex;
@@ -1614,6 +1624,7 @@ struct MetalRenderer::Impl {
         early_fills.clear();
       }
       early_fills[dst & kGpuAddrMask] = 0; // a CP DMA fill
+      NoteWholeFill(dst & kGpuAddrMask, bytes);
     }
     EndPass();
     EnsureCommandBuffer();
@@ -1700,6 +1711,9 @@ struct MetalRenderer::Impl {
   // memory. Logged with "perf:"; frame_skips feeds DC_HOLD_SKIPPED.
   u64 stat_skip[4] = {}, frame_skips = 0, stat_skip_max = 0, stat_held = 0, frame_skip[4] = {};
   u64 stat_eq_wait = 0; // z-EQUAL draws that waited for their pipeline (DC_WAIT_EQUAL)
+  // One-off waits (Draw: DC_WAIT_AFTER_FILL, DC_WAIT_NEW_LAYOUT): ms this frame, counts.
+  double frame_oneoff_ms = 0;
+  u64 stat_fill_wait = 0, stat_new_layout_wait = 0;
   u32 held_run = 0;
   // DC_GPU_STATS: draws that reopened a pass over the same attachments:
   // [0] pending clear, [1] it samples an attachment (by pixel shader).
@@ -4102,9 +4116,16 @@ struct MetalRenderer::Impl {
     // e.g. the cars' liveries): those blocks as a BC texture; over any other
     // target, the guest memory (the target's texels are not BC data).
     if (!storage && fi.compressed && tt.dim == TexDim::Tex2D) {
+      id<MTLTexture> bc = nil;
       if (RenderTarget *rt = Latest(color_targets, addr, tt.dim)) {
-        if (id<MTLTexture> bc = BlocksAsCompressed(*rt, fi, width, height,
-                                                   last_level + 1)) {
+        bc = BlocksAsCompressed(*rt, fi, width, height, last_level + 1);
+      }
+      if (!bc) { // levels written through targets of their own (BlockLevelsAsCompressed)
+        bc = BlockLevelsAsCompressed(addr, fi, width, height, pitch, tiling,
+                                     (t[3] >> 25) & 1, last_level + 1);
+      }
+      {
+        if (bc) {
           if (base_level == 0 && last_level + 1 >= bc.mipmapLevelCount &&
               swz == kIdentitySwizzle) {
             return bc;
@@ -5220,6 +5241,130 @@ struct MetalRenderer::Impl {
              destinationLevel:l
             destinationOrigin:MTLOriginMake(0, 0, 0)];
       off += row * bh;
+    }
+    [b endEncoding];
+    return c.tex;
+  }
+
+  // A BC texture whose levels a compute shader encoded one by one, each
+  // through a storage image of one texel per 4x4 block at that level's
+  // address, as wide as the level's padded pitch in blocks: GT7's Scapes
+  // compress the HDR photo (6024x4016 BC6H) through R32G32B32A32Uint images
+  // of 2048x1024 at the texture's address, 1024x512 at level 1's, ...
+  // (shadgt7 FIX-GT7-127). The guest memory, which only the GPU wrote, is
+  // zeros: a black background in the Scapes editor and in every photo.
+  // Levels from the first one with no such target on are left out (the
+  // sampler stops at the last). nil when level 0 has none.
+  // DC_NO_BLOCK_TARGETS=1: off.
+  struct BlockLevelsCopy {
+    id<MTLTexture> tex = nil;
+    std::vector<std::pair<const RenderTarget *, u64>> src; // (target, written) per level
+  };
+  std::unordered_map<u64, BlockLevelsCopy> block_level_copies;
+
+  id<MTLTexture> BlockLevelsAsCompressed(u64 addr, const TextureFormatInfo &fi, u32 width,
+                                         u32 height, u32 pitch, u32 tiling, bool pow2,
+                                         u32 levels) {
+    static const bool no_block_targets = std::getenv("DC_NO_BLOCK_TARGETS") != nullptr;
+    if (no_block_targets || !fi.bytes_per_block || fi.format == MTLPixelFormatInvalid ||
+        !Tiling::Supported(tiling) || !color_targets.count(addr)) {
+      return nil;
+    }
+    levels = std::clamp<u32>(levels, 1,
+                             std::min<u32>(16, 1 + static_cast<u32>(std::log2(std::max(width, height)))));
+    Tiling::MipLevel mips[16];
+    Tiling::MipLayout(tiling, pitch, height, 1, levels, fi.bytes_per_block, true, pow2, mips);
+    RenderTarget *src[16] = {};
+    u32 n = 0;
+    for (; n < levels; ++n) {
+      const u32 bw = std::max<u32>(1, ((width >> n) + 3) / 4);
+      const u32 bh = std::max<u32>(1, ((height >> n) + 3) / 4);
+      const u64 a = addr + mips[n].offset;
+      RenderTarget *rt = Latest(color_targets, a, TexDim::Tex2D, 0, 0, fi.bytes_per_block);
+      if (!rt || !rt->tex || !rt->initialized || rt->tex.textureType != MTLTextureType2D ||
+          rt->width < bw || rt->height < bh ||
+          rt->width > std::bit_ceil(std::max(mips[n].pitch_el, bw)) ||
+          rt->height > std::bit_ceil(std::max(mips[n].height_el, bh))) {
+        break;
+      }
+      if (const auto f = memory_fills.find(a); f != memory_fills.end() && f->second > rt->written) {
+        break; // cleared through memory since: memory is the level
+      }
+      src[n] = rt;
+    }
+    if (!n) {
+      return nil;
+    }
+    const u64 key = Hash(u64(fi.format) | (u64(width) << 16) | (u64(height) << 32), addr);
+    if (block_level_copies.size() > 256) {
+      block_level_copies.clear();
+    }
+    auto [cit, fresh] = block_level_copies.try_emplace(key);
+    BlockLevelsCopy &c = cit->second;
+    bool same = c.tex && c.tex.mipmapLevelCount == n && c.src.size() == n;
+    for (u32 l = 0; same && l < n; ++l) {
+      same = c.src[l].first == src[l] && c.src[l].second == src[l]->written;
+    }
+    if (same) {
+      return c.tex;
+    }
+    if (fresh) {
+      DC_INFO("gpu: BC texture %#llx %ux%u (format %lu) from %u level target%s (level 0 %ux%u)",
+              (unsigned long long)addr, width, height, (unsigned long)fi.format, n, n > 1 ? "s" : "",
+              src[0]->width, src[0]->height);
+    }
+    if (!c.tex || c.tex.mipmapLevelCount != n || c.tex.pixelFormat != fi.format) {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fi.format
+                                                                                   width:width
+                                                                                  height:height
+                                                                               mipmapped:n > 1];
+      d.mipmapLevelCount = n;
+      d.storageMode = MTLStorageModePrivate;
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      c.tex = [device newTextureWithDescriptor:d];
+      if (!c.tex) {
+        return nil;
+      }
+    }
+    u64 total = 0;
+    for (u32 l = 0; l < n; ++l) {
+      total += u64(std::max<u32>(1, ((width >> l) + 3) / 4)) *
+               std::max<u32>(1, ((height >> l) + 3) / 4) * fi.bytes_per_block;
+    }
+    id<MTLBuffer> buf = [device newBufferWithLength:total options:MTLResourceStorageModePrivate];
+    if (!buf) {
+      return nil;
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    u64 off = 0;
+    c.src.clear();
+    for (u32 l = 0; l < n; ++l) {
+      const u32 bw = std::max<u32>(1, ((width >> l) + 3) / 4);
+      const u32 bh = std::max<u32>(1, ((height >> l) + 3) / 4);
+      const u64 row = u64(bw) * fi.bytes_per_block;
+      [b copyFromTexture:src[l]->tex
+                   sourceSlice:0
+                   sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(bw, bh, 1)
+                      toBuffer:buf
+             destinationOffset:off
+        destinationBytesPerRow:row
+      destinationBytesPerImage:row * bh];
+      [b copyFromBuffer:buf
+                 sourceOffset:off
+            sourceBytesPerRow:row
+          sourceBytesPerImage:row * bh
+                   sourceSize:MTLSizeMake(std::max<u32>(1, width >> l),
+                                          std::max<u32>(1, height >> l), 1)
+                    toTexture:c.tex
+             destinationSlice:0
+             destinationLevel:l
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+      off += row * bh;
+      c.src.emplace_back(src[l], src[l]->written);
     }
     [b endEncoding];
     return c.tex;
@@ -7316,6 +7461,17 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     out_type[1] = out_type[0];
   }
 
+  // The colour targets as they were before this draw: BeginPass (below,
+  // before the pipeline lookup) marks them drawn. For the one-off waits.
+  bool never_drawn[8] = {};
+  u64 drawn_before[8] = {};
+  for (u32 k = 0; k < 8; ++k) {
+    if (colors[k]) {
+      never_drawn[k] = !colors[k]->initialized;
+      drawn_before[k] = colors[k]->written;
+    }
+  }
+
   RenderTarget *depth = nullptr;
   const u32 z_info = r[Reg::DB_Z_INFO];
   const u32 zfmt = z_info & 3;
@@ -7936,8 +8092,52 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   const bool mem_out = (vs && vs->writes_memory) || (ps && ps->writes_memory);
   const bool rule_wait = (depth_out && (wait_depth >= 2 || (wait_depth == 1 && !any_color))) ||
                          (mem_out && wait_mem) || (z_equal && wait_equal);
+  // Skipping keeps a colour target's last picture: right for a target drawn
+  // every frame, wrong for these (shadgt7 FIX-GT7-130/131), which wait within
+  // DC_ONEOFF_BUDGET_MS (default 50) of such waits a frame:
+  // - DC_WAIT_AFTER_FILL=1 (default): a target a DMA fill or memset rewrote
+  //   whole since it was last drawn. Skipped, the draw leaves the fill: GT7's
+  //   Scapes clear a work picture and draw the photo into it once, and with
+  //   that pipeline new every first photo of a session came out black.
+  // - DC_WAIT_NEW_LAYOUT=1 (default): a target never drawn in this layout
+  //   (a new surface at its address). Scapes draw a photo's 1920x1080 16F work
+  //   picture where a 1920x2160 RGBA8 menu backdrop of the scratch pool is
+  //   drawn every frame; skipped, the frames' average read other pictures as
+  //   16F: noise blocks (NaN) in the saved photo. Past the budget such a draw
+  //   is skipped all the same; its pass, begun above, clears the never-drawn
+  //   target (load action Clear), so later reads take an empty picture.
+  //   =0: off, as before.
+  static const bool wait_after_fill = [] {
+    const char *e = std::getenv("DC_WAIT_AFTER_FILL");
+    return e ? std::atoi(e) != 0 : true;
+  }();
+  static const bool wait_new_layout = [] {
+    const char *e = std::getenv("DC_WAIT_NEW_LAYOUT");
+    return e ? std::atoi(e) != 0 : true;
+  }();
+  static const double oneoff_budget_ms = [] {
+    const char *e = std::getenv("DC_ONEOFF_BUDGET_MS");
+    return e ? std::atof(e) : 50.0;
+  }();
+  bool fill_wait = false, new_layout_wait = false;
+  if (any_color && pit == pipelines.end() && frame_oneoff_ms < oneoff_budget_ms) {
+    for (u32 k = 0; k < 8 && !fill_wait && !new_layout_wait; ++k) {
+      const RenderTarget *c = colors[k];
+      if (!c) {
+        continue;
+      }
+      if (wait_new_layout && never_drawn[k]) {
+        new_layout_wait = true;
+      } else if (wait_after_fill) {
+        const auto f = whole_fills.find(c->addr);
+        fill_wait = f != whole_fills.end() && f->second.first > drawn_before[k] &&
+                    f->second.second >= u64(c->width) * c->height * PixelBytes(c->tex.pixelFormat);
+      }
+    }
+  }
+  const bool oneoff_wait = fill_wait || new_layout_wait;
   const bool must_run = sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) || probe_slot >= 0 ||
-                        fused_pending.on || capture || rule_wait;
+                        fused_pending.on || capture || rule_wait || oneoff_wait;
   const u32 skip_class = mem_out ? 3 : depth_out ? (any_color ? 1 : 0) : 2;
   // DC_FAKE_COMPILING=<hex ps>,...: (test) draws of these pixel shaders act as
   // if their pipeline were still compiling: skipped unless one of the wait
@@ -8179,6 +8379,13 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       const auto w0 = std::chrono::steady_clock::now();
       WaitCompiled(pkey, depth_out && !any_color ? kWaitDepth : kWaitDraw);
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+      if (oneoff_wait && !rule_wait) {
+        frame_oneoff_ms += ms;
+        ++(fill_wait ? stat_fill_wait : stat_new_layout_wait);
+        if (trace)
+          DC_INFO("gpu:   waited %.1f ms: %s", ms,
+                  fill_wait ? "target filled whole since last drawn" : "target never drawn in this layout");
+      }
       if (ms > 100) {
         DC_INFO("gpu:   (that wait: draw vs %#llx ps %#llx, %s%s%s%s%s)", (unsigned long long)vs_addr,
                 (unsigned long long)ps_addr, depth_out ? "writes depth " : "", z_equal ? "z-equal " : "",
@@ -8772,6 +8979,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
       }
       early_fills[dst & kGpuAddrMask] = static_cast<u32>(addr >> 8); // the filling shader
     }
+    NoteWholeFill(dst & kGpuAddrMask, u64(ud[2]) * 4); // num_records dwords (stride 4)
     if (color_targets.count(dst)) {
       memory_fills[dst] = ++write_seq;
       BumpEpoch(__LINE__);
@@ -9445,6 +9653,11 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       std::fill(std::begin(stat_wait_n), std::end(stat_wait_n), 0);
       std::fill(std::begin(stat_wait_ms), std::end(stat_wait_ms), 0);
       stat_skip_max = stat_held = stat_wait_inline = stat_eq_wait = stat_variant_used = 0;
+      if (stat_fill_wait || stat_new_layout_wait) {
+        DC_INFO("perf: one-off draws waited: %llu after a whole fill, %llu into a new layout",
+                (unsigned long long)stat_fill_wait, (unsigned long long)stat_new_layout_wait);
+        stat_fill_wait = stat_new_layout_wait = 0;
+      }
       LogMemory();
       perf_frames = 1;
       perf_t0 = now;
@@ -9793,6 +10006,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   const bool hold = src && hold_at && frame_skips >= hold_at && held_run < hold_max &&
                     latest_frame.load(std::memory_order_relaxed) != nullptr;
   frame_skips = 0;
+  frame_oneoff_ms = 0;
   if (hold) {
     ++held_run;
     ++stat_held;
