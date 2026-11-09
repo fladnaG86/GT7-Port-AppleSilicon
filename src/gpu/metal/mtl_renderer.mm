@@ -656,6 +656,7 @@ struct MetalRenderer::Impl {
     u32 comp_swap = 0;               // CB_INFO.COMP_SWAP it was last bound with
     bool three_channels = false;     // its format has no alpha (10_11_11, 11_11_10)
     bool htile = false;              // depth bound with HTILE (DB_Z_INFO.TILE_SURFACE_ENABLE)
+    u32 levels_drawn = 0;            // bit per mip level drawn or written (one-off waits)
   };
   using TargetMap =
       std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
@@ -1713,7 +1714,7 @@ struct MetalRenderer::Impl {
   u64 stat_eq_wait = 0; // z-EQUAL draws that waited for their pipeline (DC_WAIT_EQUAL)
   // One-off waits (Draw: DC_WAIT_AFTER_FILL, DC_WAIT_NEW_LAYOUT): ms this frame, counts.
   double frame_oneoff_ms = 0;
-  u64 stat_fill_wait = 0, stat_new_layout_wait = 0;
+  u64 stat_fill_wait = 0, stat_new_layout_wait = 0, stat_new_level_wait = 0;
   u32 held_run = 0;
   // DC_GPU_STATS: draws that reopened a pass over the same attachments:
   // [0] pending clear, [1] it samples an attachment (by pixel shader).
@@ -4098,6 +4099,7 @@ struct MetalRenderer::Impl {
         if (storage) {
           p->initialized = true;
           p->clear_pending = false;
+          p->levels_drawn |= 1u << std::min<u32>(lv + base_level, 31);
           p->written = ++write_seq;
           NoteTargetWritten(*p);
           type_out->ufloat = p->tex.pixelFormat == MTLPixelFormatRG11B10Float;
@@ -4199,8 +4201,35 @@ struct MetalRenderer::Impl {
           rt = &GetColorTarget(addr, rt->tex.pixelFormat, width, height,
                                last_level + 1, rt->dim, rt->depth_or_layers);
         }
+        // A target a little larger than the T#, within its level 0's padded
+        // size in memory, is that image too, with the T#'s levels (shadgt7
+        // FIX-GT7-134): GT7's depth of field draws its 8-level pyramid as
+        // targets of their own extent (690x496, 345x248, ...) and samples it
+        // through a 690x493 (or 479, or 496) T#; no level was linked and the
+        // blurred levels read level 0. Levels keep the target's sizes (they
+        // are what the game draws); the T# gets a copy of its own extent
+        // (LevelCropOf). 2D single-layer only. DC_NO_PADDED_MIPS=1: off.
+        static const bool no_padded_mips = std::getenv("DC_NO_PADDED_MIPS") != nullptr;
+        bool padded = false;
+        if (!no_padded_mips && last_level > 0 && tt.dim == TexDim::Tex2D &&
+            rt->dim == TexDim::Tex2D && (rt->width != width || rt->height != height) &&
+            rt->width >= width && rt->height >= height && fi.bytes_per_block &&
+            !fi.compressed && Tiling::Supported(tiling)) {
+          Tiling::MipLevel m0[1];
+          Tiling::MipLayout(tiling, pitch, height, 1, 1, fi.bytes_per_block, false,
+                            (t[3] >> 25) & 1, m0);
+          padded = rt->width <= m0[0].pitch_el && rt->height <= m0[0].height_el;
+          if (padded && padded_logged.insert(Hash(addr, (u64(width) << 32) | height)).second) {
+            DC_INFO("gpu: target %#llx %ux%u is the padded image of a %ux%u T# with %u levels",
+                    (unsigned long long)addr, rt->width, rt->height, width, height, last_level + 1);
+          }
+          if (padded && last_level >= rt->levels) {
+            rt = &GetColorTarget(addr, rt->tex.pixelFormat, rt->width, rt->height,
+                                 last_level + 1, rt->dim, rt->depth_or_layers);
+          }
+        }
         if (!fi.compressed && fi.bytes_per_block) {
-          NoteMipLevels(*rt, t, fi.bytes_per_block);
+          NoteMipLevels(*rt, t, fi.bytes_per_block, padded ? height : 0);
         }
         MTLPixelFormat view_fmt = MTLPixelFormatInvalid;
         if (fi.format != MTLPixelFormatInvalid && !fi.compressed &&
@@ -4241,6 +4270,12 @@ struct MetalRenderer::Impl {
         }
         if (RenderTarget *crop = CropOf(*rt, tt, width, height, base_level, last_level)) {
           return TargetView(*crop, 0, 1, view_fmt, 0, 1, rt_swz);
+        }
+        if (padded) {
+          if (RenderTarget *crop = LevelCropOf(*rt, width, height, last_level + 1)) {
+            return TargetView(*crop, base_level, last_level - base_level + 1, view_fmt, 0, 1,
+                              rt_swz);
+          }
         }
         return TargetView(*rt, base_level, last_level - base_level + 1,
                           view_fmt, base_array, slice_count, rt_swz);
@@ -4342,6 +4377,9 @@ struct MetalRenderer::Impl {
       }
       target.initialized = true;
       target.clear_pending = false;
+      for (u32 l = base_level; l <= last_level && l < 32; ++l) {
+        target.levels_drawn |= 1u << l;
+      }
       target.written = ++write_seq;
       NoteTargetWritten(target);
       return TargetView(target, base_level, last_level + 1 - base_level,
@@ -5142,6 +5180,7 @@ struct MetalRenderer::Impl {
       });
       [b endEncoding];
       rt.initialized = hdr[7] != 0;
+      rt.levels_drawn = rt.initialized ? ~0u : 0u;
       rt.bind_slice = hdr[8];
       rt.bind_level = hdr[9];
       rt.comp_swap = hdr[10];
@@ -5424,6 +5463,61 @@ struct MetalRenderer::Impl {
     return crop.get();
   }
 
+  // CropOf with levels: a width x height copy of `rt` and `levels` of its
+  // levels, each level clamped to the T#'s own level size (FIX-GT7-134: the
+  // depth of field pyramid's 345x248 level read as 345x246). Copied again on
+  // each resolve; `has_crops` re-resolves after each pass on `rt`.
+  std::unordered_map<u64, std::unique_ptr<RenderTarget>> level_crops;
+  std::unordered_set<u64> padded_logged; // FIX-GT7-134 log, once per address and T# size
+  RenderTarget *LevelCropOf(RenderTarget &rt, u32 width, u32 height, u32 levels) {
+    if (rt.dim != TexDim::Tex2D || rt.tex.textureType != MTLTextureType2D ||
+        rt.tex.sampleCount != 1) {
+      return nullptr;
+    }
+    levels = std::clamp<u32>(levels, 1, std::min<u32>(rt.levels,
+                             1 + static_cast<u32>(std::log2(std::max(width, height)))));
+    auto &crop = level_crops[Hash(rt.addr, (u64(height) << 32) | width)];
+    if (!crop || crop->tex.pixelFormat != rt.tex.pixelFormat || crop->levels != levels) {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+      d.textureType = MTLTextureType2D;
+      d.pixelFormat = rt.tex.pixelFormat;
+      d.width = width;
+      d.height = height;
+      d.mipmapLevelCount = levels;
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      d.storageMode = MTLStorageModePrivate;
+      crop = std::make_unique<RenderTarget>();
+      crop->tex = [device newTextureWithDescriptor:d];
+      crop->addr = rt.addr;
+      crop->width = width;
+      crop->height = height;
+      crop->levels = levels;
+      if (!crop->tex) {
+        crop.reset();
+        return nullptr;
+      }
+    }
+    rt.has_crops = true;
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    for (u32 l = 0; l < levels; ++l) {
+      const u32 w = std::min(std::max(width >> l, 1u), std::max(rt.width >> l, 1u));
+      const u32 h = std::min(std::max(height >> l, 1u), std::max(rt.height >> l, 1u));
+      [b copyFromTexture:rt.tex
+             sourceSlice:0
+             sourceLevel:l
+            sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(w, h, 1)
+               toTexture:crop->tex
+        destinationSlice:0
+        destinationLevel:l
+       destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+    [b endEncoding];
+    return crop.get();
+  }
+
   id<MTLTexture> TargetView(RenderTarget &rt, u32 base, u32 count,
                             MTLPixelFormat fmt = MTLPixelFormatInvalid,
                             u32 sbase = 0, u32 scount = ~0u,
@@ -5617,6 +5711,10 @@ struct MetalRenderer::Impl {
       rp.colorAttachments[k].storeAction = MTLStoreActionStore;
       rt.initialized = true;
       rt.clear_pending = false;
+      rt.levels_drawn |= 1u << rt.bind_level;
+      if (rt.view_of) {
+        rt.view_of->levels_drawn |= 1u << rt.bind_level;
+      }
       rt.written = seq;
       NoteTargetWritten(rt);
       ps.color[k] = reinterpret_cast<u64>(&rt);
@@ -5891,6 +5989,20 @@ struct MetalRenderer::Impl {
       const u32 *t = tsharps_[i].data();
       TextureType tt;
       id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
+      // An empty T# sampled with a depth comparison: the far depth (1.0), not
+      // zero. Zero failed every comparison ("in shadow"); the console's texture
+      // unit still applies the sampler, and an absent shadow map means nothing
+      // in front. GT7's Scapes backdrop shades the ground the car's cascade
+      // does not cover with such a 1x1 fallback shadow map under a
+      // white-bordered LEQUAL sampler: about six times too dark before
+      // (shadgt7 FIX-GT7-133). DC_NO_DEPTH_STAND_IN=1: zero, as before.
+      static const bool no_depth_stand_in = std::getenv("DC_NO_DEPTH_STAND_IN") != nullptr;
+      if (!no_depth_stand_in && img.compare && img.has_sampler && !img.storage && !tt.cube &&
+          tt.sample == TexSample::Float &&
+          (!(((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask) ||
+           (t[3] >> 28) < 8 || ((t[1] >> 20) & 0x3F) == 0)) {
+        tex = Dummy(tt, false); // white: every channel 1.0
+      }
       if (trace && (t[0] == 0 || std::getenv("DC_TRACE_TSHARP"))) {
         DC_INFO("gpu:   T# %08x %08x %08x %08x %08x %08x %08x %08x src kind %u "
                 "ud %u off %u",
@@ -5978,7 +6090,9 @@ struct MetalRenderer::Impl {
   // shadPS4 MipOf for a sampled render target: each level past the first of
   // the T#'s memory becomes an alias; a target already rendered there is
   // copied into that level and retired.
-  void NoteMipLevels(RenderTarget &rt, const u32 t[8], u32 bytes_per_el) {
+  // `layout_height`: the T#'s height when the target is a padded larger one
+  // (FIX-GT7-134), for the level addresses; 0: the target's.
+  void NoteMipLevels(RenderTarget &rt, const u32 t[8], u32 bytes_per_el, u32 layout_height = 0) {
     const u32 tiling = (t[3] >> 20) & 0x1F;
     const u32 last_level = (t[3] >> 16) & 0xF;
     if (!last_level || rt.levels <= 1 || !Tiling::Supported(tiling)) {
@@ -5997,8 +6111,8 @@ struct MetalRenderer::Impl {
     const u32 pitch = ((t[4] >> 13) & 0x3FFF) + 1;
     const u32 levels = std::min(last_level + 1, rt.levels);
     Tiling::MipLevel mips[16];
-    Tiling::MipLayout(tiling, pitch, rt.height, layers, levels, bytes_per_el,
-                      false, pow2, mips);
+    Tiling::MipLayout(tiling, pitch, layout_height ? layout_height : rt.height, layers, levels,
+                      bytes_per_el, false, pow2, mips);
     // Every (level, slice) of the image starts at its own address: GT7 writes
     // the faces of its reflection cube's mips one by one as 2D storage images
     // (cs 0x9000e31f00 at 0x900b3b0000, 0x900b3c0000, ...) and reads faces of
@@ -6051,6 +6165,7 @@ struct MetalRenderer::Impl {
                     levelCount:1];
           [b endEncoding];
           rt.written = std::max(rt.written, c.written);
+          rt.levels_drawn |= 1u << m;
         }
         DC_INFO("gpu: target %#llx %ux%u is level %u slice %u of %#llx", a, c.width,
                 c.height, m, k, rt.addr);
@@ -7464,11 +7579,14 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   // The colour targets as they were before this draw: BeginPass (below,
   // before the pipeline lookup) marks them drawn. For the one-off waits.
   bool never_drawn[8] = {};
+  bool level_never_drawn[8] = {}; // a level 1+ of a texture, never drawn into
   u64 drawn_before[8] = {};
   for (u32 k = 0; k < 8; ++k) {
-    if (colors[k]) {
-      never_drawn[k] = !colors[k]->initialized;
-      drawn_before[k] = colors[k]->written;
+    if (const RenderTarget *c = colors[k]) {
+      never_drawn[k] = !c->initialized;
+      const u32 drawn = c->levels_drawn | (c->view_of ? c->view_of->levels_drawn : 0u);
+      level_never_drawn[k] = c->initialized && c->bind_level && !((drawn >> c->bind_level) & 1);
+      drawn_before[k] = c->written;
     }
   }
 
@@ -8119,8 +8237,22 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     const char *e = std::getenv("DC_ONEOFF_BUDGET_MS");
     return e ? std::atof(e) : 50.0;
   }();
-  bool fill_wait = false, new_layout_wait = false;
-  if (any_color && pit == pipelines.end() && frame_oneoff_ms < oneoff_budget_ms) {
+  // - DC_WAIT_NEW_LEVEL=1 (default): a level (1 and up) of a texture never
+  //   drawn into, whatever the budget (shadgt7 FIX-GT7-135). GT7's Scapes salt
+  //   flat backdrop (6024x4016 RGBA16F, 5 levels) has its levels 1-4 drawn once
+  //   at the location's load; skipped, they stayed empty and the editor showed
+  //   the location at about an eighth of its brightness.
+  static const bool wait_new_level = [] {
+    const char *e = std::getenv("DC_WAIT_NEW_LEVEL");
+    return e ? std::atoi(e) != 0 : true;
+  }();
+  bool fill_wait = false, new_layout_wait = false, new_level_wait = false;
+  if (any_color && pit == pipelines.end() && wait_new_level) {
+    for (u32 k = 0; k < 8 && !new_level_wait; ++k) {
+      new_level_wait = colors[k] && level_never_drawn[k];
+    }
+  }
+  if (any_color && pit == pipelines.end() && !new_level_wait && frame_oneoff_ms < oneoff_budget_ms) {
     for (u32 k = 0; k < 8 && !fill_wait && !new_layout_wait; ++k) {
       const RenderTarget *c = colors[k];
       if (!c) {
@@ -8135,7 +8267,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       }
     }
   }
-  const bool oneoff_wait = fill_wait || new_layout_wait;
+  const bool oneoff_wait = fill_wait || new_layout_wait || new_level_wait;
   const bool must_run = sync_shaders || g_sync_shaders_now.load(std::memory_order_relaxed) || probe_slot >= 0 ||
                         fused_pending.on || capture || rule_wait || oneoff_wait;
   const u32 skip_class = mem_out ? 3 : depth_out ? (any_color ? 1 : 0) : 2;
@@ -8381,10 +8513,12 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
       if (oneoff_wait && !rule_wait) {
         frame_oneoff_ms += ms;
-        ++(fill_wait ? stat_fill_wait : stat_new_layout_wait);
+        ++(new_level_wait ? stat_new_level_wait : fill_wait ? stat_fill_wait : stat_new_layout_wait);
         if (trace)
           DC_INFO("gpu:   waited %.1f ms: %s", ms,
-                  fill_wait ? "target filled whole since last drawn" : "target never drawn in this layout");
+                  new_level_wait ? "texture level never drawn"
+                  : fill_wait    ? "target filled whole since last drawn"
+                                 : "target never drawn in this layout");
       }
       if (ms > 100) {
         DC_INFO("gpu:   (that wait: draw vs %#llx ps %#llx, %s%s%s%s%s)", (unsigned long long)vs_addr,
@@ -9653,10 +9787,12 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       std::fill(std::begin(stat_wait_n), std::end(stat_wait_n), 0);
       std::fill(std::begin(stat_wait_ms), std::end(stat_wait_ms), 0);
       stat_skip_max = stat_held = stat_wait_inline = stat_eq_wait = stat_variant_used = 0;
-      if (stat_fill_wait || stat_new_layout_wait) {
-        DC_INFO("perf: one-off draws waited: %llu after a whole fill, %llu into a new layout",
-                (unsigned long long)stat_fill_wait, (unsigned long long)stat_new_layout_wait);
-        stat_fill_wait = stat_new_layout_wait = 0;
+      if (stat_fill_wait || stat_new_layout_wait || stat_new_level_wait) {
+        DC_INFO("perf: one-off draws waited: %llu after a whole fill, %llu into a new layout, "
+                "%llu into a new texture level",
+                (unsigned long long)stat_fill_wait, (unsigned long long)stat_new_layout_wait,
+                (unsigned long long)stat_new_level_wait);
+        stat_fill_wait = stat_new_layout_wait = stat_new_level_wait = 0;
       }
       LogMemory();
       perf_frames = 1;
