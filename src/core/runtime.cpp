@@ -5,6 +5,7 @@
 #include "hle/net/net.h"
 #include "core/guest_profile.h"
 #include "core/gt7_cipher.h"
+#include "core/gt7_scripts.h"
 #include "core/guest_trace.h"
 #include "core/runtime.h"
 
@@ -230,6 +231,7 @@ void RelocateFixedHeap(const Loader::Module& exe) {
         RelocateGt7PrtApertures(exe);
         HookGt7Log(exe);
         Gt7Cipher::Install(exe.Base());
+        Gt7Scripts::Install(exe.Base());
         GuestTrace::Start(exe.Base());
         return;
     }
