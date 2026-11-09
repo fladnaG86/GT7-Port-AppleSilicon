@@ -2,7 +2,7 @@
 """Checks on the MSL that gcn_dis generates for the shaders in tools/msl_fixtures.
 
 usage: tools/msl_check.py [check ...]   (all checks when none is named)
-Run from Driveclub-Port after `cmake --build build --target gcn_dis`.
+Run from the repository root after `cmake --build build --target gcn_dis`.
 """
 import os
 import re

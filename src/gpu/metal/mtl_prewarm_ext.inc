@@ -2,7 +2,7 @@
 // right after the render prewarm's records (RenderRecord, ParseRenderRecord).
 //
 // The render prewarm (RenderPrewarmStart) covers ordinary VS+PS pipelines.
-// This adds, in ~/Library/Caches/DriveclubNative/render_pipelines_ext.bin
+// This adds, in ~/Library/Caches/GT7Port/render_pipelines_ext.bin
 // (its own file: older builds stop reading render_pipelines.bin at the first
 // record they do not know):
 //   - kRecTess: the domain-pass render pipeline of a tessellated draw
@@ -27,7 +27,7 @@ std::unordered_set<u64> kernel_known;
 
 static std::string ExtPrewarmPath() {
   const char *home = std::getenv("HOME");
-  return home ? std::string(home) + "/Library/Caches/DriveclubNative/render_pipelines_ext.bin" : "";
+  return home ? std::string(home) + "/Library/Caches/GT7Port/render_pipelines_ext.bin" : "";
 }
 
 // An LS or HS kernel of a tessellated draw.

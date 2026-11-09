@@ -1,6 +1,6 @@
-// Driveclub Native: entry point.
+// GT7 Port: entry point.
 // Usage: gt7 <game dir> [--load-only]; without a game dir (Finder launch
-// of Driveclub.app) the folder is picked in a dialog, see launcher.h.
+// of GT7.app) the folder is picked in a dialog, see launcher.h.
 // Loads and links the game's modules, then brings up the window and the
 // Metal renderer.
 
@@ -52,6 +52,9 @@ int Run(int argc, char** argv) {
     if (replay_dir) {
     } else if (interactive) {
         Launcher::BeginSession();
+        // GT7 only gets past start-up signed out (no PSN emulation): from
+        // Finder there is no shell to set DC_OFFLINE, so it is the default.
+        setenv("DC_OFFLINE", "1", 0);
         game_dir = Launcher::ChooseGameFolder();
         if (game_dir.empty()) {
             Launcher::EndSession();
@@ -74,7 +77,7 @@ int Run(int argc, char** argv) {
 
     const char* home = std::getenv("HOME");
     const std::filesystem::path user_root =
-        std::filesystem::path(home ? home : "/tmp") / "Library/Application Support/DriveclubNative";
+        std::filesystem::path(home ? home : "/tmp") / "Library/Application Support/GT7Port";
     Hle::Kernel::SetFileRoots(game_dir, user_root);
     Core::Benchmark::Configure(user_root);
 
@@ -89,7 +92,7 @@ int Run(int argc, char** argv) {
         if (interactive && !std::getenv("DC_HEAP_SITES")) {
             Launcher::RejectGameFolder(game_dir);
         }
-        DC_WARN("eboot.bin is not v1.28 (CUSA00003): expect a crash");
+        DC_WARN("eboot.bin is not GT7 v1.00 (CUSA24769): expect a crash");
     }
     linker.PrintReport();
     if (load_only) {
@@ -391,7 +394,7 @@ int main(int argc, char** argv) {
         return Run(argc, argv);
     } catch (const std::exception& e) {
         DC_ERROR("fatal: %s", e.what());
-        Launcher::ShowError("Driveclub stopped because of an error", e.what());
+        Launcher::ShowError("GT7 stopped because of an error", e.what());
         // Guest threads may be running: do not run static destructors under them.
         std::fflush(nullptr);
         std::_Exit(1);

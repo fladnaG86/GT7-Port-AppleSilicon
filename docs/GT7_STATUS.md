@@ -70,4 +70,5 @@ Passi:
 - Strumenti utili: `DC_PROBE='*:any:x,y'` (shader che scrivono un pixel, lento),
   `DC_FIND_ADDR` (V# che coprono un indirizzo, con `DC_TRACE_FRAME`), `DC_SKIP_PS`,
   `DC_LOG_RESTORED`, `DC_REPLAY_TARGETS_ONLY`, `DC_TESS_STATS`, `DC_REPLAY_LOG_KEPT`.
-- Prima di renderlo pubblico: README (ora parla di Driveclub) e licenza da rivedere.
+- README, app e percorsi ora sono di GT7 (2026-11-09): cache e salvataggi in `GT7Port`, log in `GT7 Logs`.
+  Prima di renderlo pubblico: licenza da rivedere.

@@ -1,174 +1,130 @@
-# Driveclub Native
+# GT7 Port for Apple Silicon
 
-> **Apple Silicon fork.** This repository is a fork of
-> [BlackLineInteractive/Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
-> that runs the macOS backend on **Apple Silicon Macs under Rosetta 2**
-> (playable races, ~30 fps on an M1 Max), with many GPU fixes and performance work.
-> **Prebuilt download:** [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest). What was done, how to build it and what is left:
-> **[docs/APPLE_SILICON.md](docs/APPLE_SILICON.md)** · in italiano:
-> **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
-> The rest of this README is upstream's.
->
-> *Not affiliated with or endorsed by Sony Interactive Entertainment. "Driveclub" and
-> "PlayStation" are trademarks of their owners. No game files are included: you need
-> your own legitimate copy of the game.*
+**Gran Turismo 7** (PS4, CUSA24769, v1.00) running natively on **Apple Silicon Macs**
+under Rosetta 2, with a GCN-to-Metal renderer.
 
-[![Driveclub v0.2.15 racing in heavy rain on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-rain.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/v0.2.15-apple-silicon/Driveclub-0.2.15-gameplay.mp4)
+> *Not affiliated with or endorsed by Sony Interactive Entertainment or Polyphony
+> Digital. "Gran Turismo" and "PlayStation" are trademarks of their owners. No game
+> files, keys or decryption tools are included: you need your own legitimate copy of
+> the game.*
 
-*v0.2.15 in heavy rain on a MacBook Pro M1 Max under Rosetta 2, at 30 fps: chase, bonnet and cockpit views, raindrops on the windscreen and the camera lens. Click the image to play the video (MP4, 0:28).*
+**Status: work in progress.** Boot, menus, display settings and races work. In a race
+on an M1 Max it runs at roughly 20-30 fps, with visual differences from the console and
+shader-compile stutters the first time a scene is seen. Current state, recent work and
+next steps (in Italian): **[docs/GT7_STATUS.md](docs/GT7_STATUS.md)**.
 
-### What's new since the first video
+## How it works
 
-The [first gameplay video](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4) (October 18, v0.1, ~26 fps) showed dry races only. Since then:
+This is not a general-purpose emulator. PS4 code is x86-64: under Rosetta 2 it runs
+directly, without a CPU recompiler of our own. Only what is console-specific is
+replaced: Sony's system libraries (HLE) and the AMD Liverpool GPU (PM4 command
+processor, GCN shaders translated to Metal Shading Language).
 
-- **Rain and water effects.** Rain no longer turns the screen white (v0.2.9). Rain particles and spray from the cars are drawn (v0.2.10). Raindrops now run down the windscreen and land on the camera lens in chase view: the game makes them with geometry shaders, which Metal does not have, so they are emulated with compute shaders (v0.2.14). Tyre marks now stay on the road, using the same emulation (v0.2.17).
-- **Lighting and colors.** Direct sunlight is back on cars and track (v0.2.11). Car liveries show their real colors instead of black (v0.2.5).
-- **Image quality.** The game still renders at 1080p, but MetalFX now upscales the finished frame to your window, so edges and text stay sharp on Retina and 4K screens. Press `M` to compare on and off (v0.2.18). On HDR screens such as the MacBook Pro XDR display, sun, sky and reflections in a race now go brighter than normal white; the HUD stays as it is. Press `H` to compare (v0.2.19).
-- **Audio.** Correct stereo downmix of the game's surround mix (v0.2.10), with no more crackles or gaps (v0.2.13) and the right volume on stereo outputs (v0.2.16).
-- **Performance.** From ~26 to a steady **30 fps** in a race on an M1 Max: shorter GPU work per frame (v0.2.5, v0.2.12), less waiting between frames (v0.2.6), a memory leak fixed (v0.2.8).
-- **Loading and stutters.** Shorter shader freezes the first time you play (v0.2.7). Faster texture loading, a smoother countdown and background shader prewarm after an update (v0.2.15).
-- **App.** Driveclub.app with a game-folder picker, one log per session on your Desktop with your Mac model (v0.2.4).
-
-Full list: [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases).
-
-## How to play on Apple Silicon
-
-*Italiano: [docs/APPLE_SILICON.it.md — Come giocare](docs/APPLE_SILICON.it.md#come-giocare)*
-
-You need a Mac with Apple Silicon running **macOS 15 or later** and **your own copy of Driveclub v1.28 (CUSA00003)**,
-decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
-
-1. Download `Driveclub-Native-0.2.19.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
-2. First launch only (the app is not notarized): double-click it, click **Done**, then
-   **System Settings → Privacy & Security → Open Anyway**. Accept if macOS offers to install Rosetta.
-3. Choose your game folder (the one with `eboot.bin`) when asked. The app remembers it
-   and tells you if the game version is not supported.
-4. Wait ~40 s, press **Cross** (`Enter`) at *Start Event*, then again at *Controls*: the race starts.
-5. Quit with `Cmd+Q`. Step-by-step guide, logs and Terminal use: [docs/APPLE_SILICON.md](docs/APPLE_SILICON.md#how-to-play).
-
-| PS4 button | Keyboard | In the game |
-| --- | --- | --- |
-| R2 / L2 | `W` / `S` | Accelerate / brake, reverse |
-| Left stick | `A` / `D` | Steer |
-| Cross ✕ / Circle ○ | `Enter` (or `Space`, `K`) / `L` | Confirm / back |
-| Square □ / Triangle △ | `J` / `I` | Game actions (in-game *Controls* screen) |
-| L1 / R1 | `Q` / `E` | Game actions (in-game *Controls* screen) |
-| D-pad | Arrow keys | Menus |
-| Options | `Esc` or `Tab` | Pause |
-
-A PS4 controller (DualShock 4 / DualSense) works as on the console. `V` toggles vsync.
-Full guide, building from source and known issues: [docs/APPLE_SILICON.md](docs/APPLE_SILICON.md#how-to-play).
-
-[![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
-
-![LOGO](media/logo.png)
-![Driveclub In-Game](media/2026-10-14_22-34-39.png)
-
-A native port of **Driveclub** (PS4, CUSA00003) to **macOS** and **Windows**.
-
-| Platform | Game version | Renderer | Where | Maintainer |
-| --- | --- | --- | --- | --- |
-| macOS (Intel) | v1.05 | Metal 3 | this repository's `src/` | [BlackLineInteractive](https://github.com/BlackLineInteractive) |
-| Windows 10/11 | v1.28 | Vulkan (shadPS4's renderer), FSR 3.1 / FSR 4 / FSR 4.1.1, frame generation | [`windows/`](windows/README.md) — ready-to-play builds on the [Windows releases](https://github.com/qnfn/Driveclub-Port/releases) | [qnfn](https://github.com/qnfn) |
-
-**Windows highlight:** DCport 0.3.0 can build AMD's **FSR 4.1.1** for Vulkan from your own DirectX 12 DLL, on your PC, in one click (about two minutes), and run it with FSR 3 frame generation. See [`windows/README.md`](windows/README.md#-new-in-030-fsr-411-built-on-your-own-pc-in-one-click).
-
-The sections below describe the macOS backend; the Windows backend (DCport) runs on a native PS4 runtime based on [Supermedo/bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) and is documented in [`windows/README.md`](windows/README.md).
-
-**Windows (DCport):**
-
-![DCport launcher on Windows](windows/media/launcher.png)
-![DRIVECLUB BIKES on Windows, FSR 4](windows/media/ingame-bike.png)
-![Event preview on Windows, FSR 4](windows/media/ingame-track.png)
-
-This is not a general-purpose emulator. PS4 code is x86-64, so on Intel Macs it executes directly without CPU recompilation. We only replace what is console-specific: Sony system libraries (HLE) and the AMD Liverpool GPU (GCN) - with a custom Metal renderer tailored specifically for this single game.
-
-## Repository layout
-
-| Path | Backend | Platform | What it is |
-| --- | --- | --- | --- |
-| `src/` | Metal (`src/gpu/metal`) | macOS | Our native runtime: ELF loader, HLE libraries, PM4 command processor, GCN → MSL |
-| `windows/` | Vulkan (DCport) | Windows | Separate native runtime (bloodborne_pc + `runtime/driveclub-runtime.patch`), launcher, community patches |
-
-`src/` and `windows/` are independent: each has its own runtime and build, and changes to one do not affect the other. Fixes found on one side are worth checking on the other (both translate the same GCN/PM4 stream).
-
-## Architecture
+The runtime started as the Apple Silicon fork of
+[Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
+([fladnaG86/Driveclub-Port-AppleSilicon](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon)).
+This repository carries the GT7 work on top of it: comments about Driveclub in the
+code describe where a technique came from.
 
 ```
-eboot.bin (x86-64, natively executed)
-   │  imports of 922 functions from 57 libraries
+eboot.bin (x86-64, executed directly under Rosetta 2)
+   │  imports from Sony system libraries
    ▼
-Sony HLE libraries ── libkernel, libc, Pad, AudioOut, VideoOut, Network/PSN -> stubs
-   │  sceGnmSubmitCommandBuffers / sceGnmDingDong
+HLE libraries ── libkernel, libc, Fiber, Pad, AudioOut, VideoOut, SaveData, Net/NP (offline)
+   │  sceGnmSubmitCommandBuffers
    ▼
-GPU frontend ── PM4 packet parsing, register state, GCN shaders -> IR
+GPU frontend ── PM4 parsing, register state, GCN shaders -> IR
    │  src/gpu/renderer.h
-   └──► Metal 3 (macOS) - src/gpu/metal, IR -> MSL directly
+   └──► Metal (src/gpu/metal): IR -> MSL, pipeline cache and prewarm
 ```
 
-Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the command buffer itself and passes only the finished buffer to the driver (`sceGnmDraw*` are not imported). Therefore, the GPU layer operates at the PM4 + GCN shader level.
+GT7-specific parts include:
 
-### Performance Principles
-
-- Shader IR -> MSL directly, without SPIR-V/SPIRV-Cross; disk cache for compiled pipelines.
-- Argument buffers Tier 2 (bindless) - minimal resource binding overhead per draw.
-- Up to 3 frames in flight; CPU waits for GPU only when running 3 frames ahead.
-- On discrete AMD GPUs, memory is not unified: dirty page tracking and uploading modified ranges only.
-- Explicit discrete GPU selection on dual-GPU MacBooks (`DC_GPU=<partial_name>` override).
+- **Address space:** GT7 v1.00 puts its 16 GB memory arenas and its two PRT apertures
+  in the range Rosetta 2 cannot map; the runtime moves them (`src/core/runtime.cpp`).
+- **HLE:** fibers, batch/direct memory mapping, event flags, save data memory, offline
+  PSN state and the other libraries GT7 needs beyond Driveclub.
+- **GPU:** chained indirect buffers, compute ring interrupts, PRT (tiled) textures,
+  tessellation, geometry shaders emulated with compute, F64 ops emulated with integers,
+  wave-uniform branches for cross-lane votes.
+- **Stutters:** pipelines seen in earlier sessions are compiled at start-up from a
+  manifest (`~/Library/Caches/GT7Port/render_pipelines*.bin`).
+- **Debugging:** GPU frame capture and offline replay (`DC_CAPTURE*`,
+  `DC_FRAME_REPLAY`), game logger hook (`DC_GAME_LOG=1`), recorded pad input.
 
 ## Requirements
 
-**macOS**
-
-- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
-- Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
-- Your own copy of the game as a decrypted dump (fSELF/fPKG)
-
-**Windows**
-
-- Windows 10/11 64-bit, a CPU with AVX, a Vulkan 1.3 GPU (FSR 4 needs a recent AMD or NVIDIA GPU)
-- Your own decrypted dump of Driveclub v1.28; no Python or build tools needed for the release builds
+- Apple Silicon Mac, macOS 15 or later, Rosetta 2
+- Xcode, CMake >= 3.24, Ninja, an x86_64 build of SDL3
+- Your own decrypted dump of GT7 v1.00 (CUSA24769): `eboot.bin`, `sce_module` and the
+  33 `gtNN.vol` data files (about 88 GB) in `contents`
 
 ## Build
 
-**macOS**
+The binary is always x86_64 (guest code runs on the host CPU through Rosetta 2), so
+SDL3 must be an x86_64 build too:
 
 ```bash
-cmake -S . -B build -G Ninja
+cmake -S . -B build -G Ninja -DSDL3_DIR=<x86_64 SDL3 prefix>/lib/cmake/SDL3
 cmake --build build
-./build/driveclub
 ```
 
-**Windows**: download a release build, or build the launcher and runtime from [`windows/`](windows/README.md).
+## Run
 
-## Game Files
+```bash
+DC_OFFLINE=1 arch -x86_64 ./build/gt7 <game folder with eboot.bin>
+```
 
-Game files **are not included** in the repository and must never be committed (see `.gitignore`).
-Unpacking PKG:
+`DC_OFFLINE=1` is required: there is no PSN emulation and the game only gets past
+start-up signed out. Saves go to `~/Library/Application Support/GT7Port`; set `HOME` to
+another folder to keep separate profiles. If loading stops at *INITIALIZING*, start
+again.
+
+`tools/app/make_app.sh <version>` packages `build/gt7` as `GT7.app` in a `.dmg`; launched
+from Finder it asks for the game folder, runs offline and writes one log per session to
+`~/Desktop/GT7 Logs`.
+
+## Game files
+
+Game files are not included and must never be committed (see `.gitignore`). Unpacking
+your own decrypted package:
 
 ```bash
 tools/extract.sh <path_to_pkg> extracted
 ```
 
-eboot analysis (imports by library):
+Imports of the executable by library:
 
 ```bash
 tools/elfinfo.py extracted/Image0/eboot.bin
 tools/elfinfo.py extracted/Image0/eboot.bin --lib libSceGnmDriver
 ```
 
-## Legal Disclaimer
+## Legal
 
-- **No Proprietary Game Files**: This project does not distribute, host, or link to any copyrighted material, proprietary game assets, PKG dumps, ROMs, executables (`eboot.bin`), libraries (`.prx`), engine archives (`.dat`), audio, or textures. Users must provide their own legitimately acquired copy of Driveclub (CUSA00003).
-- **Intellectual Property**: Driveclub is a registered trademark of Sony Interactive Entertainment LLC. All trademarks, service marks, game titles, and copyrighted assets belong to Sony Interactive Entertainment and Evolution Studios.
-- **Educational and Preservation Purpose**: This repository is an independent reverse-engineering project conducted strictly for interoperability, software preservation, and educational purposes. It is not affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment, Evolution Studios, or any associated entities.
+- **No proprietary game files:** this project does not distribute, host or link to
+  copyrighted material, game assets, PKG dumps, executables (`eboot.bin`), libraries
+  (`.prx`), data archives (`.vol`), audio or textures. Users must provide their own
+  legitimately acquired copy of Gran Turismo 7.
+- **Intellectual property:** Gran Turismo is a registered trademark of Sony Interactive
+  Entertainment Inc. All trademarks, game titles and copyrighted assets belong to Sony
+  Interactive Entertainment and Polyphony Digital.
+- **Purpose:** an independent reverse-engineering project for interoperability,
+  software preservation and education. It is not affiliated with, endorsed by or
+  sponsored by Sony Interactive Entertainment, Polyphony Digital or any associated
+  entity.
 
 ## License
 
-This project is licensed under the **GNU General Public License v2.0 or later (GPL-2.0-or-later)** - see the [LICENSE](LICENSE) file for details.
+GNU General Public License v2.0 or later (GPL-2.0-or-later), see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer is the reference for GCN/PM4 semantics in the Metal backend, and the renderer of the Windows backend.
-- [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
-- Windows backend: deadinside28 and Supermedo (native PS4 runtime), FireBurn (FSR-Vulkan, FSR 4 assets), akitaonrails and the patch authors; see [`windows/README.md`](windows/README.md).
+- [Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
+  (BlackLineInteractive): the runtime and Metal renderer this port builds on.
+- [ryGT7](https://gitlab.com/rygt-team/rygt7): reference for GT7's HLE needs and GPU
+  behaviour.
+- [shadPS4](https://github.com/shadps4-emu/shadPS4): the main source of knowledge on ELF
+  loading, HLE libraries, PM4 and GCN shader recompilation.
+- [OpenGNM](https://ps4-opengnm.github.io/opengnm/): documentation on PS4 Gnm and GCN
+  shaders.

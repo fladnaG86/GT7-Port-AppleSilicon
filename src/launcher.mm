@@ -1,4 +1,4 @@
-// Driveclub Native: Finder launch support (see launcher.h).
+// GT7 Port: Finder launch support (see launcher.h).
 
 #include "launcher.h"
 
@@ -54,16 +54,16 @@ NSInteger Alert(NSAlertStyle style, NSString* title, NSString* text, NSArray<NSS
 
 constexpr size_t kKeepLogs = 20;
 
-// One log per session in "Driveclub Logs" on the Desktop, where people find
+// One log per session in "GT7 Logs" on the Desktop, where people find
 // it to attach to a report. The first write there waits until the user
 // allows Desktop access, so this runs at launch, never while crashing; if
-// access is denied the logs go to ~/Library/Logs/DriveclubNative.
+// access is denied the logs go to ~/Library/Logs/GT7Port.
 std::filesystem::path OpenSessionLog() {
     char stamp[32];
     const std::time_t now = std::time(nullptr);
     std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
-    const std::string name = std::string("driveclub-") + stamp + ".txt";
-    for (const auto& dir : {HomeDir() / "Desktop/Driveclub Logs", HomeDir() / "Library/Logs/DriveclubNative"}) {
+    const std::string name = std::string("gt7-") + stamp + ".txt";
+    for (const auto& dir : {HomeDir() / "Desktop/GT7 Logs", HomeDir() / "Library/Logs/GT7Port"}) {
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         const auto log = dir / name;
@@ -81,7 +81,7 @@ void PruneLogs(const std::filesystem::path& dir) {
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         const auto name = e.path().filename().string();
-        if (name.starts_with("driveclub-") && e.path().extension() == ".txt") {
+        if (name.starts_with("gt7-") && e.path().extension() == ".txt") {
             logs.push_back(e.path());
         }
     }
@@ -91,7 +91,7 @@ void PruneLogs(const std::filesystem::path& dir) {
     }
 }
 
-// Renames driveclub-<date>.txt to driveclub-<date>-<tag>.txt so the sessions
+// Renames gt7-<date>.txt to gt7-<date>-<tag>.txt so the sessions
 // that went wrong stand out. An open log keeps being written after the rename.
 std::filesystem::path TagLog(const std::filesystem::path& log, const char* tag) {
     auto tagged = log;
@@ -146,7 +146,7 @@ bool IsInteractive(int argc, char** argv) {
 
 void BeginSession() {
     g_interactive = true;
-    const auto support = HomeDir() / "Library/Application Support/DriveclubNative";
+    const auto support = HomeDir() / "Library/Application Support/GT7Port";
     std::error_code ec;
     std::filesystem::create_directories(support, ec);
 
@@ -167,7 +167,7 @@ void BeginSession() {
                                  @"please attach it if you report the problem.",
                                  [NSString stringWithUTF8String:crashed.parent_path().filename().c_str()],
                                  LogName(crashed)];
-            if (Alert(NSAlertStyleWarning, @"Driveclub did not close normally last time", text,
+            if (Alert(NSAlertStyleWarning, @"GT7 did not close normally last time", text,
                       @[ @"Continue", @"Show Log" ]) == 1) {
                 RevealLog(crashed);
             }
@@ -207,8 +207,8 @@ std::filesystem::path ChooseGameFolder() {
         panel.canChooseDirectories = YES;
         panel.canChooseFiles = NO;
         panel.allowsMultipleSelection = NO;
-        panel.message = @"Choose your Driveclub v1.28 game folder (the one containing eboot.bin "
-                        @"and sce_module).";
+        panel.message = @"Choose your Gran Turismo 7 v1.00 (PS4) game folder (the one "
+                        @"containing eboot.bin and sce_module).";
         panel.prompt = @"Play";
         if ([panel runModal] != NSModalResponseOK) {
             return {};
@@ -220,7 +220,7 @@ std::filesystem::path ChooseGameFolder() {
             return dir;
         }
         const NSInteger choice =
-            Alert(NSAlertStyleWarning, @"This is not the Driveclub game folder",
+            Alert(NSAlertStyleWarning, @"This is not the GT7 game folder",
                   @"The folder must contain eboot.bin and sce_module. If the game came as a base "
                   @"game plus a patch, copy the patch files over the base game first.",
                   @[ @"Choose Again", @"Quit" ]);
@@ -255,11 +255,10 @@ void RejectGameFolder(const std::filesystem::path& dir) {
         g_log = TagLog(g_log, "error");
     }
     const NSInteger choice = Alert(
-        NSAlertStyleCritical, @"This version of Driveclub is not supported",
-        @"The app needs Driveclub v1.28, European release (CUSA00003). Your eboot.bin is a "
-        @"different version: the base game without the 1.28 patch, or another region.\n\n"
-        @"If you have the 1.28 patch, copy its files over the base game folder (replacing "
-        @"eboot.bin), then choose that folder.",
+        NSAlertStyleCritical, @"This version of GT7 is not supported",
+        @"The app needs Gran Turismo 7 for PS4, v1.00 (CUSA24769). Your eboot.bin is a "
+        @"different version: a patched game or another release.\n\n"
+        @"Choose a folder with the v1.00 base game.",
         @[ @"Choose Another Folder", @"Quit" ]);
     EndSession();
     if (choice == 0) {

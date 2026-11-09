@@ -1,17 +1,17 @@
 #!/bin/bash
-# Packages build/gt7 as Driveclub.app inside a drag-to-install .dmg.
+# Packages build/gt7 as GT7.app inside a drag-to-install .dmg.
 # Usage: tools/app/make_app.sh <version> [SDL3 dylib]
 #   <version>    e.g. 0.2.0
 #   SDL3 dylib   x86_64 libSDL3.0.dylib to bundle; build it with
 #                -ffile-prefix-map so it carries no local paths.
-# Output: dist/Driveclub.app and dist/Driveclub-Native-<version>.dmg (ad-hoc signed).
+# Output: dist/GT7.app and dist/GT7-Port-<version>.dmg (ad-hoc signed).
 set -euo pipefail
 
 version=${1:?usage: make_app.sh <version> [SDL3 dylib]}
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 sdl=${2:-$(otool -l "$repo/build/gt7" | sed -n '/LC_RPATH/{n;n;s/^ *path \(.*\) (offset [0-9]*)$/\1/p;}' | head -1)/libSDL3.0.dylib}
 dist="$repo/dist"
-app="$dist/Driveclub.app"
+app="$dist/GT7.app"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
@@ -34,13 +34,13 @@ done
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
 
-cp "$repo/build/gt7" "$app/Contents/MacOS/driveclub"
+cp "$repo/build/gt7" "$app/Contents/MacOS/gt7"
 cp "$sdl" "$app/Contents/Frameworks/libSDL3.0.dylib"
-otool -l "$app/Contents/MacOS/driveclub" | sed -n '/LC_RPATH/{n;n;s/^ *path \(.*\) (offset [0-9]*)$/\1/p;}' |
+otool -l "$app/Contents/MacOS/gt7" | sed -n '/LC_RPATH/{n;n;s/^ *path \(.*\) (offset [0-9]*)$/\1/p;}' |
     while IFS= read -r rpath; do
-        install_name_tool -delete_rpath "$rpath" "$app/Contents/MacOS/driveclub"
+        install_name_tool -delete_rpath "$rpath" "$app/Contents/MacOS/gt7"
     done
-install_name_tool -add_rpath @executable_path/../Frameworks "$app/Contents/MacOS/driveclub"
+install_name_tool -add_rpath @executable_path/../Frameworks "$app/Contents/MacOS/gt7"
 
 # Icon.
 swift "$repo/tools/app/make_icon.swift" "$scratch/icon.png"
@@ -57,10 +57,10 @@ cat > "$app/Contents/Info.plist" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Driveclub</string>
-    <key>CFBundleDisplayName</key><string>Driveclub Native</string>
-    <key>CFBundleIdentifier</key><string>io.github.fladnag86.driveclub-native</string>
-    <key>CFBundleExecutable</key><string>driveclub</string>
+    <key>CFBundleName</key><string>GT7</string>
+    <key>CFBundleDisplayName</key><string>GT7 Port</string>
+    <key>CFBundleIdentifier</key><string>io.github.fladnag86.gt7-port</string>
+    <key>CFBundleExecutable</key><string>gt7</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
@@ -86,7 +86,7 @@ mkdir "$stage"
 cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
 cp "$repo/tools/app/READ ME FIRST.txt" "$stage/"
-dmg="$dist/Driveclub-Native-$version.dmg"
+dmg="$dist/GT7-Port-$version.dmg"
 rm -f "$dmg"
-hdiutil create -quiet -volname "Driveclub Native $version" -srcfolder "$stage" -format UDZO "$dmg"
+hdiutil create -quiet -volname "GT7 Port $version" -srcfolder "$stage" -format UDZO "$dmg"
 echo "$dmg"

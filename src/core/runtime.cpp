@@ -97,17 +97,24 @@ bool IsHeapMovabs(VAddr site) {
 // GT7 v1.00 keeps its next arena address in a .data qword that starts at the
 // same fixed base; moving that value relocates every arena. Returns false for
 // any other executable.
-bool RelocateGt7Arenas(const Loader::Module& exe) {
-    constexpr u64 kArenaCursor = 0x6475e08;
+constexpr u64 kGt7ArenaCursor = 0x6475e08;
+
+// True for the GT7 v1.00 eboot: its arena function holds the expected code.
+bool IsGt7V100(const Loader::Module& exe) {
     constexpr u64 kArenaFunc = 0x3b4a710;
     // mov rax, [rip+disp] ; movabs rdx, 0x400000000 (arena size)
     static constexpr u8 kSignature[] = {0x48, 0x8b, 0x05, 0xf1, 0xb6, 0x92, 0x02, 0x48,
                                         0xba, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00};
-    if (exe.Size() < kArenaCursor + sizeof(u64)) {
+    if (exe.Size() < kGt7ArenaCursor + sizeof(u64)) {
         return false; // a smaller executable: another game
     }
-    if (std::memcmp(reinterpret_cast<const void*>(exe.Base() + kArenaFunc), kSignature,
-                    sizeof(kSignature)) != 0) {
+    return std::memcmp(reinterpret_cast<const void*>(exe.Base() + kArenaFunc), kSignature,
+                       sizeof(kSignature)) == 0;
+}
+
+bool RelocateGt7Arenas(const Loader::Module& exe) {
+    constexpr u64 kArenaCursor = kGt7ArenaCursor;
+    if (!IsGt7V100(exe)) {
         return false;
     }
     auto* cursor = reinterpret_cast<u64*>(exe.Base() + kArenaCursor);
@@ -491,6 +498,9 @@ void StartGame(Loader::Linker&) {
 }
 
 bool IsSupportedExecutable(const Loader::Module& exe) {
+    if (IsGt7V100(exe)) {
+        return true;
+    }
     const auto sites = HeapSites(exe);
     return std::all_of(sites.begin(), sites.end(), IsHeapMovabs);
 }

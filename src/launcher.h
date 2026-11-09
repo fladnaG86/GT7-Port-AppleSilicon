@@ -2,8 +2,8 @@
 
 #include <filesystem>
 
-// Finder launch (Driveclub.app, no game dir on the command line): each session
-// logs to its own file in "Driveclub Logs" on the Desktop, the game folder is
+// Finder launch (GT7.app, no game dir on the command line): each session
+// logs to its own file in "GT7 Logs" on the Desktop, the game folder is
 // picked in a dialog and remembered, and problems are reported in alerts
 // instead of on stderr.
 

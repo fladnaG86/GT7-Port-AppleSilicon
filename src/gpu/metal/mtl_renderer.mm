@@ -3081,7 +3081,7 @@ struct MetalRenderer::Impl {
   // Moves finished pipelines into the caches.
   // ================= compute pipeline prewarm =================
   // Every compute pipeline built is recorded (guest code and address, and the
-  // inputs of its key) in ~/Library/Caches/DriveclubNative/
+  // inputs of its key) in ~/Library/Caches/GT7Port/
   // compute_pipelines.bin. The next launch rebuilds them all on the compiler
   // threads from the start, with the current translator, so the first
   // dispatches after an update (new MSL) or a cleared Metal cache do not wait
@@ -3097,7 +3097,7 @@ struct MetalRenderer::Impl {
   std::unordered_set<u64> prewarm_known;
   static std::string PrewarmPath() {
     const char *home = std::getenv("HOME");
-    return home ? std::string(home) + "/Library/Caches/DriveclubNative/compute_pipelines.bin" : "";
+    return home ? std::string(home) + "/Library/Caches/GT7Port/compute_pipelines.bin" : "";
   }
   static u64 PrewarmKey(u64 hash, u32 rsrc2, bool map_hoist, u32 linear_mask, u32 linear_aligned,
                         const std::vector<TextureType> &types, u32 group) {
@@ -3199,7 +3199,7 @@ struct MetalRenderer::Impl {
   // ================= render pipeline prewarm =================
   // Like the compute prewarm above, for the VS+PS pipelines of ordinary draws
   // (not tessellated, not fused GS, not debug): every one built is recorded
-  // in ~/Library/Caches/DriveclubNative/render_pipelines.bin with the guest
+  // in ~/Library/Caches/GT7Port/render_pipelines.bin with the guest
   // code of both shaders and every input of their MSL options and of the
   // pipeline state, never the MSL. The next launch rebuilds them all on the
   // compiler threads from the start (intro and menus take minutes), with the
@@ -3441,7 +3441,7 @@ struct MetalRenderer::Impl {
   u64 stat_prewarm_promoted = 0;
   static std::string RenderPrewarmPath() {
     const char *home = std::getenv("HOME");
-    return home ? std::string(home) + "/Library/Caches/DriveclubNative/render_pipelines.bin" : "";
+    return home ? std::string(home) + "/Library/Caches/GT7Port/render_pipelines.bin" : "";
   }
   // Guest code from `addr` as BuildProgram decodes it, plus 64 bytes so a
   // decode that peeks past the end reads what it read in guest memory.
@@ -9269,7 +9269,7 @@ std::filesystem::path TraceDir() {
   std::filesystem::create_directories(base, ec);
   if (ec) {
     const char *home = std::getenv("HOME");
-    base = std::filesystem::path(home ? home : "/tmp") / "Desktop/Driveclub Logs";
+    base = std::filesystem::path(home ? home : "/tmp") / "Desktop/GT7 Logs";
     std::filesystem::create_directories(base, ec);
   }
   return base;

@@ -5,16 +5,10 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
 
 project(GT7Port LANGUAGES C CXX OBJC OBJCXX)
 
-# Backends
-#   macOS:          this tree, Metal renderer (src/gpu/metal).
-#   Windows/Linux:  the DCport backend in windows/ (its own native runtime and
-#                   launcher, Vulkan); see windows/README.md. This tree's core
-#                   (src/core: loader, memory, signals, TLS) is macOS-only, so
-#                   it does not configure there.
+# macOS only: src/core (loader, memory, signals, TLS) relies on macOS, and the
+# renderer is Metal (src/gpu/metal).
 if (NOT APPLE)
-    message(FATAL_ERROR
-        "GT7 Port: this tree (src/) builds the macOS backend only.\n"
-        "For Windows/Linux use the DCport backend: see windows/README.md.")
+    message(FATAL_ERROR "GT7 Port builds on macOS only.")
 endif()
 
 set(CMAKE_CXX_STANDARD 23)
@@ -26,7 +20,7 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# PS4 code runs natively, so the host must be x86_64 (Intel Mac).
+# PS4 code runs natively, so the binary is x86_64 (Rosetta 2 on Apple Silicon).
 set(CMAKE_OSX_ARCHITECTURES x86_64)
 
 find_package(SDL3 REQUIRED CONFIG)

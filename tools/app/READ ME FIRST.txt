@@ -1,48 +1,49 @@
-DRIVECLUB NATIVE for Apple Silicon Macs
-=======================================
+GT7 PORT for Apple Silicon Macs (experimental)
+==============================================
 (Italiano più sotto)
 
 Requires macOS 15 or later.
 
-Not affiliated with or endorsed by Sony Interactive Entertainment. This app
-contains no game code, game data or keys. You need your own legitimate copy of
-Driveclub v1.28, European release (CUSA00003), as a folder that contains
-eboot.bin and sce_module. If you have the base game and the 1.28 patch as two
-folders, copy the patch files over the base game folder (replace when asked).
+Not affiliated with or endorsed by Sony Interactive Entertainment or
+Polyphony Digital. This app contains no game code, game data or keys. You need
+your own legitimate copy of Gran Turismo 7 for PS4, v1.00 (CUSA24769), as a
+folder that contains eboot.bin, sce_module and the gtNN.vol data files in
+contents.
+
+This is work in progress: menus and races run, with visual errors, shader
+stutters the first time and a frame rate well below the console.
 
 1. INSTALL
-   Drag "Driveclub" onto the "Applications" folder in this window.
+   Drag "GT7" onto the "Applications" folder in this window.
 
 2. FIRST LAUNCH ONLY: allow the app
    The app is not notarized by Apple, so macOS blocks it the first time.
-   a. Open Applications and double-click Driveclub. A message says Apple
-      could not verify it. Click "Done" (do NOT click "Move to Trash").
+   a. Open Applications and double-click GT7. A message says Apple could
+      not verify it. Click "Done" (do NOT click "Move to Trash").
    b. Open System Settings > Privacy & Security. Scroll down to the message
-      "Driveclub was blocked..." and click "Open Anyway".
+      "GT7 was blocked..." and click "Open Anyway".
    c. Enter your Mac password, then click "Open Anyway" again.
    If macOS asks to install Rosetta, click "Install".
    From now on, a double-click is enough.
 
 3. CHOOSE THE GAME FOLDER
-   The first time, the app asks for your Driveclub folder. Choose the folder
-   that contains eboot.bin and click "Play". The app remembers it.
+   The first time, the app asks for your GT7 folder. Choose the folder that
+   contains eboot.bin and click "Play". The app remembers it.
    To choose a different folder later, hold the Option key while you open
    the app.
 
 4. PLAY
-   Loading takes about 40 seconds. At "Start Event" press Cross (Enter on the
-   keyboard), then Cross again at "Controls". The race starts.
+   The game runs offline (signed out of PSN). If loading stops at
+   "INITIALIZING", quit and start again.
    A DualSense / DualShock 4 controller works over USB or Bluetooth.
    Keyboard: W throttle, S brake, A/D steer, Enter = Cross, Esc = Options.
    Quit with Cmd+Q.
 
 PROBLEMS
-   Every session writes its log to the "Driveclub Logs" folder on your
-   Desktop, named by date and time. The first time, macOS asks to let
-   Driveclub access your Desktop: click "Allow". A session that crashed gets
-   "-crash" in its name, one that ended with an error gets "-error".
-   Please attach the log of that session when you open an issue:
-   https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues
+   Every session writes its log to the "GT7 Logs" folder on your Desktop,
+   named by date and time. The first time, macOS asks to let GT7 access your
+   Desktop: click "Allow". A session that crashed gets "-crash" in its name,
+   one that ended with an error gets "-error".
 
 
 ITALIANO
@@ -50,42 +51,42 @@ ITALIANO
 
 Richiede macOS 15 o successivo.
 
-Non affiliato né approvato da Sony Interactive Entertainment. L'app non
-contiene codice, dati o chiavi del gioco. Serve una tua copia legittima di
-Driveclub v1.28, versione europea (CUSA00003), come cartella che contiene
-eboot.bin e sce_module. Se hai gioco base e patch 1.28 in due cartelle, copia
-i file della patch sopra la cartella del gioco base (sostituisci quando chiede).
+Non affiliato né approvato da Sony Interactive Entertainment o Polyphony
+Digital. L'app non contiene codice, dati o chiavi del gioco. Serve una tua
+copia legittima di Gran Turismo 7 per PS4, v1.00 (CUSA24769), come cartella
+che contiene eboot.bin, sce_module e i file dati gtNN.vol in contents.
+
+È un lavoro in corso: menu e gare girano, con errori grafici, scatti dovuti
+agli shader la prima volta e un frame rate molto sotto la console.
 
 1. INSTALLAZIONE
-   Trascina "Driveclub" sulla cartella "Applicazioni" in questa finestra.
+   Trascina "GT7" sulla cartella "Applicazioni" in questa finestra.
 
 2. SOLO AL PRIMO AVVIO: autorizza l'app
    L'app non è notarizzata da Apple, quindi macOS la blocca la prima volta.
-   a. Apri Applicazioni e fai doppio clic su Driveclub. Un messaggio dice che
-      Apple non può verificarla. Clicca "Fine" (NON "Sposta nel Cestino").
+   a. Apri Applicazioni e fai doppio clic su GT7. Un messaggio dice che Apple
+      non può verificarla. Clicca "Fine" (NON "Sposta nel Cestino").
    b. Apri Impostazioni di Sistema > Privacy e sicurezza. Scorri fino al
-      messaggio "Driveclub è stato bloccato..." e clicca "Apri comunque".
+      messaggio "GT7 è stato bloccato..." e clicca "Apri comunque".
    c. Inserisci la password del Mac, poi clicca di nuovo "Apri comunque".
    Se macOS chiede di installare Rosetta, clicca "Installa".
    Da quel momento basta il doppio clic.
 
 3. SCEGLI LA CARTELLA DEL GIOCO
-   La prima volta l'app chiede la cartella di Driveclub. Scegli quella che
-   contiene eboot.bin e clicca "Play". L'app la ricorda.
+   La prima volta l'app chiede la cartella di GT7. Scegli quella che contiene
+   eboot.bin e clicca "Play". L'app la ricorda.
    Per scegliere un'altra cartella, tieni premuto Opzione (alt) mentre apri
    l'app.
 
 4. GIOCA
-   Il caricamento dura circa 40 secondi. A "Start Event" premi Croce (Invio
-   sulla tastiera), poi di nuovo Croce a "Controls". La gara parte.
+   Il gioco gira offline (disconnesso dal PSN). Se il caricamento si ferma su
+   "INITIALIZING", esci e riavvia.
    Funziona un controller DualSense / DualShock 4 via USB o Bluetooth.
    Tastiera: W acceleratore, S freno, A/D sterzo, Invio = Croce,
    Esc = Options. Esci con Cmd+Q.
 
 PROBLEMI
-   Ogni sessione scrive il suo log nella cartella "Driveclub Logs" sulla
-   Scrivania, con data e ora nel nome. La prima volta macOS chiede di
-   consentire a Driveclub l'accesso alla Scrivania: clicca "Consenti". Una
-   sessione finita in crash ha "-crash" nel nome, una finita con un errore
-   "-error". Allega il log di quella sessione quando apri una segnalazione:
-   https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues
+   Ogni sessione scrive il suo log nella cartella "GT7 Logs" sulla Scrivania,
+   con data e ora nel nome. La prima volta macOS chiede di consentire a GT7
+   l'accesso alla Scrivania: clicca "Consenti". Una sessione finita in crash
+   ha "-crash" nel nome, una finita con un errore "-error".
