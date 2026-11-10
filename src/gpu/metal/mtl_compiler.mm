@@ -15,6 +15,11 @@ std::atomic<bool> g_course_loaded{false};
 
 namespace Gpu::Metal {
 
+bool ShaderCompiler::StatsOn() {
+    static const bool on = std::getenv("DC_COMPILE_STATS") != nullptr;
+    return on;
+}
+
 ShaderCompiler::ShaderCompiler(id<MTLDevice> device, u32 count) : device(device) {
     for (u32 k = 0; k < count; ++k) {
         threads.emplace_back([this] { Worker(false); });
@@ -39,7 +44,8 @@ void ShaderCompiler::Submit(std::function<void()> job, bool urgent, u64 key, boo
     urgent = urgent && !no_urgent;
     {
         std::scoped_lock lk(lock);
-        (urgent ? urgent_jobs : jobs).push_back(Job{key, ++next_stamp, std::move(job), background});
+        (urgent ? urgent_jobs : jobs)
+            .push_back(Job{key, ++next_stamp, std::move(job), background, StatsOn() ? NowNs() : 0});
         if (key && !urgent) {
             touched[key] = next_stamp;
         }
@@ -116,7 +122,9 @@ void ShaderCompiler::BeginWait() {
         return;
     }
     std::scoped_lock lk(lock);
-    ++waiters;
+    if (!waiters++ && StatsOn()) {
+        wait_t0 = NowNs();
+    }
 }
 
 void ShaderCompiler::EndWait() {
@@ -128,7 +136,9 @@ void ShaderCompiler::EndWait() {
     }
     {
         std::scoped_lock lk(lock);
-        --waiters;
+        if (!--waiters && StatsOn()) {
+            stats.paused_ns += NowNs() - wait_t0;
+        }
     }
     cv.notify_all();
 }
@@ -141,13 +151,22 @@ size_t ShaderCompiler::Queued() {
 void ShaderCompiler::Worker(bool urgent_only) {
     pthread_setname_np(urgent_only ? "GPU shader compiler (urgent)" : "GPU shader compiler");
     static const bool fifo = std::getenv("DC_COMPILE_FIFO") != nullptr;
-    static const bool qos_off = [] {
+    // Prewarm jobs run at utility QoS only once a course has loaded: before
+    // that nothing competes, and utility QoS puts the compiles (Metal's
+    // compiler service inherits it) on the efficiency cores. Cold prewarm,
+    // M1 Max, pipelines done at ~355 s: utility 4 / 8 threads 2088 / 1390,
+    // default QoS 4 / 8 threads 2736 / 3994; menu stayed at 60 fps.
+    // DC_PREWARM_QOS=default: never utility; =utility: always (the old way).
+    static const int qos_mode = [] {
         const char* q = std::getenv("DC_PREWARM_QOS");
-        return q && std::strcmp(q, "default") == 0;
+        if (q && std::strcmp(q, "default") == 0) return 0;
+        if (q && std::strcmp(q, "utility") == 0) return 2;
+        return 1;
     }();
     while (true) {
         std::function<void()> job;
         bool background = false;
+        u64 submit_ns = 0;
         {
             std::unique_lock lk(lock);
             cv.wait(lk, [&] {
@@ -158,6 +177,7 @@ void ShaderCompiler::Worker(bool urgent_only) {
                 return;
             }
             if (!urgent_jobs.empty()) {
+                submit_ns = urgent_jobs.front().submit_ns;
                 job = std::move(urgent_jobs.front().fn);
                 urgent_jobs.pop_front();
             } else {
@@ -176,7 +196,10 @@ void ShaderCompiler::Worker(bool urgent_only) {
                 if (best->key) {
                     touched.erase(best->key);
                 }
-                background = best->background && !qos_off;
+                background = best->background &&
+                             (qos_mode == 2 ||
+                              (qos_mode == 1 && g_course_loaded.load(std::memory_order_relaxed)));
+                submit_ns = best->submit_ns;
                 job = std::move(best->fn);
                 jobs.erase(best);
             }
@@ -184,8 +207,16 @@ void ShaderCompiler::Worker(bool urgent_only) {
         if (background) {
             pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
         }
+        const u64 job_t0 = StatsOn() ? NowNs() : 0;
+        if (submit_ns) {
+            stats.queue_ns += job_t0 - submit_ns;
+        }
         @autoreleasepool {
             job();
+        }
+        if (job_t0) {
+            stats.job_ns += NowNs() - job_t0;
+            ++stats.job_n;
         }
         if (background) {
             pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0);
@@ -232,10 +263,26 @@ id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 ad
     static const bool salt_early = std::getenv("DC_MSL_SALT_EARLY") != nullptr;
     const char* salt = salt_env && (prewarm || salt_early || g_course_loaded.load(std::memory_order_relaxed)) ? salt_env
                                                                                                   : nullptr;
-    const std::string salted = salt ? "// " + std::string(salt) + "\n" + src : std::string();
+    std::string salted = salt ? "// " + std::string(salt) + "\n" + src : std::string();
+    // DC_MSL_SALT_CODE=1: the salt also changes main0's code (a volatile store
+    // of its hash), so the AIR differs and Metal's backend cache misses too.
+    static const bool salt_code = std::getenv("DC_MSL_SALT_CODE") != nullptr;
+    if (salt && salt_code) {
+        const size_t m = salted.find(" main0(");
+        const size_t b = m == std::string::npos ? m : salted.find('{', m);
+        if (b != std::string::npos) {
+            salted.insert(b + 1, " { volatile uint dc_salt_v = " +
+                                     std::to_string(std::hash<std::string>{}(salt) & 0x7fffffffu) +
+                                     "u; (void)dc_salt_v; }");
+        }
+    }
     const auto t0 = std::chrono::steady_clock::now();
-    id<MTLLibrary> lib = [device newLibraryWithSource:@((salt ? salted : src).c_str()) options:opts
-                                                error:&err];
+    id<MTLLibrary> lib = nil;
+    {
+        Timed timed(stats, stats.lib_ns, stats.lib_n, stats.lib_hit);
+        stats.lib_bytes += src.size();
+        lib = [device newLibraryWithSource:@((salt ? salted : src).c_str()) options:opts error:&err];
+    }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (secs > 0.5) {
         DC_WARN("gpu: MSL of shader %#llx (key %016llx, %zu KB) took %.1f s to compile", address,

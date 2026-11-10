@@ -2,6 +2,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <nmmintrin.h>
 
@@ -1330,11 +1331,22 @@ struct MetalRenderer::Impl {
       [device sampleTimestamps:&ts_cpu0 gpuTimestamp:&ts_gpu0];
       DC_INFO("gpu: pass timing %s", pass_timing ? "on" : "unavailable");
     }
-    // DC_COMPILE_THREADS=<n>: background compile workers (default 4), plus
-    // one that only serves urgent jobs.
+    // DC_COMPILE_THREADS=<n>: background compile workers, plus one that only
+    // serves urgent jobs. Default: one per performance core (8 on an M1 Max;
+    // it was 4). Metal's compiler service
+    // runs the requests in parallel and native whatever this process is:
+    // 32 cold GT7 pixel shaders gave 6.2 / 10.2 / 10.5 pipelines a second
+    // with 4 / 8 / 16 threads on an idle M1 Max (8 P cores).
     const char *ct = std::getenv("DC_COMPILE_THREADS");
-    compiler = std::make_unique<ShaderCompiler>(
-        device, ct ? std::clamp<u32>(static_cast<u32>(std::atoi(ct)), 1, 32) : 4u);
+    u32 pcores = 0;
+    size_t pcores_size = sizeof(pcores);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &pcores, &pcores_size, nullptr, 0) != 0) {
+      pcores = 4;
+    }
+    const u32 compile_threads = ct ? std::clamp<u32>(static_cast<u32>(std::atoi(ct)), 1, 32)
+                                   : std::clamp<u32>(pcores, 4, 12);
+    DC_INFO("gpu: %u compile threads", compile_threads);
+    compiler = std::make_unique<ShaderCompiler>(device, compile_threads);
     PrewarmStart();
     signal_event = [device newSharedEvent];
     signal_listener = [[MTLSharedEventListener alloc]
@@ -3057,11 +3069,19 @@ struct MetalRenderer::Impl {
     return list.back().prog.get();
   }
 
+  // GenerateMsl, timed for DC_COMPILE_STATS (any thread).
+  std::string TimedMsl(const Program &p, const Shader::MslOptions &o, std::vector<std::string> *unsupported) {
+    const u64 t0 = ShaderCompiler::NowNs();
+    std::string src = Shader::GenerateMsl(p, o, unsupported);
+    compiler->stats.msl_ns += ShaderCompiler::NowNs() - t0;
+    ++compiler->stats.msl_n;
+    return src;
+  }
   // MSL for `p`; GPU thread only (reports and dumps).
   std::string MslSource(const Program &p, const Shader::MslOptions &o,
                         u64 key) {
     std::vector<std::string> unsupported;
-    std::string src = Shader::GenerateMsl(p, o, &unsupported);
+    std::string src = TimedMsl(p, o, &unsupported);
     const char *stage = p.stage == Stage::Vertex     ? "vs"
                         : p.stage == Stage::Fragment ? "ps"
                                                      : "cs";
@@ -3190,7 +3210,7 @@ struct MetalRenderer::Impl {
         o.map_hoist = e.map_hoist;
         o.linear_mask = e.linear_mask;
         o.linear_aligned = e.linear_aligned;
-        const std::string src = Shader::GenerateMsl(*prog, o, nullptr);
+        const std::string src = TimedMsl(*prog, o, nullptr);
         id<MTLFunction> fn = compiler->Function(key, src, e.addr, true);
         if (!fn) {
           return;
@@ -3200,9 +3220,13 @@ struct MetalRenderer::Impl {
         d.label = [NSString stringWithFormat:@"cs %#llx", e.addr];
         d.maxTotalThreadsPerThreadgroup = e.group;
         NSError *err = nil;
-        id<MTLComputePipelineState> pso =
-            [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
-                                               reflection:nil error:&err];
+        id<MTLComputePipelineState> pso = nil;
+        {
+          ShaderCompiler::Timed timed(compiler->stats, compiler->stats.pso_ns, compiler->stats.pso_n,
+                                      compiler->stats.pso_hit);
+          pso = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
+                                                   reflection:nil error:&err];
+        }
         if (pso && pso.maxTotalThreadsPerThreadgroup >= e.group) { // failures: the dispatch reports
           std::scoped_lock lk(done_lock);
           done_compute.emplace_back(e.pkey, pso);
@@ -3743,10 +3767,10 @@ struct MetalRenderer::Impl {
       return;
     }
     id<MTLFunction> vfn = compiler->Function(
-        vs_key, compiler->Has(vs_key) ? std::string() : Shader::GenerateMsl(*vs, vo, nullptr), e.vs_addr, true);
+        vs_key, compiler->Has(vs_key) ? std::string() : TimedMsl(*vs, vo, nullptr), e.vs_addr, true);
     id<MTLFunction> ffn =
         !ps ? nil
-            : compiler->Function(ps_key, compiler->Has(ps_key) ? std::string() : Shader::GenerateMsl(*ps, fo, nullptr),
+            : compiler->Function(ps_key, compiler->Has(ps_key) ? std::string() : TimedMsl(*ps, fo, nullptr),
                                  e.ps_addr, true);
     if (vfn && (!ps || ffn)) {
       MTLRenderPipelineDescriptor *d = RenderDescriptor(e.state);
@@ -3756,6 +3780,8 @@ struct MetalRenderer::Impl {
       d.vertexFunction = vfn;
       d.fragmentFunction = e.state.flat ? debug_fs : ffn;
       NSError *err = nil;
+      ShaderCompiler::Timed timed(compiler->stats, compiler->stats.pso_ns, compiler->stats.pso_n,
+                                  compiler->stats.pso_hit);
       pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
     }
     finish();
@@ -8453,7 +8479,11 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
           d.fragmentFunction = flat ? debug_fs : ffn;
           NSError *err = nil;
           const auto t0 = std::chrono::steady_clock::now();
-          pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+          {
+            ShaderCompiler::Timed timed(compiler->stats, compiler->stats.pso_ns, compiler->stats.pso_n,
+                                        compiler->stats.pso_hit);
+            pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
+          }
           ReportSlowCompile("pipeline", vs_addr, ps_addr, t0);
           if (!pso) {
             DC_ERROR("gpu: pipeline (vs %#llx ps %#llx): %s", vs_addr, ps_addr,
@@ -9425,11 +9455,14 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
               group; // the guest's group size must fit as is
           NSError *err = nil;
           const auto t0 = std::chrono::steady_clock::now();
-          pso = [device
-              newComputePipelineStateWithDescriptor:d
-                                            options:MTLPipelineOptionNone
-                                         reflection:nil
-                                              error:&err];
+          {
+            ShaderCompiler::Timed timed(compiler->stats, compiler->stats.pso_ns, compiler->stats.pso_n,
+                                        compiler->stats.pso_hit);
+            pso = [device newComputePipelineStateWithDescriptor:d
+                                                        options:MTLPipelineOptionNone
+                                                     reflection:nil
+                                                          error:&err];
+          }
           ReportSlowCompile("compute pipeline", addr, 0, t0);
           if (!pso) {
             DC_ERROR("gpu: compute pipeline %#llx: %s", addr,
@@ -9769,6 +9802,24 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
               prewarm_render_done.load(), prewarm_render_total.load(), prewarm_render_dropped.load(),
               (unsigned long long)stat_prewarm_promoted,
               std::chrono::duration<double>(now - start_time).count());
+      if (ShaderCompiler::StatsOn()) {
+        // DC_COMPILE_STATS=1: translator vs MSL frontend vs GPU backend, and
+        // whether the workers are the limit (busy ~100%) or starved (paused, low busy).
+        ShaderCompiler::Stats &cs = compiler->stats;
+        auto take = [](std::atomic<u64> &v) { return double(v.exchange(0)); };
+        const double msl_n = take(cs.msl_n), lib_n = take(cs.lib_n), pso_n = take(cs.pso_n), job_n = take(cs.job_n);
+        const double msl = take(cs.msl_ns) / 1e6, lib = take(cs.lib_ns) / 1e6, pso = take(cs.pso_ns) / 1e6;
+        const double job = take(cs.job_ns) / 1e6, queue = take(cs.queue_ns) / 1e6, paused = take(cs.paused_ns) / 1e6;
+        const double lib_hit = take(cs.lib_hit), pso_hit = take(cs.pso_hit), lib_kb = take(cs.lib_bytes) / 1024;
+        auto avg = [](double sum, double n) { return n ? sum / n : 0.0; };
+        DC_INFO("perf: compile: translator %.0f x %.1f ms = %.0f ms | MSL frontend %.0f x %.0f ms = %.0f ms "
+                "(%.0f cached, %.0f KB avg) | backend %.0f x %.0f ms = %.0f ms (%.0f cached) | workers: %.0f jobs, "
+                "busy %.0f%% of %u threads, queue wait %.0f ms avg, paused by GPU-thread waits %.0f ms, "
+                "peak %u Metal calls at once, %zu queued",
+                msl_n, avg(msl, msl_n), msl, lib_n, avg(lib, lib_n), lib, lib_hit, avg(lib_kb, lib_n), pso_n,
+                avg(pso, pso_n), pso, pso_hit, job_n, job / (dt * 1e3 * compiler->Workers()) * 100,
+                compiler->Workers(), avg(queue, job_n), paused, cs.peak.exchange(0), compiler->Queued());
+      }
       DC_INFO("perf: skipped draws (pipeline compiling) %llu: depth-only %llu, color+depth %llu, "
               "color %llu, memory %llu; max %llu in a frame, %llu frames held; waits: compute %llu/%llu ms, "
               "draw %llu/%llu ms, depth-only %llu/%llu ms, gs/tess %llu/%llu ms, %llu compiled inline, "
