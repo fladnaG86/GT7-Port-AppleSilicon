@@ -650,6 +650,47 @@ bool WritesExec(const Inst& i) {
     }
 }
 
+// Writes VCC (implicitly or as its scalar destination): what s_mov_b64 exec,
+// vcc then restores is no longer the exec saved there. The decoder gives every
+// VOP2 sdst = vcc, but only the carry ops write it.
+bool WritesVcc(const Inst& i) {
+    auto is_vcc = [](u16 code) { return code == Operand::VccLo || code == Operand::VccHi; };
+    switch (i.enc) {
+    case Enc::SOP1:
+    case Enc::SOP2:
+    case Enc::SOPK:
+    case Enc::SMRD: {
+        bool hit = false;
+        ForEachSgprWrite(i, [&](u32 reg, u32 count) {
+            hit = hit || (reg <= Operand::VccHi && reg + count > Operand::VccLo);
+        });
+        return hit;
+    }
+    case Enc::VOPC:
+        return true;
+    case Enc::VOP2:
+        switch (static_cast<Vop>(i.op)) {
+        case Vop::V_ADD_I32:
+        case Vop::V_SUB_I32:
+        case Vop::V_SUBREV_I32:
+        case Vop::V_ADDC_U32:
+        case Vop::V_SUBB_U32:
+        case Vop::V_SUBBREV_U32:
+            return true;
+        default:
+            return false;
+        }
+    case Enc::VOP1:
+    case Enc::VOP3:
+        if (static_cast<Vop>(i.op) == Vop::V_READFIRSTLANE_B32 || static_cast<Vop>(i.op) == Vop::V_READLANE_B32) {
+            return is_vcc(i.dst);
+        }
+        return i.enc == Enc::VOP3 && i.sdst != 0xFFFF && is_vcc(i.sdst);
+    default:
+        return false;
+    }
+}
+
 // Per instruction: whether this lane is surely on (exec_lo != 0u) before it
 // runs, so its lane writes need no exec guard. Lanes run one per thread, so a
 // s_cbranch_execz skips the region for exactly the lanes that are off: on its
@@ -659,20 +700,24 @@ bool WritesExec(const Inst& i) {
 // (s_mov_b64 / s_*_saveexec_b64), so restoring them (s_mov_b64 exec or
 // s_or_b64 exec, exec, saved) turns the lane back on.
 std::vector<bool> LaneOn(const std::vector<Inst>& code) {
+    static const bool kLaneOnVcc = std::getenv("DC_NO_LANE_ON_VCC") == nullptr; // old: exec saved in VCC not tracked
     const size_t n = code.size();
     struct State {
         bool on = true;
         std::array<bool, Operand::SgprMax + 1> saved{}; // SGPR is nonzero for this lane
+        bool vcc = false; // VCC is nonzero for this lane (exec saved there)
         bool operator==(const State&) const = default;
     };
     auto meet = [](State& a, const State& b) {
         a.on = a.on && b.on;
+        a.vcc = a.vcc && b.vcc;
         for (size_t r = 0; r < a.saved.size(); ++r) {
             a.saved[r] = a.saved[r] && b.saved[r];
         }
     };
     State top;
     top.saved.fill(true);
+    top.vcc = true;
     const State entry; // all lanes on, no copies
 
     // An operand pair surely nonzero for this lane.
@@ -683,6 +728,9 @@ std::vector<bool> LaneOn(const std::vector<Inst>& code) {
         if (code == Operand::IntPosMax + 1) { // -1: all lanes
             return true;
         }
+        if (code == Operand::VccLo) {
+            return s.vcc;
+        }
         return code < Operand::SgprMax && s.saved[code] && s.saved[code + 1u];
     };
     auto step = [&](State& s, const Inst& i) {
@@ -692,9 +740,14 @@ std::vector<bool> LaneOn(const std::vector<Inst>& code) {
                 s.saved[r] = false;
             }
         });
+        if (WritesVcc(i)) {
+            s.vcc = false;
+        }
         auto set_saved = [&](u16 dst, bool v) {
             if (dst < Operand::SgprMax) {
                 s.saved[dst] = s.saved[dst + 1u] = v;
+            } else if (dst == Operand::VccLo && kLaneOnVcc) {
+                s.vcc = v;
             }
         };
         const bool to_exec = i.dst == Operand::ExecLo;
