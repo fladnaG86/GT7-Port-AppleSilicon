@@ -425,6 +425,10 @@ private:
     bool Structure();
     void EmitStructured();
     void EmitSwitch();
+    bool TreeShape();
+    bool EmitTree(u32 lo, u32 hi, u32 depth, u32 header);
+    bool RegionClosed(u32 a, u32 b, u32 entry) const;
+    std::string BranchCond(const Inst& i);
 
     std::string AttrExpr(u32 attr, u32 chan);
     std::string TexArgs() const;     // call arguments for dc_run
@@ -441,6 +445,9 @@ private:
 
     // Structured control flow (see Structure()).
     bool structured = false;
+    bool tree = false; // if/else nesting instead of tgt_ blocks (see TreeShape())
+    std::unordered_map<u32, u32> tails;           // tree: inlined tail start -> one past its S_ENDPGM
+    std::vector<std::pair<u32, u32>> loops;       // tree: open loops (header, last back edge)
     u32 cur = 0;                              // index of the instruction being emitted
     bool guard = false;                       // its lane writes need `exec_lo != 0u`
     std::unordered_map<u32, u32> index_of;    // pc -> instruction index
@@ -760,12 +767,15 @@ void Emitter::EmitSopp(const Inst& i) {
         End();
         break;
     case Sopp::S_BRANCH: Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_SCC0: Line("if (!scc)"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_SCC1: Line("if (scc)"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_VCCZ: Line("if (" + WaveZero("vcc_lo") + ")"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_VCCNZ: Line("if (!" + WaveZero("vcc_lo") + ")"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_EXECZ: Line("if (" + WaveZero("exec_lo") + ")"); Jump(BranchTarget(i)); break;
-    case Sopp::S_CBRANCH_EXECNZ: Line("if (!" + WaveZero("exec_lo") + ")"); Jump(BranchTarget(i)); break;
+    case Sopp::S_CBRANCH_SCC0:
+    case Sopp::S_CBRANCH_SCC1:
+    case Sopp::S_CBRANCH_VCCZ:
+    case Sopp::S_CBRANCH_VCCNZ:
+    case Sopp::S_CBRANCH_EXECZ:
+    case Sopp::S_CBRANCH_EXECNZ:
+        Line("if (" + BranchCond(i) + ")");
+        Jump(BranchTarget(i));
+        break;
     case Sopp::S_BARRIER:
         if (p.stage == Stage::Compute) {
             Line("threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);");
@@ -2146,6 +2156,258 @@ void Emitter::EmitStructured() {
     End();
 }
 
+// When a conditional branch is taken.
+std::string Emitter::BranchCond(const Inst& i) {
+    switch (static_cast<Sopp>(i.op)) {
+    case Sopp::S_CBRANCH_SCC0: return "!scc";
+    case Sopp::S_CBRANCH_SCC1: return "scc";
+    case Sopp::S_CBRANCH_VCCZ: return WaveZero("vcc_lo");
+    case Sopp::S_CBRANCH_VCCNZ: return "!" + WaveZero("vcc_lo");
+    case Sopp::S_CBRANCH_EXECZ: return WaveZero("exec_lo");
+    case Sopp::S_CBRANCH_EXECNZ: return "!" + WaveZero("exec_lo");
+    default: return "true";
+    }
+}
+
+// The tgt_ blocks of EmitStructured() are correct for any structured code,
+// but Metal's compiler optimizes that shape poorly: every block is guarded by
+// a run-time compare, so nothing is known about which code runs together.
+// Vertex and pixel shaders whose branches nest are emitted as real control
+// flow instead (DC_NO_MSL_TREE=1: blocks):
+//  - a forward branch over [k+1, t) is `if (!cond) {..}`, with an S_BRANCH at
+//    t-1 over [t, e) `if (!cond) {..} else {..}`;
+//  - a loop [h, e] (e: its last back edge) is `while (true) {..}`; inside it
+//    a branch to h is `continue`, one to e+1 `break`;
+//  - a tail [t, end] ending in S_ENDPGM that only one branch reaches (the
+//    code before t does not fall into it) is inlined at that branch.
+bool Emitter::TreeShape() {
+    static const bool off = std::getenv("DC_NO_MSL_TREE") != nullptr;
+    if (off || p.stage == Stage::Compute || o.ring.stage != RingStage::None) {
+        return false;
+    }
+    // DC_MSL_TREE_STAGE=vs|ps: only that stage (bisecting).
+    if (const char* st = std::getenv("DC_MSL_TREE_STAGE")) {
+        if ((std::strcmp(st, "vs") == 0) != (p.stage == Stage::Vertex)) {
+            return false;
+        }
+    }
+    for (const Inst& i : p.code) {
+        if (LdsBarrier(i)) {
+            return false;
+        }
+    }
+    const u32 n = static_cast<u32>(p.code.size());
+    // Tails.
+    tails.clear();
+    std::unordered_map<u32, u32> hits; // target index -> branches landing there
+    for (u32 k = 0; k < n; ++k) {
+        if (IsBranch(p.code[k])) {
+            ++hits[index_of.at(BranchTarget(p.code[k]))];
+        }
+    }
+    auto no_fall = [&](u32 k) { // instruction k does not continue at k + 1
+        const Inst& i = p.code[k];
+        return i.enc == Enc::SOPP &&
+               (static_cast<Sopp>(i.op) == Sopp::S_ENDPGM || static_cast<Sopp>(i.op) == Sopp::S_BRANCH);
+    };
+    for (const auto& [t, count] : hits) {
+        if (count != 1 || t == 0 || t >= n || !no_fall(t - 1) || loop_end.count(t)) {
+            continue;
+        }
+        u32 e = t;
+        while (e < n && !(p.code[e].enc == Enc::SOPP && static_cast<Sopp>(p.code[e].op) == Sopp::S_ENDPGM)) {
+            ++e;
+        }
+        if (e >= n) {
+            continue;
+        }
+        bool ok = true;
+        for (u32 k = 0; k < n && ok; ++k) {
+            if (!IsBranch(p.code[k])) {
+                continue;
+            }
+            const u32 tk = index_of.at(BranchTarget(p.code[k]));
+            if (k >= t && k <= e) {
+                ok = tk > k && tk <= e; // stays inside, forward
+            } else {
+                ok = !(tk > t && tk <= e); // no other entry
+            }
+        }
+        if (ok) {
+            tails[t] = e + 1;
+        }
+    }
+    const std::string saved = body;
+    loops.clear();
+    if (EmitTree(0, n, 0, ~0u)) {
+        return true;
+    }
+    body = saved;
+    return false;
+}
+
+// Region [a, b): every branch in it lands in (its own index, b], at an inlined
+// tail, or at the header or exit of an enclosing loop; no other branch lands
+// in [a, b) except instruction `entry` (~0u: none) and back edges of loops
+// that start at a.
+bool Emitter::RegionClosed(u32 a, u32 b, u32 entry) const {
+    for (u32 k = 0; k < p.code.size(); ++k) {
+        const Inst& i = p.code[k];
+        if (!IsBranch(i)) {
+            continue;
+        }
+        const u32 t = index_of.at(BranchTarget(i));
+        if (k >= a && k < b) {
+            if (tails.count(t)) {
+                continue;
+            }
+            bool loop_jump = false;
+            for (const auto& [h, e] : loops) {
+                loop_jump |= t == h || t == e + 1;
+            }
+            if (loop_jump) {
+                continue;
+            }
+            if (t <= k || t > b) {
+                if (!(t <= k && loop_end.count(t) && t >= a)) { // back edge of a loop inside
+                    return false;
+                }
+            }
+        } else if (t >= a && t < b && k != entry && !tails.count(t)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#define TREE_FAIL(why)                                                                                       \
+    do {                                                                                                     \
+        if (std::getenv("DC_TREE_DEBUG"))                                                                    \
+            std::fprintf(stderr, "tree fail %s k=%u lo=%u hi=%u\n", why, k, lo, hi);                         \
+        return false;                                                                                        \
+    } while (0)
+
+// Emits [lo, hi) as nested control flow; false if the shape does not fit.
+// `header`: lo is that loop's header, already opened by the caller.
+bool Emitter::EmitTree(u32 lo, u32 hi, u32 depth, u32 header) {
+    if (depth > 64) {
+        return false;
+    }
+    for (u32 k = lo; k < hi;) {
+        if (k != header && k != lo && tails.count(k)) {
+            k = tails.at(k); // inlined at its branch
+            continue;
+        }
+        if (k != header && loop_end.count(k)) {
+            const u32 e = loop_end.at(k);
+            if (e >= hi) {
+                TREE_FAIL("loop crosses region");
+            }
+            // Only the loop's own back edges land on its header from outside the body.
+            for (u32 j = 0; j < p.code.size(); ++j) {
+                if (IsBranch(p.code[j]) && index_of.at(BranchTarget(p.code[j])) == k && (j < k || j > e)) {
+                    TREE_FAIL("entry into loop header");
+                }
+            }
+            loops.emplace_back(k, e);
+            body += "    while (true) {\n";
+            if (!EmitTree(k, e, depth + 1, k)) {
+                return false;
+            }
+            const Inst& back = p.code[e];
+            cur = e;
+            if (static_cast<Sopp>(back.op) == Sopp::S_BRANCH) {
+                body += "    " + LoopGuard() + "continue;\n";
+            } else {
+                body += "    if (" + BranchCond(back) + ") { " + LoopGuard() + "continue; }\n";
+                body += "    break;\n";
+            }
+            body += "    }\n";
+            loops.pop_back();
+            k = e + 1;
+            continue;
+        }
+        const Inst& i = p.code[k];
+        if (!IsBranch(i)) {
+            cur = k;
+            Emit(i);
+            ++k;
+            continue;
+        }
+        cur = k;
+        const u32 t = index_of.at(BranchTarget(i));
+        const bool uncond = static_cast<Sopp>(i.op) == Sopp::S_BRANCH;
+        const std::string cond = uncond ? std::string("true") : BranchCond(i);
+        // Loop control.
+        if (!loops.empty() && (t == loops.back().first || t == loops.back().second + 1)) {
+            const bool cont = t == loops.back().first;
+            const std::string what = cont ? LoopGuard() + "continue;" : std::string("break;");
+            body += uncond ? "    " + what + "\n" : "    if (" + cond + ") { " + what + " }\n";
+            ++k;
+            continue;
+        }
+        // Inlined tail.
+        if (tails.count(t)) {
+            if (!uncond) {
+                body += "    if (" + cond + ") {\n";
+            }
+            if (!EmitTree(t, tails.at(t), depth + 1, ~0u)) {
+                return false;
+            }
+            if (!uncond) {
+                body += "    }\n";
+            }
+            ++k;
+            continue;
+        }
+        if (t <= k || t > hi) {
+            TREE_FAIL("target outside");
+        }
+        if (uncond) {
+            // Code up to the target only runs if a branch lands in it.
+            for (u32 j = 0; j < p.code.size(); ++j) {
+                if (IsBranch(p.code[j])) {
+                    const u32 tj = index_of.at(BranchTarget(p.code[j]));
+                    if (tj > k && tj < t && !tails.count(tj)) {
+                        TREE_FAIL("jump over label");
+                    }
+                }
+            }
+            k = t;
+            continue;
+        }
+        // Taken: skip [k+1, t). With an S_BRANCH to e at t-1: if / else.
+        const Inst& last = p.code[t - 1];
+        if (t - 1 > k && IsBranch(last) && static_cast<Sopp>(last.op) == Sopp::S_BRANCH) {
+            const u32 e = index_of.at(BranchTarget(last));
+            if (e > t && e <= hi && !tails.count(e) && RegionClosed(k + 1, t - 1, ~0u) && RegionClosed(t, e, k)) {
+                body += "    if (!(" + cond + ")) {\n";
+                if (!EmitTree(k + 1, t - 1, depth + 1, ~0u)) {
+                    return false;
+                }
+                body += "    } else {\n";
+                if (!EmitTree(t, e, depth + 1, ~0u)) {
+                    return false;
+                }
+                body += "    }\n";
+                k = e;
+                continue;
+            }
+        }
+        if (!RegionClosed(k + 1, t, ~0u)) {
+            TREE_FAIL("then not closed");
+        }
+        body += "    if (!(" + cond + ")) {\n";
+        if (!EmitTree(k + 1, t, depth + 1, ~0u)) {
+            return false;
+        }
+        body += "    }\n";
+        k = t;
+    }
+    return true;
+}
+#undef TREE_FAIL
+
 void Emitter::EmitSwitch() {
     size_t label = 0;
     for (const Inst& i : p.code) {
@@ -2166,7 +2428,11 @@ void Emitter::EmitSwitch() {
 std::string Emitter::Run() {
     // Body first: it records which registers and inputs are used.
     structured = Structure();
-    if (structured) {
+    if (structured && TreeShape()) {
+        structured = false;
+        tree = true;
+        End();
+    } else if (structured) {
         EmitStructured();
     } else {
         EmitSwitch();
@@ -2336,7 +2602,9 @@ std::string Emitter::Run() {
     const std::string probe_param = probe ? ", device uint* dbg [[buffer(" + N(kProbeBinding) + ")]]" : "";
 
     std::string wrapped;
-    if (structured) {
+    if (tree) {
+        wrapped = "    uint guard_ = 0u;\n" + body;
+    } else if (structured) {
         wrapped = "    uint tgt_ = 0u;\n    uint guard_ = 0u;\n" + body;
     } else if (p.has_branches) {
         wrapped = "    uint pc_ = 0u;\n    uint guard_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
