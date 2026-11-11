@@ -1701,7 +1701,14 @@ static std::string Compare(u8 func, const std::string& ref, const std::string& t
 
 void Emitter::EmitImage(const Inst& i) {
     const u32 slot = p.ImageSlot(i.pc);
-    const TextureType tt = slot < o.textures.size() ? o.textures[slot] : TextureType{};
+    TextureType tt = slot < o.textures.size() ? o.textures[slot] : TextureType{};
+    // USCALED: a float texture whose reads are scaled back to the integer value.
+    const char* uscale = tt.sample == TexSample::Uscaled8    ? "255.0f"
+                         : tt.sample == TexSample::Uscaled16 ? "65535.0f"
+                                                             : nullptr;
+    if (uscale) {
+        tt.sample = TexSample::Float;
+    }
     const u32 s_idx = slot < p.images.size() && p.images[slot].has_sampler ? p.images[slot].sampler_index : 0;
     const std::string t = "t" + N(slot), smp = "smp" + N(std::min<u32>(s_idx, 15u));
     const auto op = static_cast<Mimg>(i.op);
@@ -1765,6 +1772,7 @@ void Emitter::EmitImage(const Inst& i) {
         std::string lod = op == Mimg::IMAGE_LOAD_MIP ? VName(a + (tt.dim == TexDim::Tex2D ? 2u : 3u)) : "0u";
         std::string coord = int_coord(a) + (storage ? "" : ", " + lod);
         Line(std::string("{ ") + vec + " r_ = " + t + ".read(" + coord + ");");
+        if (uscale) Line("  r_ *= " + std::string(uscale) + ";");
         write_dmask("r_");
         Line("}");
         return;
@@ -1878,6 +1886,7 @@ void Emitter::EmitImage(const Inst& i) {
         static const char* comps[] = {"component::x", "component::y", "component::z", "component::w"};
         const std::string offs = tt.dim == TexDim::Tex3D ? "" : ", int2(0)";
         Line(std::string("  ") + vec + " r_ = " + t + ".gather(" + args + offs + ", " + comps[comp] + ");");
+        if (uscale && !c) Line("  r_ *= " + std::string(uscale) + ";");
         if (c) {
             Line("  r_ = " + std::string(vec) + "(" + Compare(tt.compare, ref, "r_.x") + ", " +
                  Compare(tt.compare, ref, "r_.y") + ", " + Compare(tt.compare, ref, "r_.z") + ", " +
@@ -1894,6 +1903,7 @@ void Emitter::EmitImage(const Inst& i) {
     else if (b) args += ", bias(" + bias + ")";
     else if (d) args += ", " + grad;
     Line(std::string("  ") + vec + " r_ = " + t + ".sample(" + args + ");");
+    if (uscale && !c) Line("  r_ *= " + std::string(uscale) + ";");
     if (c) {
         Line("  r_ = " + std::string(vec) + "(" + Compare(tt.compare, ref, "r_.x") + ");");
     }
@@ -2003,7 +2013,7 @@ std::string Emitter::TexParams(bool entry) const {
     std::string s;
     for (size_t k = 0; k < p.images.size(); ++k) {
         const TextureType tt = k < o.textures.size() ? o.textures[k] : TextureType{};
-        const char* comp = tt.sample == TexSample::Float ? "float" : tt.sample == TexSample::Uint ? "uint" : "int";
+        const char* comp = FloatSample(tt.sample) ? "float" : tt.sample == TexSample::Uint ? "uint" : "int";
         const char* kind = tt.dim == TexDim::Tex2D ? "texture2d" : tt.dim == TexDim::Tex2DArray ? "texture2d_array" : "texture3d";
         // Images the shader writes are bound write-only, or read_write when it also
         // loads them (Metal allows read_write only for a few formats).

@@ -118,7 +118,13 @@ struct alignas(16) GpuDrawConsts {
 };
 
 enum class TexDim : u8 { Tex2D, Tex2DArray, Tex3D };
-enum class TexSample : u8 { Float, Uint, Sint };
+// Uscaled8/16: USCALED unsigned normalized storage the shader reads as the
+// integer value in a float (0..255 / 0..65535). Bound as the UNORM format, so
+// it filters, and scaled after the read. Appended so older keys stay valid.
+enum class TexSample : u8 { Float, Uint, Sint, Uscaled8, Uscaled16 };
+inline bool FloatSample(TexSample s) {
+    return s == TexSample::Float || s == TexSample::Uscaled8 || s == TexSample::Uscaled16;
+}
 
 struct TextureType {
     TexDim dim = TexDim::Tex2D;

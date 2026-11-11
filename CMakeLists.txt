@@ -106,7 +106,7 @@ set(DC_CORE_SOURCES
     src/hle/font/font.h
     src/hle/font/font.cpp
     src/hle/avplayer/avplayer.h
-    src/hle/avplayer/avplayer.cpp
+    src/hle/avplayer/avplayer.mm
     src/hle/services/misc_services.h
     src/hle/audio_out/audio_out.h
     src/hle/audio_out/audio_out.cpp
@@ -172,6 +172,9 @@ target_link_libraries(gt7 PRIVATE
     "-framework CoreText"
     "-framework CoreGraphics"
     "-framework IOKit"
+    "-framework AVFoundation"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
 )
 
 # Developer tool: GCN disassembler + MSL translation check (gcn_dis shader.bin [vs|ps] [--msl]).

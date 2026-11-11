@@ -3859,7 +3859,7 @@ struct MetalRenderer::Impl {
     d.textureType = tt.dim == TexDim::Tex2D        ? MTLTextureType2D
                     : tt.dim == TexDim::Tex2DArray ? MTLTextureType2DArray
                                                    : MTLTextureType3D;
-    d.pixelFormat = tt.sample == TexSample::Float  ? MTLPixelFormatRGBA8Unorm
+    d.pixelFormat = FloatSample(tt.sample)         ? MTLPixelFormatRGBA8Unorm
                     : tt.sample == TexSample::Uint ? MTLPixelFormatRGBA8Uint
                                                    : MTLPixelFormatRGBA8Sint;
     d.width = d.height = 1;
@@ -3871,7 +3871,7 @@ struct MetalRenderer::Impl {
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     id<MTLTexture> t = [device newTextureWithDescriptor:d];
     const u32 white = zero                            ? 0u
-                      : tt.sample == TexSample::Float ? 0xFFFFFFFFu
+                      : FloatSample(tt.sample)        ? 0xFFFFFFFFu
                                                       : 0x01010101u;
     [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1)
           mipmapLevel:0
@@ -4196,7 +4196,7 @@ struct MetalRenderer::Impl {
           const u32 nlv = std::clamp<u32>(last_level - base_level + 1, 1, a->levels - lv0);
           MTLPixelFormat vf = a->tex.pixelFormat;
           if (fi.format != MTLPixelFormatInvalid && PixelBytes(fi.format) == PixelBytes(vf) &&
-              !(fi.sample == TexSample::Float) == !(SampleKind(vf) == TexSample::Float)) {
+              !FloatSample(fi.sample) == !(SampleKind(vf) == TexSample::Float)) {
             vf = fi.format;
           } else {
             tt.sample = SampleKind(vf);
@@ -4261,7 +4261,7 @@ struct MetalRenderer::Impl {
         if (fi.format != MTLPixelFormatInvalid && !fi.compressed &&
             fi.format != rt->tex.pixelFormat && PixelBytes(fi.format) &&
             PixelBytes(fi.format) == PixelBytes(rt->tex.pixelFormat) &&
-            !(fi.sample == TexSample::Float) ==
+            !FloatSample(fi.sample) ==
                 !(SampleKind(rt->tex.pixelFormat) == TexSample::Float)) {
           view_fmt = fi.format;
         }

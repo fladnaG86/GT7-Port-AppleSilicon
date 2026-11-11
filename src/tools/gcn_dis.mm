@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
     const bool cs = argc > 2 && std::strcmp(argv[2], "cs") == 0;
     bool print_msl = false;
     u32 uint_tex = 0; // uint_tex=<mask>: images sampled as uint (default float)
+    u32 uscaled_tex = 0; // textures read as USCALED (bit per slot)
     u32 user_sgprs = 16; // user_sgprs=<n>: user-data SGPRs (ES/GS: from their RSRC2)
     MslOptions o;
     // After the stage: --msl and MslOptions overrides as key=value.
@@ -120,6 +121,10 @@ int main(int argc, char** argv) {
         const char* eq = std::strchr(arg, '=');
         if (eq && std::string(arg, eq - arg) == "uint_tex") {
             uint_tex = static_cast<u32>(std::strtoul(eq + 1, nullptr, 0));
+            continue;
+        }
+        if (eq && std::string(arg, eq - arg) == "uscaled_tex") {
+            uscaled_tex = static_cast<u32>(std::strtoul(eq + 1, nullptr, 0));
             continue;
         }
         if (eq && std::string(arg, eq - arg) == "user_sgprs") {
@@ -166,6 +171,9 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < textures.size(); ++k) {
         if (uint_tex & (1u << k)) {
             textures[k].sample = TexSample::Uint;
+        }
+        if (uscaled_tex & (1u << k)) {
+            textures[k].sample = TexSample::Uscaled8;
         }
     }
     o.textures = textures;

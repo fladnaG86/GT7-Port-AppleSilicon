@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 #include "common/log.h"
 #include "core/memory.h"
@@ -52,6 +53,10 @@ public:
             }
         }
     }
+
+    using State = std::array<SgprSource, 108>;
+    const State& All() const { return state; }
+    void SetAll(const State& s) { state = s; }
 
     const SgprSource& Get(u32 reg) const {
         static const SgprSource unknown{};
@@ -932,7 +937,30 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     Exactness exact(p->code);
     Provenance prov(in.num_user_sgprs, in.stage, in.compute_rsrc2);
     bool v0_written = false; // the vertex index is still in v0
+    // Provenance follows program order. A label only jumps reach (the
+    // instruction before it is S_BRANCH or S_ENDPGM) starts from the state
+    // of the jump to it instead of the code it follows: GT7's movie shader
+    // reloads s[0:7] in its HDR branch, and its SDR branch, after an
+    // S_BRANCH, still samples the luma T# from user data.
+    std::unordered_map<u32, Provenance::State> jump_states; // label pc -> state of the last jump to it
+    bool falls_through = true;
     for (const Inst& i : p->code) {
+        if (!jump_states.empty()) {
+            if (auto it = jump_states.find(i.pc); it != jump_states.end()) {
+                // DC_NO_JUMP_PROVENANCE=1: program order only, as before (A/B).
+                static const bool off = std::getenv("DC_NO_JUMP_PROVENANCE") != nullptr;
+                if (!falls_through && !off && it->second != prov.All()) {
+                    static int logged = 0;
+                    if (logged < 40) {
+                        ++logged;
+                        DC_INFO("shader %#llx: state at label %#x taken from the jump to it",
+                                (unsigned long long)p->address, i.pc);
+                    }
+                    prov.SetAll(it->second);
+                }
+                jump_states.erase(it);
+            }
+        }
         if (in.stage == Stage::Vertex && !v0_written && i.pc >= kFetchPcBase &&
             (i.enc == Enc::MUBUF || i.enc == Enc::MTBUF) && i.idxen && !i.offen && i.vaddr == 0 &&
             i.soffset == 128 && !i.addr64 && !i.lds && !i.tfe &&
@@ -1063,6 +1091,11 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
         CollectLinearBase(*p, prov, exact, i);
         exact.Step(i, SourcesExact(i, exact));
         prov.Step(i);
+        if (IsBranch(i) && i.pc < kFetchPcBase && BranchTarget(i) > i.pc) {
+            jump_states[BranchTarget(i)] = prov.All();
+        }
+        falls_through = !(i.enc == Enc::SOPP && (static_cast<Sopp>(i.op) == Sopp::S_BRANCH ||
+                                                 static_cast<Sopp>(i.op) == Sopp::S_ENDPGM));
     }
     std::sort(p->labels.begin(), p->labels.end());
     p->labels.erase(std::unique(p->labels.begin(), p->labels.end()), p->labels.end());

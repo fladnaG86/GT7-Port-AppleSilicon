@@ -193,6 +193,15 @@ inline TextureFormatInfo TextureFormat(u32 dfmt, u32 nfmt) {
     if (t.sample != TexSample::Float && t.compressed) {
         t.sample = TexSample::Float;
     }
+    // USCALED (e.g. libSceAvPlayer's NV12 planes as GT7 samples them): the
+    // UNORM format above, read back as integer values.
+    if (nfmt == NumFormat::Uscaled && !t.compressed) {
+        if (dfmt == 1 || dfmt == 3 || dfmt == 10) {
+            t.sample = TexSample::Uscaled8;
+        } else if (dfmt == 2 || dfmt == 5 || dfmt == 12) {
+            t.sample = TexSample::Uscaled16;
+        }
+    }
     return t;
 }
 
