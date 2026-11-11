@@ -51,8 +51,14 @@ GT7-specific parts include:
 - **GPU:** chained indirect buffers, compute ring interrupts, PRT (tiled) textures,
   tessellation, geometry shaders emulated with compute, F64 ops emulated with integers,
   wave-uniform branches for cross-lane votes.
+- **Movies:** libSceAvPlayer on AVFoundation (H.264 through VideoToolbox), NV12 frames
+  in the game's own buffers, multichannel audio (`DC_NO_AVPLAYER=1` skips movies).
+- **Offline extras:** a local asset server answers GT7's own HTTPS client, so the Legend
+  Cars dealership works offline (data files are not included); the Arcade remembers its
+  last course, weather and car; game file decryption runs four ChaCha blocks at a time.
 - **Stutters:** pipelines seen in earlier sessions are compiled at start-up from a
-  manifest (`~/Library/Caches/GT7Port/render_pipelines*.bin`).
+  manifest (`~/Library/Caches/GT7Port/render_pipelines*.bin`), on one compile worker per
+  performance core.
 - **Debugging:** GPU frame capture and offline replay (`DC_CAPTURE*`,
   `DC_FRAME_REPLAY`), game logger hook (`DC_GAME_LOG=1`), recorded pad input.
 
@@ -130,5 +136,7 @@ GNU General Public License v2.0 or later (GPL-2.0-or-later), see [LICENSE](LICEN
   behaviour.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4): the main source of knowledge on ELF
   loading, HLE libraries, PM4 and GCN shader recompilation.
+- [PS4Recomp](https://github.com/wie-project/PS4Recomp): reference for the
+  libSceAvPlayer structures and frame format.
 - [OpenGNM](https://ps4-opengnm.github.io/opengnm/): documentation on PS4 Gnm and GCN
   shaders.

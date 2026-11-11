@@ -1,6 +1,6 @@
 # GT7 su Apple Silicon: stato e prossimi passi
 
-Aggiornato: 2026-11-07. Branch locale `gt7`, pubblicato come `main` su questo repo privato.
+Aggiornato: 2026-11-11. Pubblicato come `main` su questo repo privato.
 
 Gran Turismo 7 (PS4, CUSA24769 v1.00) gira sul runtime di Driveclub-Port con il renderer GCN→Metal.
 Questo repo contiene solo codice: nessun file del gioco, chiave o cattura.
@@ -10,6 +10,18 @@ Questo repo contiene solo codice: nessun file del gioco, chiave o cattura.
 - Avvio, menu, impostazioni display e Music Rally fino alla gara funzionano. La schermata
   "Display Settings" con la strada nel bosco coincide quasi al pixel con il video PS5 di riferimento.
 - Gara in abitacolo: prato, asfalto, cartelloni, HUD, specchietto corretti. ~18-20 fps su M1 Max.
+
+### Lavoro del 2026-11-09 / 11
+
+| Commit | Cosa |
+|---|---|
+| `358ba66` | **Filmati**: libSceAvPlayer su AVFoundation (`psstudio.mp4` all'avvio con video e audio 6 canali). Due bug del renderer trovati così: texture USCALED lette come UNORM (ora ×255/65535 dopo la lettura) e provenienza degli SGPR che attraversava gli `S_BRANCH` (un'etichetta raggiunta solo da salti ora prende lo stato del salto; A/B `DC_NO_JUMP_PROVENANCE=1`) |
+| `3e6219a` | Compilazione shader: un worker per P-core, prewarm a QoS normale fino alla prima gara: prewarm a freddo 453 s (prima oltre 20 min) |
+| `12cab7c` | L'Arcade ricorda pista, meteo e auto (script Adhoc riscritti al caricamento) |
+| `adc0ed7`, `119c6f6`, `0bde551` | Fix Scapes portati da shadgt7 (FIX-GT7-126/127/130/131/133/134/135): **da provare in Scapes** |
+| `a92fdff`, `bb7f458` | Server asset locale: concessionaria Leggendarie offline tramite il client HTTPS del gioco (**da verificare nella UI**) |
+| `f1a5d8d` | Decifratura dei file del gioco 4 blocchi ChaCha alla volta: CPU per caricare una gara 7,9 → 3,7 s |
+| `88bf079`, `4ee49c5` | Tessellation: patch e slice LDS come uniform (opt-in `DC_TESS_UNIFORMS=1`) |
 
 ### Lavoro del 2026-11-06 / 07
 
