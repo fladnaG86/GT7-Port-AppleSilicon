@@ -31,6 +31,7 @@ public:
     bool DispatchIndirect(const Liverpool::RegFile& regs, std::uint64_t args) override;
     void OnSubmit() override;
     void WaitIdle() override;
+    std::uint64_t GpuTimeNs() const override;
     void Signal(std::function<void()> done) override;
     void NoteConstDump(std::uint64_t addr, std::uint32_t bytes) override;
     void Flip(const FlipInfo& flip) override;

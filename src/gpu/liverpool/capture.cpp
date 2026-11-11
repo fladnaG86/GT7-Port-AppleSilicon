@@ -828,10 +828,13 @@ void Replay(const char* dir_c, Renderer* renderer) {
         if (renderer) {
             renderer->WaitIdle();
         }
-        DC_INFO("capture: replay loop %d: %u submits, %u pages (%llu dwords kept), %.2f s%s", loop + 1, submits,
-                pages, (unsigned long long)kept,
+        static std::uint64_t last_gpu_ns = 0;
+        const std::uint64_t gpu_ns = renderer ? renderer->GpuTimeNs() : 0;
+        DC_INFO("capture: replay loop %d: %u submits, %u pages (%llu dwords kept), %.2f s, GPU %.2f ms%s", loop + 1,
+                submits, pages, (unsigned long long)kept,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-                done ? "" : " (GPU still busy after 10 s)");
+                (gpu_ns - last_gpu_ns) / 1e6, done ? "" : " (GPU still busy after 10 s)");
+        last_gpu_ns = gpu_ns;
     }
 }
 

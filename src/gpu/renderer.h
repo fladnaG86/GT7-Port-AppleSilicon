@@ -70,6 +70,8 @@ public:
     // Blocks until all recorded work has executed (the CP then touches
     // memory that work uses).
     virtual void WaitIdle() = 0;
+    // GPU execution time of every completed command buffer so far (0 if unknown).
+    virtual std::uint64_t GpuTimeNs() const { return 0; }
 
     // Runs `done` on another thread once all work recorded so far has
     // executed; calls complete in order. Fences, labels and their interrupts

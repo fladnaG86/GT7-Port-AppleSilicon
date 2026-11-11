@@ -1118,6 +1118,7 @@ struct MetalRenderer::Impl {
   std::atomic<u64> gpu_ns{0};
   // Frame rate and GPU time logged every 10 s, for bug reports.
   std::atomic<u64> perf_gpu_ns{0};
+  std::atomic<u64> total_gpu_ns{0}; // never reset (GpuTimeNs)
   u64 perf_frames = 0;
   std::chrono::steady_clock::time_point perf_t0{};
 
@@ -2544,6 +2545,7 @@ struct MetalRenderer::Impl {
       const u64 ns = static_cast<u64>(GpuSeconds(c) * 1e9);
       gpu_ns += ns;
       perf_gpu_ns += ns;
+      total_gpu_ns += ns;
     }];
     // A command buffer that hogs the GPU for seconds starves WindowServer
     // until its watchdog reboots the Mac: bail out before that happens.
@@ -9210,11 +9212,17 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   if (!addr || !gx || !gy || !gz) {
     return;
   }
-  static const u64 skip_cs =
-      std::getenv("DC_SKIP_CS")
-          ? std::strtoull(std::getenv("DC_SKIP_CS"), nullptr, 16)
-          : 0;
-  if (skip_cs && addr == skip_cs) { // debug: drop one compute shader's dispatches
+  // debug: DC_SKIP_CS=<addr>[,<addr>...] drops those compute shaders' dispatches
+  static const std::vector<u64> skip_cs = [] {
+    std::vector<u64> v;
+    for (const char *q = std::getenv("DC_SKIP_CS"); q && *q;) {
+      char *e = nullptr;
+      v.push_back(std::strtoull(q, &e, 16));
+      q = *e ? e + 1 : e;
+    }
+    return v;
+  }();
+  if (!skip_cs.empty() && std::find(skip_cs.begin(), skip_cs.end(), addr) != skip_cs.end()) {
     return;
   }
   ++stat_dispatches;
@@ -10309,6 +10317,8 @@ void MetalRenderer::OnSubmit() {
     impl->Commit(serial);
   }
 }
+
+std::uint64_t MetalRenderer::GpuTimeNs() const { return impl->total_gpu_ns.load(); }
 
 void MetalRenderer::WaitIdle() {
   Gpu::LtLock lk(impl->lock);
