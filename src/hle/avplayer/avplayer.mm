@@ -719,7 +719,9 @@ void FakePlayback() {
         // returns, and such games then only wait for it.
         std::thread([generation = ++p.generation] {
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            if (generation == g_player.generation.load()) {
+            const bool current = generation == g_player.generation.load();
+            DC_INFO("avplayer: fallback movie over (%s)", current ? "Stop sent" : "superseded");
+            if (current) {
                 EmitFromHost(kEventStop);
             }
         }).detach();
