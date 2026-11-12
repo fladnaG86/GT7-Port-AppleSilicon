@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -55,6 +56,15 @@ struct Mutex {
             host = PTHREAD_MUTEX_NORMAL;
         }
         pthread_mutexattr_settype(&a, host);
+        // macOS defaults to the firstfit policy: an unlocking thread can grab
+        // the mutex again before the woken waiter runs. Under Rosetta GT7's
+        // Job#0 lost that race for minutes (logic frozen, frames still drawn).
+        // Fairshare hands the mutex to waiters in order, like the PS4 kernel.
+        // DC_MUTEX_FIRSTFIT=1: old behavior.
+        static const bool firstfit = std::getenv("DC_MUTEX_FIRSTFIT") != nullptr;
+        if (!firstfit) {
+            pthread_mutexattr_setpolicy_np(&a, PTHREAD_MUTEX_POLICY_FAIRSHARE_NP);
+        }
         pthread_mutex_init(&m, &a);
         pthread_mutexattr_destroy(&a);
     }
