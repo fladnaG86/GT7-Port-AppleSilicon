@@ -89,9 +89,13 @@ struct LinearBase {
     bool stride0 = false;  // VBuffer: some access is bounded only when the stride is 0
     bool unbounded = false; // VBuffer: some access has no bound at all
     bool scalar = false;    // VBuffer: scalar loads, bounded by num_records bytes whatever the stride
+    // Some access has no bound the host can check (a pointer plus a register
+    // offset, a V# with a constant num_records of 4 GB): never in linear_mask,
+    // only a window (LinearBaseVa, MslOptions::linear_window).
+    bool window_only = false;
 
     bool operator==(const LinearBase& b) const {
-        return kind == b.kind && words == b.words;
+        return kind == b.kind && words == b.words && window_only == b.window_only;
     }
 };
 constexpr u32 kMaxLinearBases = 32;
@@ -187,5 +191,9 @@ u32 ResolveSgpr(const SgprSource& src, const u32* user_data, SgprReadCache* cach
 // with the dword-aligned base an indexed access is aligned when its offsets are.
 bool LinearBaseRange(const LinearBase& b, const u32* user_data, SgprReadCache* cache, u64* va, u64* bytes,
                      bool* stride4 = nullptr);
+
+// Guest address of a linear base at draw time, whatever its bound (for its
+// window: the bytes mapped contiguously from there). False if not dword aligned.
+bool LinearBaseVa(const LinearBase& b, const u32* user_data, SgprReadCache* cache, u64* va);
 
 } // namespace Gpu::Shader

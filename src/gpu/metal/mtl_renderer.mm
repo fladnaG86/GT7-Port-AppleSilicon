@@ -529,6 +529,7 @@ struct MetalRenderer::Impl {
     return v ? static_cast<u32>(std::atoi(v)) : 120u;
   }();
   u64 stat_midpass = 0;
+  u64 stat_linear_windows = 0; // LinearTable: bases given a window
 
   // Signals: an event value encoded between passes, so fences do not cut
   // command buffers. Callbacks run in order on the listener's queue.
@@ -1583,6 +1584,36 @@ struct MetalRenderer::Impl {
       return false;
     }
     return true;
+  }
+
+  // The bytes from dword-aligned `va` that map contiguously into one `mem`
+  // buffer (a multiple of 4, below 4 GB), at `off` in it.
+  bool LocateWindow(u64 va, u64 *off, bool *hi, u64 *win) const {
+    auto it =
+        std::upper_bound(mem_ranges.begin(), mem_ranges.end(), va,
+                         [](u64 a, const auto &r) { return a < r.start; });
+    if (it == mem_ranges.begin() || (va & 3)) {
+      return false;
+    }
+    --it;
+    if (va >= it->start + it->size) {
+      return false;
+    }
+    u64 w = it->start + it->size - va;
+    const u64 phys = it->phys + (va - it->start);
+    if (phys < mem_split) {
+      *off = phys;
+      *hi = false;
+      w = std::min(w, mem_split - phys);
+    } else {
+      *off = phys - mem_split;
+      *hi = true;
+    }
+    if ((*off & 3) || (*off >> 2) >= (1ull << 31)) {
+      return false;
+    }
+    *win = std::min<u64>(w, 0xFFFFFFFCull) & ~3ull;
+    return *win >= 4;
   }
 
   // Guest range [va, va + size) as a range of one of the `mem` buffers.
@@ -2667,11 +2698,19 @@ struct MetalRenderer::Impl {
   // none, every access walks the page table. `aligned` gets the returned bases
   // whose stride is a multiple of 4 (MslOptions::linear_aligned); DC_NO_ALIGNED:
   // none, every buffer load keeps its unaligned fallback.
+  //
+  // `out` holds two entries per base: out[2k] as above, out[2k + 1] the bytes
+  // mapped contiguously from base k (MslOptions::linear_window; 0 = walk),
+  // out[2k] then pointing at the base even outside the mask.
   u32 LinearTable(const Shader::Program &p, const u32 *ud, u32 *out,
                   u32 *aligned) {
     static const bool off = std::getenv("DC_NO_LINEAR") != nullptr;
     static const bool no_aligned = std::getenv("DC_NO_ALIGNED") != nullptr;
     *aligned = 0;
+    for (u32 k = 0; k < p.linear_bases.size(); ++k) {
+      out[2 * k] = 0;
+      out[2 * k + 1] = 0;
+    }
     if (off) {
       return 0;
     }
@@ -2684,16 +2723,22 @@ struct MetalRenderer::Impl {
     Shader::SgprReadCache cache;
     UpdateMemMap();
     for (u32 k = 0; k < p.linear_bases.size(); ++k) {
-      out[k] = 0;
-      u64 va = 0, bytes = 0, moff = 0;
+      u64 va = 0, bytes = 0, moff = 0, win = 0;
       bool hi = false, stride4 = false;
       if (!Shader::LinearBaseRange(p.linear_bases[k], ud, &cache, &va, &bytes,
                                    &stride4) ||
           !LocatePhys(va, std::max<u64>(bytes, 4), &moff, &hi) || (moff & 3) ||
           (moff >> 2) >= (1ull << 31)) {
+        if (Shader::LinearBaseVa(p.linear_bases[k], ud, &cache, &va) &&
+            LocateWindow(va, &moff, &hi, &win)) {
+          out[2 * k] = (static_cast<u32>(moff >> 2) << 1) | (hi ? 1u : 0u);
+          out[2 * k + 1] = static_cast<u32>(win);
+          ++stat_linear_windows;
+        }
         continue;
       }
-      out[k] = (static_cast<u32>(moff >> 2) << 1) | (hi ? 1u : 0u);
+      out[2 * k] = (static_cast<u32>(moff >> 2) << 1) | (hi ? 1u : 0u);
+      out[2 * k + 1] = 0xFFFFFFFCu; // unused: the access is direct
       mask |= 1u << k;
       if (stride4 && !no_aligned) {
         *aligned |= 1u << k;
@@ -3223,6 +3268,7 @@ struct MetalRenderer::Impl {
         o.map_hoist = e.map_hoist;
         o.linear_mask = e.linear_mask;
         o.linear_aligned = e.linear_aligned;
+        o.linear_window = true;
         const std::string src = TimedMsl(*prog, o, nullptr);
         id<MTLFunction> fn = compiler->Function(key, src, e.addr, true);
         if (!fn) {
@@ -3632,6 +3678,7 @@ struct MetalRenderer::Impl {
     vo.map_hoist = e.vmap_hoist;
     vo.linear_mask = e.vlinear_mask;
     vo.linear_aligned = e.vlinear_aligned;
+    vo.linear_window = true;
     vo.vertex_attrs = e.vattrs;
     vo.textures = e.vtypes;
     fo.ps_input_cntl = e.ps_input_cntl;
@@ -3645,6 +3692,7 @@ struct MetalRenderer::Impl {
     fo.map_hoist = e.pmap_hoist;
     fo.linear_mask = e.plinear_mask;
     fo.linear_aligned = e.plinear_aligned;
+    fo.linear_window = true;
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = static_cast<Shader::OutType>(e.mrt_type[k]);
     }
@@ -8051,10 +8099,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     PatchUserData(pud);
   }
   const u64 patched_at = commits;
-  u32 vlin[Shader::kMaxLinearBases], plin[Shader::kMaxLinearBases];
+  u32 vlin[2 * Shader::kMaxLinearBases], plin[2 * Shader::kMaxLinearBases];
   // A fused copy VS reads its draw's arena copy of the GSVS ring through the
   // biased address: no host-translated bases for it.
-  vo.linear_mask = fused_pending.on ? 0 : LinearTable(*vs, vud, vlin, &vo.linear_aligned);
+  // The table is filled either way: the windows (MslOptions::linear_window)
+  // are bound whenever the program has bases.
+  vo.linear_window = true;
+  vo.linear_mask = LinearTable(*vs, vud, vlin, &vo.linear_aligned);
+  if (fused_pending.on) {
+    vo.linear_mask = 0;
+  }
   if (fused_pending.on) {
     vo.linear_aligned = 0;
   }
@@ -8138,6 +8192,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.col_format = col_format;
     fo.dual_source = dual_source;
     fo.map_hoist = map_hoist;
+    fo.linear_window = true;
     fo.linear_mask = LinearTable(*ps, pud, plin, &fo.linear_aligned);
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
@@ -8794,8 +8849,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       return (mask & o.linear_mask) != o.linear_mask ||
              (aligned & o.linear_aligned) != o.linear_aligned;
     };
-    if ((vo.linear_mask && moved(*vs, vud, vlin, vo)) ||
-        (ps && fo.linear_mask && moved(*ps, pud, plin, fo))) {
+    // (moved() also refreshes the windows, which depend on the patched data.)
+    const bool vmoved = !vs->linear_bases.empty() && moved(*vs, vud, vlin, vo);
+    const bool pmoved = ps && !ps->linear_bases.empty() && moved(*ps, pud, plin, fo);
+    if (vmoved || pmoved) {
       ReportOnce("draw skipped: a linear base moved between key and bind");
       return;
     }
@@ -8806,8 +8863,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   BindBuffer(0, mem[0], 0, Shader::Binding::Mem0);
   BindBuffer(0, mem[1], 0, Shader::Binding::Mem1);
   BindBuffer(0, mem_map, 0, Shader::Binding::MemMap);
-  if (vo.linear_mask) {
-    BindBytes(0, 2, vlin, 4 * (32 - std::countl_zero(vo.linear_mask)), Shader::Binding::Linear);
+  if (!vs->linear_bases.empty()) {
+    BindBytes(0, 2, vlin, 8 * u32(vs->linear_bases.size()), Shader::Binding::Linear);
   }
   for (u32 k = 0; k < nvbufs; ++k) {
     BindBuffer(0, vbufs[k].buf, vbufs[k].off, kVertexBufferBase + k);
@@ -8849,8 +8906,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     BindBuffer(1, mem[0], 0, Shader::Binding::Mem0);
     BindBuffer(1, mem[1], 0, Shader::Binding::Mem1);
     BindBuffer(1, mem_map, 0, Shader::Binding::MemMap);
-    if (fo.linear_mask) {
-      BindBytes(1, 2, plin, 4 * (32 - std::countl_zero(fo.linear_mask)), Shader::Binding::Linear);
+    if (!ps->linear_bases.empty()) {
+      BindBytes(1, 2, plin, 8 * u32(ps->linear_bases.size()), Shader::Binding::Linear);
     }
     for (u32 k = 0; k < ps_res.tex.size(); ++k) {
       BindTexture(1, ps_res.tex[k], k);
@@ -9423,7 +9480,8 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   Shader::MslOptions o;
   o.textures = types; // borrowed: `types` lives until the key is hashed
   o.map_hoist = map_hoist;
-  u32 lin[Shader::kMaxLinearBases];
+  u32 lin[2 * Shader::kMaxLinearBases];
+  o.linear_window = true;
   o.linear_mask = LinearTable(*cs, cud, lin, &o.linear_aligned);
   const int probe_slot =
       probe_buf && trace
@@ -9538,10 +9596,8 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
   [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
   [e setBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
-  if (o.linear_mask) {
-    [e setBytes:lin
-         length:4 * (32 - std::countl_zero(o.linear_mask))
-        atIndex:Shader::Binding::Linear];
+  if (!cs->linear_bases.empty()) {
+    [e setBytes:lin length:8 * cs->linear_bases.size() atIndex:Shader::Binding::Linear];
   }
   for (u32 k = 0; k < res.tex.size(); ++k) {
     [e setTexture:res.tex[k] atIndex:k];
@@ -9936,6 +9992,8 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                   stat_depth_read_copy / double(frames));
           DC_INFO("gpu stats: %.1f mid-pass commits/frame", stat_midpass / double(frames));
           stat_midpass = 0;
+          DC_INFO("gpu stats: %.1f linear windows/frame", stat_linear_windows / double(frames));
+          stat_linear_windows = 0;
           stat_break[0] = stat_break[1] = 0;
           stat_depth_read_copy = 0;
           break_by_ps.clear();

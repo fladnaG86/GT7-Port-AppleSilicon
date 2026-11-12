@@ -43,10 +43,49 @@ static inline device uint* dc_ptr_n(thread const DcMem& m, ulong va, uint bytes)
 }
 static inline device uint* dc_ptr(thread const DcLin& m, ulong va) { return m.p + ((va - m.va) >> 2); }
 static inline device uint* dc_ptr_n(thread const DcLin& m, ulong va, uint bytes) { return dc_ptr(m, va); }
-// Linear base `k`: entry = dword offset << 1 | upper memory buffer.
+// Linear base `k`: entry 2k = dword offset << 1 | upper memory buffer,
+// entry 2k + 1 = its window (DcLinW).
 static inline DcLin dc_lin(thread const DcMem& m, uint k, ulong va) {
-    uint e = m.lin[k];
+    uint e = m.lin[2u * k];
     return DcLin{((e & 1u) ? m.hi : m.lo) + (e >> 1), va};
+}
+// The page-table walk of dc_ptr / dc_ptr_n as one out-of-line copy, for the
+// rare accesses outside a window: inlined at every access it doubled the
+// shaders and tripled their compile time.
+__attribute__((noinline)) static device uint* dc_walk(device uint* lo, device uint* hi, device const DcMap* map,
+                                                      ulong va) {
+    ulong fo = va - map->fva;
+    if (fo < map->fsize) return (map->fhi ? hi : lo) + ((fo + map->foff) >> 2);
+    ulong i = (va - map->base) >> map->shift;
+    if (i >= map->pages) return nullptr;
+    int e = ((device const int*)(map + 1))[i];
+    if (e == int(0x80000000u)) return nullptr;
+    ulong p = va + ulong(long(e) << 14);
+    if (p >= map->limit) return nullptr;
+    return p < map->split ? lo + (p >> 2) : hi + ((p - map->split) >> 2);
+}
+__attribute__((noinline)) static device uint* dc_walk_n(device uint* lo, device uint* hi, device const DcMap* map,
+                                                        ulong va, uint bytes) {
+    device uint* p = dc_walk(lo, hi, map, va);
+    ulong last = va + ulong(bytes - 4u);
+    if (((va ^ last) >> map->shift) != 0ul && dc_walk(lo, hi, map, last) != p + ((bytes - 4u) >> 2)) return nullptr;
+    return p;
+}
+// A base outside linear_mask with a window (MslOptions::linear_window): `win`
+// bytes from `va` are mapped contiguously at `p` (a multiple of 4, 0 = none).
+// Inside, no page-table walk; outside (or below va), the walk as before.
+struct DcLinW { device uint* p; ulong va; ulong win; device uint* lo; device uint* hi; device const DcMap* map; };
+static inline device uint* dc_ptr(thread const DcLinW& m, ulong va) {
+    ulong o = va - m.va;
+    return o < m.win ? m.p + (o >> 2) : dc_walk(m.lo, m.hi, m.map, va);
+}
+static inline device uint* dc_ptr_n(thread const DcLinW& m, ulong va, uint bytes) {
+    ulong o = va - m.va;
+    return o < m.win && ulong(bytes) <= m.win - o ? m.p + (o >> 2) : dc_walk_n(m.lo, m.hi, m.map, va, bytes);
+}
+static inline DcLinW dc_linw(thread const DcMem& m, uint k, ulong va) {
+    uint e = m.lin[2u * k];
+    return DcLinW{((e & 1u) ? m.hi : m.lo) + (e >> 1), va, ulong(m.lin[2u * k + 1u]), m.lo, m.hi, m.map};
 }
 // A linear base whose every access is known dword aligned
 // (MslOptions::linear_aligned): loads need no unaligned fallback.
@@ -54,7 +93,7 @@ struct DcLinA { device uint* p; ulong va; };
 static inline device uint* dc_ptr(thread const DcLinA& m, ulong va) { return m.p + ((va - m.va) >> 2); }
 static inline device uint* dc_ptr_n(thread const DcLinA& m, ulong va, uint bytes) { return dc_ptr(m, va); }
 static inline DcLinA dc_lina(thread const DcMem& m, uint k, ulong va) {
-    uint e = m.lin[k];
+    uint e = m.lin[2u * k];
     return DcLinA{((e & 1u) ? m.hi : m.lo) + (e >> 1), va};
 }
 static inline uint dc_ld(thread const DcLinA& m, ulong va) { return *dc_ptr(m, va); }

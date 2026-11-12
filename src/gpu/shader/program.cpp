@@ -532,6 +532,14 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
     auto stable = [&](u32 reg, const SgprSource& s) {
         return exact.Exact(reg) && (s.kind == SgprSource::UserData || s.kind == SgprSource::PointerLoad);
     };
+    // A V#'s num_records the shader writes itself: GT7 builds raw V#s over a
+    // user-data pointer with num_records 0xffffffff (its range is then too big
+    // for linear_mask, but it gets a window).
+    auto stable_records = [&](u32 reg, const SgprSource& s) {
+        return stable(reg, s) || (exact.Exact(reg) && s.kind == SgprSource::Constant);
+    };
+    // DC_NO_LINEAR_WINDOW: none of the bases above (their accesses walk).
+    static const bool windows = std::getenv("DC_NO_LINEAR_WINDOW") == nullptr;
     LinearBase b;
     if (i.enc == Enc::SMRD) {
         const auto op = static_cast<Smrd>(i.op);
@@ -539,7 +547,7 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
             return;
         }
         const bool buffer = op >= Smrd::S_BUFFER_LOAD_DWORD;
-        if (!i.imm && !buffer) {
+        if (!i.imm && !buffer && !windows) {
             return; // a pointer plus a register offset has no known bound
         }
         const u32 count = op == Smrd::S_LOAD_DWORDX2 || op == Smrd::S_BUFFER_LOAD_DWORDX2   ? 2
@@ -548,32 +556,46 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
                           : op == Smrd::S_LOAD_DWORDX16 || op == Smrd::S_BUFFER_LOAD_DWORDX16 ? 16
                                                                                                 : 1;
         b.kind = buffer ? LinearBase::VBase : LinearBase::Pointer;
-        const u32 words = i.imm ? 2 : 3;
+        const u32 words = i.imm || !buffer ? 2 : 3;
         for (u32 k = 0; k < words; ++k) {
             b.words[k] = prov.Get(i.sbase + k);
-            if (!stable(i.sbase + k, b.words[k])) {
+            const bool ok = k == 2 && windows ? stable_records(i.sbase + k, b.words[k])
+                                              : stable(i.sbase + k, b.words[k]);
+            if (!ok) {
                 return;
             }
         }
         b.extent = i.smrd_offset * 4 + count * 4;
-        if (!i.imm) { // register offset: bounded by num_records (the load checks it)
+        if (!i.imm && !buffer) { // a pointer plus a register offset: no known bound
+            b.window_only = true;
+            b.extent = 0;
+        } else if (!i.imm) { // register offset: bounded by num_records (the load checks it)
             b.kind = LinearBase::VBuffer;
             b.scalar = true;
             b.extent = count * 4;
         }
     } else if (i.enc == Enc::MUBUF || i.enc == Enc::MTBUF) {
-        if (i.addr64 || i.lds || i.soffset < 128 || i.soffset > 192) {
-            return; // only inline non-negative constant soffsets have a known bound
+        if (i.addr64 || i.lds) {
+            return;
+        }
+        // Only inline non-negative constant soffsets have a known bound.
+        const bool const_soffset = i.soffset >= 128 && i.soffset <= 192;
+        if (!const_soffset && !windows) {
+            return;
         }
         b.kind = LinearBase::VBuffer;
         for (u32 k = 0; k < 4; ++k) {
             b.words[k] = prov.Get(i.srsrc + k);
-            if (k < 3 && !stable(i.srsrc + k, b.words[k])) {
+            const bool ok = k == 2 && windows ? stable_records(i.srsrc + k, b.words[k])
+                                              : stable(i.srsrc + k, b.words[k]);
+            if (k < 3 && !ok) {
                 return;
             }
         }
-        const u32 off = i.offset + (i.soffset - 128u) + 16;
-        if (i.idxen && i.offen) {
+        const u32 off = i.offset + (const_soffset ? i.soffset - 128u : 0u) + 16;
+        if (!const_soffset) {
+            b.window_only = true;
+        } else if (i.idxen && i.offen) {
             b.unbounded = true;
         } else if (i.offen) {
             b.stride0 = true; // bounded by num_records only when the stride is 0
@@ -601,6 +623,7 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
         e.stride0 |= b.stride0;
         e.unbounded |= b.unbounded;
         e.scalar &= b.scalar; // a vector access on the same V# needs the strided bound
+        e.window_only |= b.window_only;
     }
     p.linear_base_by_pc.emplace_back(i.pc, slot);
 }
@@ -1242,8 +1265,19 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
     }
 }
 
+bool LinearBaseVa(const LinearBase& b, const u32* ud, SgprReadCache* cache, u64* va) {
+    const u32 w0 = ResolveSgpr(b.words[0], ud, cache);
+    const u32 w1 = ResolveSgpr(b.words[1], ud, cache);
+    *va = b.kind == LinearBase::Pointer ? (u64(w0) | (u64(w1) << 32)) & 0xFFFFFFFFFFFFull
+                                        : u64(w0) | (u64(w1 & 0xFFF) << 32);
+    return *va != 0 && (*va & 3) == 0;
+}
+
 bool LinearBaseRange(const LinearBase& b, const u32* ud, SgprReadCache* cache, u64* va, u64* bytes,
                      bool* stride4) {
+    if (b.window_only) {
+        return false;
+    }
     const u32 w0 = ResolveSgpr(b.words[0], ud, cache);
     const u32 w1 = ResolveSgpr(b.words[1], ud, cache);
     if (stride4) {

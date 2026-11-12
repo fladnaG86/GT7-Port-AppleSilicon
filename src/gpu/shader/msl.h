@@ -183,11 +183,17 @@ struct MslOptions {
     bool map_hoist = false;
     // Program::linear_bases the host translated for this draw (bit k = base k):
     // their accesses index memory directly. Entry k of the buffer at
-    // Binding::Linear is the base's dword offset << 1 | 1 for the upper buffer.
+    // Binding::Linear is the base's dword offset << 1 | 1 for the upper buffer
+    // (entry 2k).
     u32 linear_mask = 0;
     // Bases of linear_mask whose V# stride is a multiple of 4: buffer accesses on
     // them with constant, dword-aligned offsets drop the unaligned fallback.
     u32 linear_aligned = 0;
+    // Binding::Linear holds two entries per base: 2k as above, 2k + 1 the bytes
+    // mapped contiguously from base k (0: none): accesses on bases outside
+    // linear_mask take entry k directly when they fall inside, else walk.
+    // Set by the paths that fill and bind the whole table.
+    bool linear_window = false;
     // Compute only: this program is the ES or GS of a GS pipeline (RingInfo).
     RingInfo ring;
     // The ES / GS as a vertex function with rasterization off (one vertex per

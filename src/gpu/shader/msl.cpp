@@ -298,8 +298,14 @@ private:
     // wave never writes) would hang the GPU and, on macOS, WindowServer with
     // it: back edges spend a budget and the invocation gives up when it runs out.
     std::string LoopGuard() const {
+        // A live discard_fragment() anywhere makes the whole pixel shader
+        // "punch-through" on Apple GPUs (no hidden-surface removal), and this
+        // guard sits on every loop back-edge of 85% of GT7's pixel shaders.
+        // A runaway loop now returns its (unexported) output instead.
+        // DC_LOOP_GUARD_DISCARD=1: old behavior.
+        static const bool guard_discard = std::getenv("DC_LOOP_GUARD_DISCARD") != nullptr;
         return std::string("if (++guard_ > ") + N(kLoopBudget) + "u) { " +
-               (p.stage == Stage::Fragment ? "discard_fragment(); " : "") +
+               (p.stage == Stage::Fragment && guard_discard ? "discard_fragment(); " : "") +
                (p.stage == Stage::Compute ? "return; " : "return out; ") + "} ";
     }
     void Jump(u32 target) {
@@ -404,6 +410,15 @@ private:
         }
         const u32 k = p.LinearBaseOf(pc);
         return k < kMaxLinearBases && ((o.linear_mask >> k) & 1u);
+    }
+    // The memory instruction at `pc` uses a base outside linear_mask that has a
+    // window (MslOptions::linear_window): direct inside it, a walk outside.
+    bool Windowed(u32 pc) const {
+        static const bool off = std::getenv("DC_NO_LINEAR_WINDOW") != nullptr;
+        if (off || !o.linear_window || o.ring.stage != RingStage::None || o.fused.on || Linear(pc)) {
+            return false;
+        }
+        return p.LinearBaseOf(pc) < kMaxLinearBases;
     }
     // A buffer access on a linear base whose address is a multiple of 4 in
     // every lane: the base is (LinearBaseRange), the stride is when the host
@@ -836,8 +851,10 @@ void Emitter::EmitSmrd(const Inst& i) {
     std::string s = Linear(i.pc) ? "{ device uint* p_ = " + in_range + "dc_ptr(dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) +
                                        "u, " + base + "), (" + base + " + ulong(" + off + ")) & ~3ul)" +
                                        (in_range.empty() ? "" : " : nullptr") + ";"
-                                 : "{ device uint* p_ = dc_ptr_n(mem, (" + base + " + ulong(" + off + ")) & ~3ul, " +
-                                       N(count * 4) + "u);";
+                                 : "{ device uint* p_ = dc_ptr_n(" +
+                                       (Windowed(i.pc) ? "dc_linw(mem, " + N(p.LinearBaseOf(i.pc)) + "u, " + base + ")"
+                                                       : std::string("mem")) +
+                                       ", (" + base + " + ulong(" + off + ")) & ~3ul, " + N(count * 4) + "u);";
     if (checked && count > 1 && Linear(i.pc)) {
         // The offset register may be one of the destinations.
         s += " ulong r_ = " + size + " - min(" + size + ", ulong(" + off + "));";
@@ -1534,9 +1551,11 @@ void Emitter::EmitBuffer(const Inst& i) {
         }
     }
     // A base the host translated: the access needs no page-table walk.
-    const std::string M = Linear(i.pc) ? "lm_" : "mem";
+    const std::string M = Linear(i.pc) ? "lm_" : Windowed(i.pc) ? "lw_" : "mem";
     const bool aligned = AlignedAccess(i);
-    if (M != "mem") {
+    if (M == "lw_") {
+        Line("  DcLinW lw_ = dc_linw(mem, " + N(p.LinearBaseOf(i.pc)) + "u, base_);");
+    } else if (M != "mem") {
         Line(std::string(aligned ? "  DcLinA lm_ = dc_lina(" : "  DcLin lm_ = dc_lin(") + "mem, " +
              N(p.LinearBaseOf(i.pc)) + "u, base_);");
     }
