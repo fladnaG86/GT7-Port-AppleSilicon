@@ -1482,9 +1482,20 @@ struct MetalRenderer::Impl {
       return;
     }
     mem_map_gen = gen;
-    mem_ranges = Core::Memory::DirectMappings();
-    std::sort(mem_ranges.begin(), mem_ranges.end(),
+    auto fresh = Core::Memory::DirectMappings();
+    std::sort(fresh.begin(), fresh.end(),
               [](const auto &x, const auto &y) { return x.start < y.start; });
+    // The generation also moves when other mappings change: same direct
+    // mappings, same table (a new buffer per change cost the GPU thread
+    // ~10 ms per frame in races).
+    auto same = [](const auto &x, const auto &y) {
+      return x.start == y.start && x.size == y.size && x.phys == y.phys;
+    };
+    if (mem_map && fresh.size() == mem_ranges.size() &&
+        std::equal(fresh.begin(), fresh.end(), mem_ranges.begin(), same)) {
+      return;
+    }
+    mem_ranges = std::move(fresh);
     const auto &ranges = mem_ranges;
     // Largest page size at which no page holds two mappings.
     u32 shift = Shader::GpuMemMap::kMaxShift;

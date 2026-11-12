@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -28,6 +29,8 @@ int g_direct_fd = -1;
 std::map<u64, u64> g_direct_used; // phys start -> size
 std::map<VAddr, Vma> g_vmas;      // start -> mapping (non-overlapping)
 std::atomic<u64> g_generation{0}; // bumped whenever the mapping set changes
+// DC_ALL_MAP_BUMPS=1: old behaviour, every unmap/reserve bumps it.
+const bool kAllBumps = std::getenv("DC_ALL_MAP_BUMPS") != nullptr;
 
 int HostProt(int prot) {
     int host = PROT_NONE;
@@ -220,6 +223,23 @@ int ReleaseDirect(u64 phys, u64 size) {
     return 0;
 }
 
+// Whether [addr, addr + size) overlaps a direct mapping: only those changes
+// matter to DirectMapGeneration (the GPU page table is rebuilt on each bump).
+// Caller holds g_lock.
+bool TouchesDirect(VAddr addr, u64 size) {
+    auto it = g_vmas.upper_bound(addr);
+    if (it != g_vmas.begin()) {
+        --it;
+    }
+    for (; it != g_vmas.end() && it->first < addr + size; ++it) {
+        const Vma& v = it->second;
+        if (v.type == VmaType::Direct && v.start + v.size > addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int MapDirect(VAddr* addr, u64 size, int prot, int flags, u64 phys, u64 align, const char* name) {
     std::scoped_lock lk(g_lock);
     g_generation.fetch_add(1, std::memory_order_release);
@@ -243,6 +263,9 @@ int MapDirect(VAddr* addr, u64 size, int prot, int flags, u64 phys, u64 align, c
 int MapFlexible(VAddr* addr, u64 size, int prot, int flags, const char* name) {
     std::scoped_lock lk(g_lock);
     size = AlignUp(size, kPage);
+    if (*addr && TouchesDirect(*addr, size)) { // replaces direct memory
+        g_generation.fetch_add(1, std::memory_order_release);
+    }
     if (const int err = Place(addr, size, flags, kPage)) {
         return err;
     }
@@ -257,8 +280,11 @@ int MapFlexible(VAddr* addr, u64 size, int prot, int flags, const char* name) {
 
 int Reserve(VAddr* addr, u64 size, int flags, u64 align) {
     std::scoped_lock lk(g_lock);
-    g_generation.fetch_add(1, std::memory_order_release);
     size = AlignUp(size, kPage);
+    // Before Place: at a fixed address it replaces what is mapped there.
+    if (kAllBumps || (*addr && TouchesDirect(*addr, size))) {
+        g_generation.fetch_add(1, std::memory_order_release);
+    }
     if (const int err = Place(addr, size, flags, align)) {
         return err;
     }
@@ -269,8 +295,10 @@ int Reserve(VAddr* addr, u64 size, int flags, u64 align) {
 
 int Unmap(VAddr addr, u64 size) {
     std::scoped_lock lk(g_lock);
-    g_generation.fetch_add(1, std::memory_order_release);
     size = AlignUp(size, kPage);
+    if (kAllBumps || TouchesDirect(addr, size)) {
+        g_generation.fetch_add(1, std::memory_order_release);
+    }
     Carve(addr, size);
     AddressSpace::Unmap(addr, size);
     return 0;
