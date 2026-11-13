@@ -6984,8 +6984,10 @@ struct MetalRenderer::Impl {
           continue;
         }
         const u32 k = p->LinearBaseOf(i.pc);
-        if (k >= p->linear_bases.size()) {
-          continue; // an SGPR soffset has no base; the next access has the same V#
+        if (k >= p->linear_bases.size() || p->linear_bases[k].window_only) {
+          // An SGPR soffset has no bound (at most a window); the next access
+          // has the same V#.
+          continue;
         }
         u64 va = 0, bytes = 0;
         Shader::SgprReadCache cache;
