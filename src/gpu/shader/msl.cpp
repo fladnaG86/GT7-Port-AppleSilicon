@@ -37,7 +37,11 @@ bool TessBakedConsts() {
 namespace {
 
 // Back edges one invocation may take before it gives up (see LoopGuard).
-constexpr u32 kLoopBudget = 1u << 20;
+// 1 << 20 could not save the GPU from a full-screen runaway loop (Metal's
+// watchdog fires first). No GT7 shader seen needs more than 4096 (race8f
+// frame replay and a live menu + Music Rally run render the same at 4096 as
+// at 1 << 20); 16384 keeps a margin for scenes not checked.
+constexpr u32 kLoopBudget = 1u << 14;
 
 std::string Hex(u32 v) {
     char b[16];
@@ -304,7 +308,14 @@ private:
         // A runaway loop now returns its (unexported) output instead.
         // DC_LOOP_GUARD_DISCARD=1: old behavior.
         static const bool guard_discard = std::getenv("DC_LOOP_GUARD_DISCARD") != nullptr;
-        return std::string("if (++guard_ > ") + N(kLoopBudget) + "u) { " +
+        // DC_LOOP_BUDGET=<n>: other budget (the source changes, so Metal's
+        // own cache recompiles every guarded shader).
+        static const u32 budget = [] {
+            const char* e = std::getenv("DC_LOOP_BUDGET");
+            const unsigned long v = e ? std::strtoul(e, nullptr, 0) : 0;
+            return v ? static_cast<u32>(v) : kLoopBudget;
+        }();
+        return std::string("if (++guard_ > ") + N(budget) + "u) { " +
                (p.stage == Stage::Fragment && guard_discard ? "discard_fragment(); " : "") +
                (p.stage == Stage::Compute ? "return; " : "return out; ") + "} ";
     }
