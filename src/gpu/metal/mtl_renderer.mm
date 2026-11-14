@@ -1760,6 +1760,58 @@ struct MetalRenderer::Impl {
   PassState last_pass;
   void *last_end_ra = nullptr;
   std::unordered_map<void *, u64> split_by;
+  std::unordered_map<void *, u64> split_px; // attachment pixels reloaded by those splits
+  std::unordered_map<u64, std::pair<u64, u64>> disp_break; // cs -> open passes it ended, their pixels
+  // A dispatch from a compute ring that arrives while the graphics ring has a
+  // render pass open used to end that pass (Metal has no compute inside a
+  // render pass): ~10 times a frame in a GT7 race the 1080p targets were
+  // stored and loaded again, and more often the faster the compute rings got
+  // the renderer lock. Such a dispatch is now recorded and encoded when the
+  // pass ends. Fence signals already wait for the commit, and the guest has
+  // to wait for a compute ring's fence before the graphics ring may use its
+  // output, so the order the guest can rely on is kept.
+  // DC_DEFER_DISPATCH=0: end the pass (old behavior).
+  struct DeferredDispatch {
+    id<MTLComputePipelineState> pso = nil;
+    u32 ud[16] = {};
+    std::vector<u32> lin;
+    std::vector<id<MTLTexture>> tex;
+    std::vector<id<MTLSamplerState>> smp;
+    u32 lds = 16;
+    id<MTLBuffer> ibuf = nil; // indirect arguments, or the group counts below
+    u64 ioff = 0;
+    u32 groups[3] = {}, threads[3] = {};
+  };
+  std::vector<DeferredDispatch> deferred;
+  const bool defer_dispatch = [] {
+    const char *v = std::getenv("DC_DEFER_DISPATCH");
+    return !v || std::atoi(v) != 0;
+  }();
+  u64 stat_deferred = 0;
+  void EncodeDispatch(id<MTLComputeCommandEncoder> e, const DeferredDispatch &d) {
+    [e setComputePipelineState:d.pso];
+    [e setBytes:d.ud length:64 atIndex:Shader::Binding::UserData];
+    [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
+    [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
+    [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+    [e setBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
+    if (!d.lin.empty()) {
+      [e setBytes:d.lin.data() length:4 * d.lin.size() atIndex:Shader::Binding::Linear];
+    }
+    for (u32 k = 0; k < d.tex.size(); ++k) {
+      [e setTexture:d.tex[k] atIndex:k];
+    }
+    for (u32 u = 0; u < d.smp.size() && u < 16; ++u) {
+      [e setSamplerState:d.smp[u] atIndex:u];
+    }
+    [e setThreadgroupMemoryLength:d.lds atIndex:0];
+    const MTLSize per = MTLSizeMake(d.threads[0], d.threads[1], d.threads[2]);
+    if (d.ibuf) {
+      [e dispatchThreadgroupsWithIndirectBuffer:d.ibuf indirectBufferOffset:d.ioff threadsPerThreadgroup:per];
+    } else {
+      [e dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:per];
+    }
+  }
   u64 stat_passes = 0, stat_split = 0;
   u64 stat_pipe_miss = 0, stat_msl_gen = 0; // DC_GPU_STATS: render pipeline misses
   // Draws skipped because their pipeline was compiling, by class: [0] depth or
@@ -1789,6 +1841,14 @@ struct MetalRenderer::Impl {
     if (enc) {
       [enc endEncoding];
       enc = nil;
+      if (!deferred.empty()) {
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        for (const DeferredDispatch &d : deferred) {
+          EncodeDispatch(e, d);
+        }
+        [e endEncoding];
+        deferred.clear();
+      }
       if (trace && PeekRt().addr) {
         PeekPass();
       }
@@ -2494,7 +2554,11 @@ struct MetalRenderer::Impl {
 
   void Commit(bool wait) {
     CpuTimer t(cpu_profile ? &cpu_commit_s : nullptr);
+    const bool open_pass = enc != nil;
     EndPass();
+    if (stats && open_pass) {
+      last_end_ra = __builtin_return_address(0); // who committed, not Commit itself
+    }
     FlushUploads(); // before any command buffer that samples them
     if (!cmd) {
       if (wait) {
@@ -5882,6 +5946,7 @@ struct MetalRenderer::Impl {
       if (ps == last_pass && last_end_ra) {
         ++stat_split;
         ++split_by[last_end_ra];
+        split_px[last_end_ra] += u64(w) * h;
       }
       last_end_ra = nullptr;
     }
@@ -9451,11 +9516,39 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
 
   // One encoder per dispatch while timing them or dumping a traced frame.
   const bool batch = !pass_timing && !trace;
-  if (!batch || enc) {
-    EndPass();
+  if (stats && enc) {
+    auto &d = disp_break[addr];
+    ++d.first;
+    d.second += u64(pass_width) * pass_height;
   }
-  if (++work_since_commit >= kCommitEvery) {
-    Commit(false);
+  // See DeferredDispatch. Not for the graphics ring's own dispatches (their
+  // place among its draws is exact), nor when the shader reads an attachment
+  // of the open pass or writes an image the CPU reads back.
+  bool defer = defer_dispatch && batch && enc && draw_thread &&
+               pthread_mach_thread_np(pthread_self()) != draw_thread;
+  for (u32 k = 0; defer && k < res.tex.size(); ++k) {
+    id<MTLTexture> base = res.tex[k].parentTexture ? res.tex[k].parentTexture : res.tex[k];
+    for (u32 c = 0; c < 8 && defer; ++c) {
+      const RenderTarget *rt = reinterpret_cast<const RenderTarget *>(pass.color[c]);
+      defer = !(rt && rt->tex == base);
+    }
+    const RenderTarget *dz = reinterpret_cast<const RenderTarget *>(pass.depth);
+    defer = defer && !(dz && dz->tex == base);
+    if (defer && k < cs->images.size() && cs->images[k].storage && k < tsharps_.size()) {
+      const u32 *t = tsharps_[k].data();
+      const u64 tbase = ((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
+      defer = tbase < 0xe000000000ull; // the CPU readback below ends the pass anyway
+    }
+  }
+  if (!defer) {
+    if (!batch || enc) {
+      EndPass();
+    }
+    if (++work_since_commit >= kCommitEvery) {
+      Commit(false);
+    }
+  } else {
+    ++work_since_commit;
   }
   // DC_CAPTURE_CS=<cs>[:<flip>]: a command buffer holding only that dispatch
   // goes into ../bench/capture_cs_<cs>.gputrace for Xcode's shader profiler
@@ -9576,6 +9669,28 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     return;
   }
 
+  if (defer && enc && !capturing && probe_slot < 0) {
+    DeferredDispatch &d = deferred.emplace_back();
+    d.pso = pso;
+    std::memcpy(d.ud, cud, sizeof(d.ud));
+    d.lin.assign(lin, lin + 2 * cs->linear_bases.size());
+    d.tex.assign(res.tex.begin(), res.tex.end());
+    d.smp.assign(res.smp.begin(), res.smp.end());
+    d.lds = std::min<u32>(std::max<u32>(16, Bits(rsrc2, 15, 9) * 512), 32768);
+    id<MTLBuffer> args_buf = nil;
+    u64 args_off = 0;
+    if (indirect_args && Locate(indirect_args, 12, &args_buf, &args_off)) {
+      d.ibuf = args_buf;
+      d.ioff = args_off;
+    }
+    d.groups[0] = gx, d.groups[1] = gy, d.groups[2] = gz;
+    d.threads[0] = tx, d.threads[1] = ty, d.threads[2] = tz;
+    ++stat_deferred;
+    return;
+  }
+  if (defer && enc) { // not recorded after all: as before
+    EndPass();
+  }
   id<MTLComputeCommandEncoder> e = nil;
   if (pass_timing) {
     const u32 sample = TsBegin(addr, gx, gy, true);
@@ -9964,13 +10079,32 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
         std::string by;
         for (size_t k = 0; k < top.size() && k < 6; ++k) {
           char buf[48];
-          std::snprintf(buf, sizeof(buf), " %p:%llu", top[k].second,
-                        (unsigned long long)top[k].first);
+          std::snprintf(buf, sizeof(buf), " %p:%llu(%.1fMpx)", top[k].second,
+                        (unsigned long long)top[k].first, split_px[top[k].second] / 1e6);
           by += buf;
         }
+        DC_INFO("gpu stats: %.1f dispatches/frame deferred to the end of the open pass", stat_deferred / double(frames));
+        stat_deferred = 0;
         DC_INFO("gpu stats: %.0f passes/frame, %.0f split from the same targets by%s",
                 stat_passes / double(frames), stat_split / double(frames), by.c_str());
         split_by.clear();
+        split_px.clear();
+        if (!disp_break.empty()) {
+          std::vector<std::pair<u64, u64>> cs; // pixels, address
+          for (auto &[a, n] : disp_break) {
+            cs.push_back({n.second, a});
+          }
+          std::sort(cs.rbegin(), cs.rend());
+          std::string l;
+          for (size_t k = 0; k < cs.size() && k < 8; ++k) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), " %llx:%llu(%.1fMpx)", (unsigned long long)cs[k].second,
+                          (unsigned long long)disp_break[cs[k].second].first, cs[k].first / 1e6);
+            l += buf;
+          }
+          DC_INFO("gpu stats: dispatches ending an open pass, by cs:%s", l.c_str());
+          disp_break.clear();
+        }
         stat_passes = stat_split = 0;
         DC_INFO("gpu stats: %.1f new pipelines/frame, %.1f MSL sources generated/frame, %zu pipelines",
                 stat_pipe_miss / double(frames), stat_msl_gen / double(frames), pipelines.size());

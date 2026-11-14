@@ -75,6 +75,26 @@ inline void LtThreadCpu(double* user_us, double* sys_us) {
 // Time the calling thread spent blocked on the renderer lock (trace only).
 inline thread_local u64 lt_lock_ns = 0;
 
+// The graphics ring takes the renderer lock once per draw (~15 us each) and
+// the compute rings once per dispatch or fence (a few us each). A thread that
+// sleeps on the lock costs its owner a kernel wake at unlock and runs again
+// tens of microseconds later, far longer than the work it waited for: in a
+// GT7 race the graphics thread spent ~15% of its time in that sleep and ~5%
+// waking sleepers that lost the lock again. Waiters poll for this long first.
+// Every thread polls: with the graphics thread alone the compute rings starve
+// and the guest waits for their fences (21.8 vs 24 fps). Polling compute
+// rings win the lock between two draws far more often, which is only cheap
+// because their dispatches no longer end the open render pass (see
+// DeferredDispatch in mtl_renderer.mm). Together: +4-5% fps in a race.
+// DC_LOCK_SPIN_US=<n> overrides, 0 sleeps at once (old behavior).
+inline u64 LtSpinNs() {
+    static const u64 ns = [] {
+        const char* e = std::getenv("DC_LOCK_SPIN_US");
+        return (e ? std::strtoull(e, nullptr, 0) : 60ull) * 1000;
+    }();
+    return ns;
+}
+
 template <typename M>
 struct LtLock {
     M& m;
@@ -83,6 +103,17 @@ struct LtLock {
             return;
         }
         const u64 t = LtNow();
+        if (const u64 spin = LtSpinNs()) {
+            do {
+                for (int k = 0; k < 8; ++k) {
+                    __builtin_ia32_pause();
+                }
+                if (m.try_lock()) {
+                    lt_lock_ns += LtNow() - t;
+                    return;
+                }
+            } while (LtNow() - t < spin);
+        }
         m.lock();
         lt_lock_ns += LtNow() - t;
     }
