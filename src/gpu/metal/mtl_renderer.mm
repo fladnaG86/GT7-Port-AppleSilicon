@@ -7278,7 +7278,21 @@ struct MetalRenderer::Impl {
               (unsigned long long)index_va);
     }
     // The copy VS as an ordinary indexed triangle list (GS stage off).
-    auto copy = std::make_unique<RegFile>(r);
+    // Three registers differ: they are changed in place and put back after
+    // the draw. (A copy of the register file is 256 KB: allocated, copied and
+    // freed per GS draw it was ~14% of the graphics thread in a race.) The
+    // file is the calling ring's own state and the renderer lock is held.
+    RegFile &copy_regs = const_cast<RegFile &>(r);
+    struct RestoreRegs {
+      RegFile &regs;
+      const u32 stages, prim, indx_offset;
+      ~RestoreRegs() {
+        regs[Reg::VGT_SHADER_STAGES_EN] = stages;
+        regs[Reg::VGT_PRIMITIVE_TYPE] = prim;
+        regs[Reg::VGT_INDX_OFFSET] = indx_offset;
+      }
+    } restore_regs{copy_regs, r[Reg::VGT_SHADER_STAGES_EN], r[Reg::VGT_PRIMITIVE_TYPE], r[Reg::VGT_INDX_OFFSET]};
+    RegFile *const copy = &copy_regs;
     (*copy)[Reg::VGT_SHADER_STAGES_EN] &= ~0x20u;
     (*copy)[Reg::VGT_PRIMITIVE_TYPE] = static_cast<u32>(PrimType::TriList);
     (*copy)[Reg::VGT_INDX_OFFSET] = 0; // the ES took the base; these index the ring
