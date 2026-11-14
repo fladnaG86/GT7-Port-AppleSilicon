@@ -1788,6 +1788,25 @@ struct MetalRenderer::Impl {
     return !v || std::atoi(v) != 0;
   }();
   u64 stat_deferred = 0;
+  // A compute ring's submit ends with a commit (its work and fence signals
+  // go to the GPU). With the graphics ring's pass open that commit ended the
+  // pass too: ~26 times a frame once the compute rings stopped sleeping on
+  // the lock. It now waits for the pass to end (the mid-pass commit bounds
+  // the wait). DC_DEFER_SUBMIT=0: commit at once.
+  const bool defer_submit = [] {
+    const char *v = std::getenv("DC_DEFER_SUBMIT");
+    return !v || std::atoi(v) != 0;
+  }();
+  bool commit_wanted = false;
+  u64 stat_deferred_commits = 0;
+  bool DeferCommit() {
+    if (!defer_submit || !enc || !draw_thread || pthread_mach_thread_np(pthread_self()) == draw_thread) {
+      return false;
+    }
+    commit_wanted = true;
+    ++stat_deferred_commits;
+    return true;
+  }
   void EncodeDispatch(id<MTLComputeCommandEncoder> e, const DeferredDispatch &d) {
     [e setComputePipelineState:d.pso];
     [e setBytes:d.ud length:64 atIndex:Shader::Binding::UserData];
@@ -2555,6 +2574,7 @@ struct MetalRenderer::Impl {
   void Commit(bool wait) {
     CpuTimer t(cpu_profile ? &cpu_commit_s : nullptr);
     const bool open_pass = enc != nil;
+    commit_wanted = false;
     EndPass();
     if (stats && open_pass) {
       last_end_ra = __builtin_return_address(0); // who committed, not Commit itself
@@ -5832,7 +5852,7 @@ struct MetalRenderer::Impl {
                  float depth_value, bool clear_stencil = false,
                  u32 stencil_value = 0) {
     EndPass();
-    if (work_since_commit >= kCommitEvery) {
+    if (work_since_commit >= kCommitEvery || commit_wanted) {
       Commit(false); // keep the host GPU busy while the rest is recorded
     }
     EnsureCommandBuffer();
@@ -6054,8 +6074,11 @@ struct MetalRenderer::Impl {
   }
   static bool SamplesAttachment(const Resources &res, RenderTarget *const colors[8],
                                 const RenderTarget *depth) {
-    for (id<MTLTexture> t : res.tex) {
-      id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
+    // Runs up to three times a draw: by reference and unretained, so ARC adds
+    // no retain/release per texture, and one parentTexture call each.
+    for (const auto &t : res.tex) {
+      __unsafe_unretained id<MTLTexture> parent = t.parentTexture;
+      __unsafe_unretained id<MTLTexture> base = parent ? parent : t;
       if (depth && base == depth->tex) {
         return true;
       }
@@ -6980,6 +7003,8 @@ struct MetalRenderer::Impl {
   // the indices the GS wrote. Handles non-indexed point input and line input,
   // indexed or not, with triangle-strip output; otherwise returns false and the
   // draw is skipped. DC_NO_GS=1: skip them all; DC_GS_ONLY=<gs addr>: only that GS.
+  std::unordered_map<u64, u32> gs_plane;     // copy shader hash -> plane bytes (DrawGs)
+  std::unordered_map<u64, u32> gs_ring_base; // ring program hash -> its ring's linear base, ~0u none
   bool DrawGs(const RegFile &r, const DrawCall &dc) {
     static const bool off = std::getenv("DC_NO_GS") != nullptr;
     static const u64 only = std::getenv("DC_GS_ONLY") ? std::strtoull(std::getenv("DC_GS_ONLY"), nullptr, 16) : 0;
@@ -7004,18 +7029,37 @@ struct MetalRenderer::Impl {
     Program *vs = GetProgram(Stage::Vertex, vs_addr, r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0),
                              Bits(r[Reg::SPI_SHADER_PGM_RSRC2_VS], 1, 5),
                              Bits(r[Reg::SPI_SHADER_PGM_RSRC1_VS], 24, 2));
+    // The copy shader's plane size and each ring program's ring base depend
+    // on the program alone: scanned once per program, not per draw (the scan
+    // walked, and through a ternary even copied, the whole instruction list
+    // three times a draw: ~12% of the graphics thread in a race with a
+    // text-heavy HUD).
     std::vector<u32> offsets;
-    for (const auto &i : vs ? vs->code : std::vector<Shader::Gcn::Inst>{}) {
-      if (i.enc == Shader::Gcn::Enc::MUBUF) {
-        offsets.push_back(i.offset);
+    auto scan_offsets = [&] {
+      offsets.clear();
+      if (vs) {
+        for (const auto &i : vs->code) {
+          if (i.enc == Shader::Gcn::Enc::MUBUF) {
+            offsets.push_back(i.offset);
+          }
+        }
       }
-    }
-    std::sort(offsets.begin(), offsets.end());
+      std::sort(offsets.begin(), offsets.end());
+    };
     u32 plane = 0;
-    for (size_t k = 1; k < offsets.size(); ++k) {
-      if (offsets[k] != offsets[k - 1]) {
-        plane = plane ? std::min(plane, offsets[k] - offsets[k - 1]) : offsets[k] - offsets[k - 1];
+    if (vs) {
+      auto it = gs_plane.find(vs->hash);
+      if (it == gs_plane.end()) {
+        scan_offsets();
+        u32 pl = 0;
+        for (size_t k = 1; k < offsets.size(); ++k) {
+          if (offsets[k] != offsets[k - 1]) {
+            pl = pl ? std::min(pl, offsets[k] - offsets[k - 1]) : offsets[k] - offsets[k - 1];
+          }
+        }
+        it = gs_plane.emplace(vs->hash, pl).first;
       }
+      plane = it->second;
     }
     Shader::RingInfo ring;
     ring.esgs_itemsize = r[Reg::VGT_ESGS_RING_ITEMSIZE] & 0x7FFF;
@@ -7029,6 +7073,7 @@ struct MetalRenderer::Impl {
     if (plane % 64 || ring.slots < 3 || ring.slots > 64 || !ring.esgs_itemsize ||
         !ring.vert_itemsize) {
       std::string list;
+      scan_offsets();
       for (const u32 o : offsets) {
         list += " " + std::to_string(o);
       }
@@ -7044,24 +7089,35 @@ struct MetalRenderer::Impl {
     // first buffer access with a known base reads (ESGS) and the copy VS's (GSVS).
     // `base_out`: the ring V#'s 48-bit base as the shader sees it (dc_vbase).
     auto ring_bytes = [&](Program *p, const u32 *ud, u64 *base_out) -> u64 {
-      for (const auto &i : p ? p->code : std::vector<Shader::Gcn::Inst>{}) {
-        if (i.enc != Shader::Gcn::Enc::MUBUF) {
-          continue;
-        }
-        const u32 k = p->LinearBaseOf(i.pc);
-        if (k >= p->linear_bases.size() || p->linear_bases[k].window_only) {
+      if (!p) {
+        return 0;
+      }
+      auto it = gs_ring_base.find(p->hash);
+      if (it == gs_ring_base.end()) {
+        u32 found = ~0u;
+        for (const auto &i : p->code) {
+          if (i.enc != Shader::Gcn::Enc::MUBUF) {
+            continue;
+          }
           // An SGPR soffset has no bound (at most a window); the next access
           // has the same V#.
-          continue;
+          const u32 k = p->LinearBaseOf(i.pc);
+          if (k < p->linear_bases.size() && !p->linear_bases[k].window_only) {
+            found = k;
+            break;
+          }
         }
-        u64 va = 0, bytes = 0;
-        Shader::SgprReadCache cache;
-        const Shader::LinearBase &b = p->linear_bases[k];
-        const u32 w0 = Shader::ResolveSgpr(b.words[0], ud, &cache), w1 = Shader::ResolveSgpr(b.words[1], ud, &cache);
-        *base_out = u64(w0) | (u64(w1 & 0xFFF) << 32);
-        return Shader::LinearBaseRange(b, ud, &cache, &va, &bytes) ? bytes : 0;
+        it = gs_ring_base.emplace(p->hash, found).first;
       }
-      return 0;
+      if (it->second >= p->linear_bases.size()) {
+        return 0;
+      }
+      u64 va = 0, bytes = 0;
+      Shader::SgprReadCache cache;
+      const Shader::LinearBase &b = p->linear_bases[it->second];
+      const u32 w0 = Shader::ResolveSgpr(b.words[0], ud, &cache), w1 = Shader::ResolveSgpr(b.words[1], ud, &cache);
+      *base_out = u64(w0) | (u64(w1 & 0xFFF) << 32);
+      return Shader::LinearBaseRange(b, ud, &cache, &va, &bytes) ? bytes : 0;
     };
     const u32 *gs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_GS_0);
     Program *gsp = GetProgram(Stage::Compute, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS), gs_ud,
@@ -8016,7 +8072,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     bool all_ok = true;
     auto uses = [&](const Resources &res) {
       bool any = false;
-      for (id<MTLTexture> t : res.tex) {
+      for (const auto &t : res.tex) {
         if (t == depth->tex || t.parentTexture == depth->tex) {
           any = true;
           all_ok = all_ok && copy_view_ok(t);
@@ -10083,8 +10139,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                         (unsigned long long)top[k].first, split_px[top[k].second] / 1e6);
           by += buf;
         }
-        DC_INFO("gpu stats: %.1f dispatches/frame deferred to the end of the open pass", stat_deferred / double(frames));
-        stat_deferred = 0;
+        DC_INFO("gpu stats: %.1f dispatches/frame deferred to the end of the open pass, %.1f commits/frame deferred",
+                stat_deferred / double(frames), stat_deferred_commits / double(frames));
+        stat_deferred = stat_deferred_commits = 0;
         DC_INFO("gpu stats: %.0f passes/frame, %.0f split from the same targets by%s",
                 stat_passes / double(frames), stat_split / double(frames), by.c_str());
         split_by.clear();
@@ -10518,6 +10575,9 @@ void MetalRenderer::OnSubmit() {
   // DC_SERIAL: wait for the GPU after every submit (debug: rules out CPU/GPU
   // races on guest memory).
   static const bool serial = std::getenv("DC_SERIAL") != nullptr;
+  if (!serial && impl->DeferCommit()) {
+    return;
+  }
   @autoreleasepool {
     impl->Commit(serial);
   }
