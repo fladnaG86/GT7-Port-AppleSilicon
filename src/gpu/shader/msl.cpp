@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 #include <unordered_map>
 
@@ -472,6 +473,7 @@ private:
     // Structured control flow (see Structure()).
     bool structured = false;
     bool tree = false; // if/else nesting instead of tgt_ blocks (see TreeShape())
+    std::map<u32, u32> plds_slot; // pixel-shader LDS: byte offset -> dc_plds index
     std::unordered_map<u32, u32> tails;           // tree: inlined tail start -> one past its S_ENDPGM
     std::vector<std::pair<u32, u32>> loops;       // tree: open loops (header, last back edge)
     u32 cur = 0;                              // index of the instruction being emitted
@@ -1350,11 +1352,20 @@ void Emitter::EmitDs(const Inst& i) {
     // Pixel shaders get no LDS on Metal. GT7's forward shaders use it as a
     // per-lane slot (address = lane * 4 from mbcnt, write then read back by
     // the same lane) for the light index of the cluster loop: a private array
-    // per thread, indexed by the immediate offset only.
+    // per thread, indexed by the immediate offset only. Each field is its own
+    // 64-lane array (offsets 0x000, 0x100, ... 0x500): every distinct offset
+    // gets its own slot. `(off >> 2) & 15` folded them all onto slot 0, so the
+    // light loop counter (+0x400) read back the light word (+0x300) and the
+    // loop never ended (GPU hang at the p001 race countdown).
     if (p.stage == Stage::Fragment &&
         (static_cast<Ds>(i.op) == Ds::DS_WRITE_B32 || static_cast<Ds>(i.op) == Ds::DS_READ_B32)) {
         const u32 off16 = (u32(i.offset1) << 8) | i.offset0;
-        const std::string slot = "dc_plds[" + N((off16 >> 2) & 15) + "]";
+        const auto [it, fresh] = plds_slot.emplace(off16, u32(plds_slot.size()));
+        if (it->second >= 16) {
+            Unsupported(i);
+            return;
+        }
+        const std::string slot = "dc_plds[" + N(it->second) + "]";
         if (static_cast<Ds>(i.op) == Ds::DS_WRITE_B32) {
             Line(std::string(guard ? "if (exec_lo != 0u) " : "") + slot + " = " + VName(i.data0) + ";");
         } else {
