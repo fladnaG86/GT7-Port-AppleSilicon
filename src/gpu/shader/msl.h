@@ -145,6 +145,10 @@ constexpr u32 kProbeExportNan = 0xFFFFFFFEu; // probe_pc: at color exports that 
 constexpr u32 kProbeExportAny = 0xFFFFFFFDu; // probe_pc: at every color export
 constexpr u32 kProbeBinding = 7;
 constexpr u32 kDepthBoundsBuffer = 6;
+// DC_GUARD_REPORT=1: pixel shaders count loop-budget exhaustions here (one
+// atomic_uint slot per shader, bound with an offset by the renderer).
+constexpr u32 kGuardReportBinding = 15;
+bool GuardReportEnabled();
 constexpr u32 kDepthBoundsTexture = 30;
 
 struct MslOptions {

@@ -43,6 +43,12 @@ namespace {
 // frame replay and a live menu + Music Rally run render the same at 4096 as
 // at 1 << 20); 16384 keeps a margin for scenes not checked.
 constexpr u32 kLoopBudget = 1u << 14;
+} // namespace
+bool GuardReportEnabled() {
+    static const bool on = std::getenv("DC_GUARD_REPORT") != nullptr;
+    return on;
+}
+namespace {
 
 std::string Hex(u32 v) {
     char b[16];
@@ -317,6 +323,9 @@ private:
             return v ? static_cast<u32>(v) : kLoopBudget;
         }();
         return std::string("if (++guard_ > ") + N(budget) + "u) { " +
+               (p.stage == Stage::Fragment && GuardReportEnabled()
+                    ? "atomic_fetch_add_explicit(dc_gr, 1u, memory_order_relaxed); "
+                    : "") +
                (p.stage == Stage::Fragment && guard_discard ? "discard_fragment(); " : "") +
                (p.stage == Stage::Compute ? "return; " : "return out; ") + "} ";
     }
@@ -2836,7 +2845,10 @@ std::string Emitter::Run() {
             o.depth_bounds ? ", texture2d<float> dc_zb [[texture(" + N(kDepthBoundsTexture) + ")]], constant float2& dc_zbr [[buffer(" +
                                  N(kDepthBoundsBuffer) + ")]]"
                            : "";
-        src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + probe_param + bounds_param + TexParams(true) +
+        const std::string guard_param =
+            GuardReportEnabled() ? ", device atomic_uint* dc_gr [[buffer(" + N(kGuardReportBinding) + ")]]" : "";
+        src += "fragment PsOut main0(PsIn pin [[stage_in]], " + mem_params + probe_param + bounds_param + guard_param +
+               TexParams(true) +
                ") {\n";
         if (o.depth_bounds) {
             src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; float bmin = min(dc_zbr.x, dc_zbr.y); float bmax = max(dc_zbr.x, dc_zbr.y); if (z_ < bmin || z_ > bmax) discard_fragment(); }\n";

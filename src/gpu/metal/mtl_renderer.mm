@@ -1071,6 +1071,26 @@ struct MetalRenderer::Impl {
     u32 pc = ~0u, x = 0, y = 0;
   } probe;
   id<MTLBuffer> probe_buf = nil;
+  // DC_GUARD_REPORT=1: per-PS counters of loop-budget exhaustions.
+  static constexpr u32 kGuardSlots = 4096;
+  id<MTLBuffer> guard_buf = nil;
+  std::mutex guard_lock;
+  std::unordered_map<u32, u64> guard_addr; // slot -> PS address
+  std::unordered_map<u64, u32> guard_slot; // PS address -> slot
+  void DumpGuardReport(const char *why) {
+    if (!guard_buf) return;
+    auto *d = static_cast<std::atomic<u32> *>(guard_buf.contents);
+    std::scoped_lock lk(guard_lock);
+    for (u32 k = 0; k < kGuardSlots; ++k) {
+      const u32 n = d[k].exchange(0, std::memory_order_relaxed);
+      if (n) {
+        const auto it = guard_addr.find(k);
+        DC_WARN("gpu guard report (%s, frame %llu): ps 0x%llx hit the loop budget %u times",
+                why, (unsigned long long)frame_count,
+                (unsigned long long)(it != guard_addr.end() ? it->second : 0), n);
+      }
+    }
+  }
   std::vector<std::string>
       probe_slots; // what each slot of probe_buf belongs to
   static constexpr u32 kProbeSlots = 4096;
@@ -1232,6 +1252,12 @@ struct MetalRenderer::Impl {
 
   void Init() {
     dump_dir = std::getenv("DC_DUMP_SHADERS");
+    if (Shader::GuardReportEnabled()) {
+      guard_buf = [device newBufferWithLength:kGuardSlots * 4
+                                      options:MTLResourceStorageModeShared];
+      std::memset(guard_buf.contents, 0, guard_buf.length);
+      DC_WARN("gpu: DC_GUARD_REPORT on");
+    }
     dump_frames = std::getenv("DC_DUMP_FRAMES");
     if (const char *e = std::getenv("DC_DUMP_EVERY")) {
       dump_every = std::max<u64>(1, std::strtoull(e, nullptr, 10));
@@ -2703,6 +2729,7 @@ struct MetalRenderer::Impl {
                    "it holds:\n%s",
                    s, c.error ? c.error.localizedDescription.UTF8String : "ok",
                    work.c_str());
+          DumpGuardReport("watchdog");
           std::_Exit(3);
         }
       }];
@@ -9068,6 +9095,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     if (probe_slot >= 0) {
       BindBuffer(1, probe_buf, u64(probe_slot) * Shader::kProbeWords * 4, Shader::kProbeBinding);
     }
+    if (guard_buf) {
+      u32 slot;
+      {
+        std::scoped_lock lk(guard_lock);
+        auto [it, fresh] = guard_slot.emplace(ps_addr, u32(guard_slot.size() % kGuardSlots));
+        slot = it->second;
+        if (fresh) guard_addr[slot] = ps_addr;
+      }
+      BindBuffer(1, guard_buf, u64(slot) * 4, Shader::kGuardReportBinding);
+    }
   }
 
   if (capture) {
@@ -9952,6 +9989,9 @@ bool MetalRenderer::Impl::BeginCapture(const std::string &path) {
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   CpuTimer t(cpu_profile ? &cpu_flip_s : nullptr);
   ++frame_count;
+  if (guard_buf && frame_count % 30 == 0) {
+    DumpGuardReport("flip");
+  }
   if (!linear_watch.empty() && trace_frame && frame_count > trace_frame + 1) {
     const u64 age = frame_count - trace_frame;
     for (const auto &w : linear_watch) {
