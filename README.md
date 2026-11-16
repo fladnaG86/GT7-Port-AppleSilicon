@@ -12,6 +12,11 @@ under Rosetta 2, with a GCN-to-Metal renderer.
 
 *Music Rally at Alsace Village on a MacBook Pro M1 Max under Rosetta 2, 24 fps (2026-11-09).*
 
+[![Race at Tokyo Expressway on a MacBook Pro M1 Max, video with game audio (33 s, 1080p60)](media/gt7-tokyo-expressway-race.jpg)](https://github.com/fladnaG86/GT7-Port-AppleSilicon/releases/download/gt7-v0.1.4/GT7-Tokyo-Expressway-race-1080p60.mp4)
+
+*Video: a race at Tokyo Expressway on a MacBook Pro M1 Max with game audio, 33 s,
+1080p60 (2026-11-16, build 0.1.4). Click the image to open the mp4.*
+
 **Status: work in progress.** Boot, menus, display settings and races work. In a race
 on an M1 Max it runs at roughly 20-30 fps, with visual differences from the console and
 shader-compile stutters the first time a scene is seen. Current state, recent work and
