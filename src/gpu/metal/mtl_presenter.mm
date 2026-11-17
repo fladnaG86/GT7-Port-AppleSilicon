@@ -70,10 +70,12 @@ struct Presenter::Impl {
     id<MTLTexture> scaled; // Scaler output; the drawable is framebufferOnly
 
     // At most one frame per `pace` s on screen: on a 120 Hz display an unpaced
-    // 30 fps game lands frames 25 or 41.7 ms apart, which reads as stutter. The
-    // game caps at 30. DC_NO_PACE turns it off. DC_PACE_STATS logs the intervals
-    // between frames as the display showed them.
-    double pace = 1.0 / 30.0;
+    // 60 fps game lands frames 8.3 or 25 ms apart, which reads as stutter.
+    // GT7 flips at up to 60 Hz (Driveclub, where this came from, capped at 30
+    // and used 1/30, which held GT7 races at 30 fps). DC_PACE_HZ=<hz> changes
+    // it, DC_NO_PACE turns it off. DC_PACE_STATS logs the intervals between
+    // frames as the display showed them.
+    double pace = 1.0 / 60.0;
     bool pace_stats = false;
     double last_shown = 0;
     std::vector<float> shown_ms;
@@ -87,13 +89,14 @@ struct Presenter::Impl {
         last_shown = t;
         if (shown_ms.size() >= 300) {
             std::sort(shown_ms.begin(), shown_ms.end());
+            const float target = static_cast<float>(pace * 1000.0);
             int off = 0;
             for (const float v : shown_ms) {
-                off += v < 30.0f || v > 36.0f;
+                off += v < target - 3.0f || v > target + 3.0f;
             }
             const size_t n = shown_ms.size();
-            DC_INFO("pace: p1 %.1f p50 %.1f p99 %.1f max %.1f ms, %.1f%% off 33 ms", shown_ms[n / 100],
-                    shown_ms[n / 2], shown_ms[n - n / 100 - 1], shown_ms[n - 1], 100.0 * off / n);
+            DC_INFO("pace: p1 %.1f p50 %.1f p99 %.1f max %.1f ms, %.1f%% off %.1f ms", shown_ms[n / 100],
+                    shown_ms[n / 2], shown_ms[n - n / 100 - 1], shown_ms[n - 1], 100.0 * off / n, target);
             shown_ms.clear();
         }
     }
@@ -168,6 +171,9 @@ Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     impl->layer = (__bridge CAMetalLayer*)layer;
     impl->frames_in_flight = dispatch_semaphore_create(kFramesInFlight);
     impl->upscale = std::getenv("DC_NO_METALFX") == nullptr;
+    if (const char* hz = std::getenv("DC_PACE_HZ"); hz && std::atof(hz) > 0) {
+        impl->pace = 1.0 / std::atof(hz);
+    }
     if (std::getenv("DC_NO_PACE") || !config.vsync) {
         impl->pace = 0;
     }

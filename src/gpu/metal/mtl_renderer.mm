@@ -529,6 +529,20 @@ struct MetalRenderer::Impl {
     return v ? static_cast<u32>(std::atoi(v)) : 120u;
   }();
   u64 stat_midpass = 0;
+  // Command buffers committed and not completed. The early commits above
+  // exist to feed an idle GPU; with work still queued they only cost extra
+  // attachment loads/stores (mid-pass) and command buffer overhead, so they
+  // wait until the GPU drains or 4x the count piles up. DC_COMMIT_GATE=1 on.
+  std::atomic<int> cb_inflight{0};
+  const bool commit_gate = [] {
+    const char *v = std::getenv("DC_COMMIT_GATE");
+    return v && std::atoi(v) != 0; // opt-in: measured no gain in the Tokyo race
+  }();
+  bool CommitDue(u32 every) const {
+    return work_since_commit >= every &&
+           (!commit_gate || cb_inflight.load(std::memory_order_relaxed) == 0 ||
+            work_since_commit >= 4 * every);
+  }
   u64 stat_linear_windows = 0; // LinearTable: bases given a window
 
   // Signals: an event value encoded between passes, so fences do not cut
@@ -722,12 +736,25 @@ struct MetalRenderer::Impl {
   // Addresses whose Latest() answer a cached result depends on, with the
   // write generation of each when it was cached (see AddrGen).
   using AddrDeps = std::vector<std::pair<u64, u64>>;
+  struct TextureEntry;
   struct TextureCacheEntry {
     id<MTLTexture> tex = nil;
     TextureType type;
     u64 epoch = 0;
     AddrDeps deps;
+    // Plain guest textures stay cached across frames: on the first use in a
+    // frame only their content check runs (TextureChanged), not the decode.
+    u64 frame = 0;
+    TextureEntry *entry = nullptr; // null: valid for `frame` only
+    const u8 *base = nullptr;
+    u64 size = 0;
   };
+  // Set by GetTextureUncached when it answered from a plain guest texture.
+  TextureEntry *gt_entry = nullptr;
+  const u8 *gt_base = nullptr;
+  u64 gt_size = 0;
+  // DC_NO_TEX_PERSIST=1: rebuild the descriptor cache every frame (A/B).
+  const bool tex_persist = std::getenv("DC_NO_TEX_PERSIST") == nullptr;
   std::unordered_map<u64, TextureCacheEntry> texture_cache;
   u64 texture_cache_frame = ~0ull;
   u64 texture_epoch = 0;
@@ -943,6 +970,9 @@ struct MetalRenderer::Impl {
       }
     }
     const size_t evicted = dead->size();
+    if (evicted) {
+      texture_cache.clear(); // its entries point into `textures`
+    }
     if (texture_reaper_off) {
       dead->clear();
     }
@@ -2734,6 +2764,10 @@ struct MetalRenderer::Impl {
         }
       }];
     }
+    cb_inflight.fetch_add(1, std::memory_order_relaxed);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+      cb_inflight.fetch_sub(1, std::memory_order_relaxed);
+    }];
     [cmd commit];
     last_committed = cmd;
     cmd = nil;
@@ -4178,7 +4212,9 @@ struct MetalRenderer::Impl {
       ++cpu_gettex_calls;
     }
     if (texture_cache_frame != frame_count) {
-      texture_cache.clear();
+      if (!tex_persist) {
+        texture_cache.clear();
+      }
       texture_cache_frame = frame_count;
     }
     // The descriptor is the key: t[6] and t[7] are unused by the decoder.
@@ -4187,7 +4223,20 @@ struct MetalRenderer::Impl {
       key = Hash(t[k], key);
     }
     if (auto it = texture_cache.find(key); it != texture_cache.end()) {
-      if (it->second.epoch == texture_epoch && DepsValid(it->second.deps)) {
+      TextureCacheEntry &ce = it->second;
+      bool fresh = ce.frame == frame_count;
+      if (!fresh && ce.entry && ce.epoch == texture_epoch) {
+        // First use this frame of a plain guest texture: same check as the
+        // slow path's `e.tex && !TextureChanged` branch.
+        if (ce.entry->frame == frame_count ||
+            (Readable(reinterpret_cast<u64>(ce.base), ce.size) &&
+             !TextureChanged(*ce.entry, ce.base, ce.size))) {
+          ce.entry->frame = frame_count;
+          ce.frame = frame_count;
+          fresh = true;
+        }
+      }
+      if (fresh && ce.epoch == texture_epoch && DepsValid(ce.deps)) {
         ForwardDeps(it->second.deps);
         if (cpu_profile) {
           ++cpu_gettex_hits;
@@ -4224,11 +4273,15 @@ struct MetalRenderer::Impl {
     std::vector<u64> looked;
     std::vector<u64> *outer = latest_deps;
     latest_deps = &looked;
+    gt_entry = nullptr;
     id<MTLTexture> tex = GetTextureUncached(t, &tt, false);
     latest_deps = outer;
     AddrDeps deps = SnapDeps(looked);
     ForwardDeps(deps);
-    texture_cache[key] = TextureCacheEntry{tex, tt, texture_epoch, std::move(deps)};
+    TextureEntry *const persist = tex_persist && deps.empty() ? gt_entry : nullptr;
+    texture_cache[key] = TextureCacheEntry{tex, tt, texture_epoch, std::move(deps), frame_count,
+                                           persist, gt_base, gt_size};
+    gt_entry = nullptr;
     *type_out = tt;
     return tex;
   }
@@ -4767,16 +4820,25 @@ struct MetalRenderer::Impl {
       }
       return e.base_view;
     };
+    const bool plain = tex_base == reinterpret_cast<const u8 *>(addr);
+    auto guest = [&]() {
+      if (plain) {
+        gt_entry = &e;
+        gt_base = tex_base;
+        gt_size = size;
+      }
+      return view();
+    };
     if (e.tex && e.frame == frame_count) {
       if (cpu_profile) {
         ++cpu_gettex_hits;
       }
-      return view();
+      return guest();
     }
     if (e.tex) {
       if (!TextureChanged(e, tex_base, size)) {
         e.frame = frame_count;
-        return view();
+        return guest();
       }
       e.hot = true;
     }
@@ -4883,7 +4945,7 @@ struct MetalRenderer::Impl {
       e.hot = true;
     }
     TexturePressure();
-    return view();
+    return guest();
   }
 
   id<MTLSamplerState> GetSampler(const u32 s[4]) NS_RETURNS_RETAINED {
@@ -4907,7 +4969,13 @@ struct MetalRenderer::Impl {
                   : mip == 1 ? MTLSamplerMipFilterNearest
                              : MTLSamplerMipFilterLinear;
     if (min >= 2 || mag >= 2) {
-      d.maxAnisotropy = std::min<u32>(16, 1u << aniso);
+      // DC_MAX_ANISO=<n>: lower ceiling than the guest asks (A/B for PS cost).
+      static const u32 aniso_cap = [] {
+        const char *e = std::getenv("DC_MAX_ANISO");
+        const u32 v = e ? u32(std::strtoul(e, nullptr, 10)) : 0;
+        return v ? std::min<u32>(v, 16) : 16u;
+      }();
+      d.maxAnisotropy = std::min<u32>(aniso_cap, 1u << aniso);
     }
     d.lodMinClamp = static_cast<float>(s[1] & 0xFFF) / 256.0f;
     d.lodMaxClamp = static_cast<float>((s[1] >> 12) & 0xFFF) / 256.0f;
@@ -5879,7 +5947,7 @@ struct MetalRenderer::Impl {
                  float depth_value, bool clear_stencil = false,
                  u32 stencil_value = 0) {
     EndPass();
-    if (work_since_commit >= kCommitEvery || commit_wanted) {
+    if (CommitDue(kCommitEvery) || commit_wanted) {
       Commit(false); // keep the host GPU busy while the rest is recorded
     }
     EnsureCommandBuffer();
@@ -5894,7 +5962,17 @@ struct MetalRenderer::Impl {
       }
       RenderTarget &rt = *colors[k];
       if (rt.has_crops) {
-        BumpEpoch(__LINE__); // its crops go stale: the next bind copies them again
+        // Its crops go stale: the next bind copies them again. Cached
+        // descriptors that resolved to a crop looked `rt.addr` up through
+        // Latest(), so a per-address bump reaches exactly them; the global
+        // epoch emptied both caches ~18 times a frame in races.
+        // DC_GLOBAL_CROP_EPOCH=1: old way.
+        static const bool global = std::getenv("DC_GLOBAL_CROP_EPOCH") != nullptr;
+        if (global) {
+          BumpEpoch(__LINE__);
+        } else {
+          BumpAddr(rt.addr, __LINE__);
+        }
       }
       rp.colorAttachments[k].texture = rt.tex;
       rp.colorAttachments[k].slice = draw_layers ? 0 : rt.bind_slice;
@@ -8067,7 +8145,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   for (u32 k = 0; k < 8; ++k) {
     pending_clear = pending_clear || (colors[k] && colors[k]->clear_pending);
   }
-  if (kCommitMidPass && enc && pass_draws && work_since_commit >= kCommitMidPass) {
+  if (kCommitMidPass && enc && pass_draws && CommitDue(kCommitMidPass)) {
     EndPass();
     Commit(false); // the next check reopens the pass over the same attachments
     ++stat_midpass;
@@ -9390,7 +9468,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     NoteWholeFill(dst & kGpuAddrMask, u64(ud[2]) * 4); // num_records dwords (stride 4)
     if (color_targets.count(dst)) {
       memory_fills[dst] = ++write_seq;
-      BumpEpoch(__LINE__);
+      // Descriptors that resolved a target at `dst` looked it up through
+      // Latest(dst): a per-address bump reaches them (DC_GLOBAL_EPOCH=1: global).
+      BumpAddr(dst, __LINE__);
     }
     // The same memset over a depth surface clears it (GT7 clears its reflection
     // cube depth 0x900b460000 to 0, reverse Z, this way each frame). The value
@@ -9651,7 +9731,8 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     if (!batch || enc) {
       EndPass();
     }
-    if (++work_since_commit >= kCommitEvery) {
+    ++work_since_commit;
+    if (CommitDue(kCommitEvery)) {
       Commit(false);
     }
   } else {
