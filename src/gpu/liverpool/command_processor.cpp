@@ -266,12 +266,35 @@ void HistDump(u64 addr, u32 ring) {
 }
 } // namespace
 
-thread_local CommandProcessor::Ring* CommandProcessor::t_ring = nullptr;
-thread_local RegFile* CommandProcessor::t_regs = nullptr;
+__attribute__((noinline)) CommandProcessor::Ring*& CommandProcessor::TRing() {
+    static thread_local Ring* ring = nullptr;
+    return ring;
+}
+__attribute__((noinline)) RegFile*& CommandProcessor::TRegs() {
+    static thread_local RegFile* r = nullptr;
+    return r;
+}
+#define t_ring TRing()
+#define t_regs TRegs()
+
+namespace {
+// Pipe record kinds (low byte of a record's first dword).
+enum : u32 { kPipeRegs = 1, kPipeDraw, kPipeDispatch, kPipeCtx, kPipeMem, kPipeFn };
+constexpr u32 kPipeBatchDraws = 32;   // draws per batch handed to the worker
+constexpr size_t kPipeMaxQueued = 8;  // batches in flight before the ring thread waits
+constexpr u32 kDrawCallWords = (sizeof(DrawCall) + 3) / 4;
+} // namespace
+
 
 CommandProcessor::CommandProcessor() {
     trace = std::getenv("DC_CP_TRACE") != nullptr;
     ClearState();
+    if (const char* e = std::getenv("DC_CP_PIPE"); e && std::atoi(e) != 0) {
+        pipe = std::make_unique<Pipe>();
+        pipe->regs = regs;
+        pipe->thread = std::jthread([this](std::stop_token st) { PipeWorker(st); });
+        DC_INFO("gpu: graphics CP pipelined (parse and render on two threads)");
+    }
 }
 
 // CLEAR_STATE: context registers back to their power-on values. Most are 0;
@@ -295,9 +318,16 @@ void CommandProcessor::ClearState() {
         regs[Reg::PA_SC_VPORT_SCISSOR_0_TL + 2 * k + 1] = 0x40004000;
         regs[Reg::PA_SC_VPORT_ZMIN_0 + 2 * k + 1] = 0x3F800000; // ZMAX = 1.0
     }
+    if (Piped()) {
+        PipeRegs(kContextRegBase, regs.Data() + kContextRegBase, 0x400);
+    }
 }
 
 CommandProcessor::~CommandProcessor() {
+    if (pipe) {
+        pipe->thread.request_stop();
+        pipe->cv.notify_all();
+    }
     for (auto& r : rings) {
         if (r) {
             r->thread.request_stop();
@@ -384,6 +414,10 @@ void CommandProcessor::WaitIdle() {
         std::unique_lock lk(r->lock);
         r->idle_cv.wait(lk, [&] { return r->jobs.empty() && !r->busy; });
     }
+    if (pipe) { // an idle ring has flushed its last batch
+        std::unique_lock lk(pipe->lock);
+        pipe->done_cv.wait(lk, [&] { return pipe->queue.empty() && !pipe->busy; });
+    }
 }
 
 bool CommandProcessor::WaitIdleFor(int ms) {
@@ -401,6 +435,10 @@ bool CommandProcessor::WaitIdleFor(int ms) {
     for (Ring* r : all) {
         std::unique_lock lk(r->lock);
         ok &= r->idle_cv.wait_until(lk, until, [&] { return r->jobs.empty() && !r->busy; });
+    }
+    if (pipe) {
+        std::unique_lock lk(pipe->lock);
+        ok &= pipe->done_cv.wait_until(lk, until, [&] { return pipe->queue.empty() && !pipe->busy; });
     }
     return ok;
 }
@@ -421,6 +459,10 @@ bool CommandProcessor::WaitQuiescentFor(int ms) {
         for (Ring* r : all) {
             std::scoped_lock lk(r->lock);
             quiet &= (r->jobs.empty() && !r->busy) || r->waiting.load(std::memory_order_acquire);
+        }
+        if (pipe) {
+            std::scoped_lock lk(pipe->lock);
+            quiet &= pipe->queue.empty() && !pipe->busy;
         }
         if (quiet) {
             return true;
@@ -510,6 +552,12 @@ void CommandProcessor::LoadState(const std::vector<u8>& in) {
     {
         std::scoped_lock lk(fence_lock);
         pending_fences.clear();
+        if (pipe) {
+            pipe->pending.clear();
+        }
+    }
+    if (pipe) { // idle: the worker replays nothing meanwhile
+        pipe->regs = regs;
     }
     const u32 n = Get<u32>(in, at);
     for (u32 k = 0; k < n && at < in.size(); ++k) {
@@ -569,7 +617,11 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             }
         }
         if (job.after) {
-            job.after();
+            if (Piped()) {
+                PipeFn(std::move(job.after));
+            } else {
+                job.after();
+            }
         }
         if (flip_label.addr || flip_label.interrupt) {
             const FlipLabel label = flip_label;
@@ -589,7 +641,10 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             });
             flip_label = {};
         }
-        if (renderer) {
+        if (Piped()) {
+            PipeFn([this] { renderer->OnSubmit(); });
+            PipeFlush();
+        } else if (renderer) {
             renderer->OnSubmit(); // hand everything, signals included, to the host GPU
         }
         if (lt) {
@@ -612,14 +667,16 @@ RegFile& CommandProcessor::CurRegs() {
 }
 
 void CommandProcessor::SetRegs(u32 index, const u32* values, u32 count) {
-    if (index + count > RegFile::kSize) {
+    if (index >= RegFile::kSize || count > RegFile::kSize - index) {
         return;
     }
     std::memcpy(CurRegs().Data() + index, values, count * 4);
 }
 
 void CommandProcessor::AfterGpu(std::function<void()> fn) {
-    if (renderer) {
+    if (Piped()) {
+        PipeFn([this, fn = std::move(fn)]() mutable { renderer->Signal(std::move(fn)); });
+    } else if (renderer) {
         renderer->Signal(std::move(fn));
     } else {
         fn();
@@ -629,18 +686,21 @@ void CommandProcessor::AfterGpu(std::function<void()> fn) {
 void CommandProcessor::FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 irq) {
     const u32 hist_ring = t_ring ? t_ring->index : 99;
     HistAdd('R', addr, lo, hist_ring);
-    if (data_sel == kData32 || data_sel == kData64) {
+    const bool value_write = data_sel == kData32 || data_sel == kData64;
+    const bool piped = Piped();
+    if (value_write) {
         std::scoped_lock lk(fence_lock);
-        pending_fences[addr] = lo;
+        auto& m = piped ? pipe->pending : pending_fences;
+        m[addr] = lo;
         if (data_sel == kData64) {
-            pending_fences[addr + 4] = hi;
+            m[addr + 4] = hi;
         }
     }
     const bool lt = addr == Lt().addr && LtOn();
     if (lt) {
         DC_INFO("lt %.0f label rec %#x%s", LtUs(LtNow()), lo, t_ring && t_ring->index ? " (compute)" : "");
     }
-    AfterGpu([=, this] {
+    auto write = [=, this] {
         if (lt) {
             DC_INFO("lt %.0f label write %#x", LtUs(LtNow()), lo);
         }
@@ -663,20 +723,50 @@ void CommandProcessor::FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 ir
         if (irq) {
             Interrupt(irq);
         }
+    };
+    if (!piped) {
+        AfterGpu(std::move(write));
+        return;
+    }
+    // Now the renderer gets it: pending for every ring from here on.
+    PipeFn([=, this, write = std::move(write)]() mutable {
+        if (value_write) {
+            std::scoped_lock lk(fence_lock);
+            for (u32 k = 0; k < (data_sel == kData64 ? 2u : 1u); ++k) {
+                const u64 a = addr + 4 * k;
+                const u32 v = k ? hi : lo;
+                pending_fences[a] = v;
+                auto it = pipe->pending.find(a);
+                if (it != pipe->pending.end() && it->second == v) {
+                    pipe->pending.erase(it);
+                }
+            }
+        }
+        renderer->Signal(std::move(write));
     });
 }
 
 bool CommandProcessor::PendingFence(u64 addr, u32* value) {
     std::scoped_lock lk(fence_lock);
     auto it = pending_fences.find(addr);
-    if (it == pending_fences.end()) {
-        return false;
+    if (it != pending_fences.end()) {
+        *value = it->second;
+        return true;
     }
-    *value = it->second;
-    return true;
+    if (Piped()) { // recorded by this ring: ahead of anything it records next
+        it = pipe->pending.find(addr);
+        if (it != pipe->pending.end()) {
+            *value = it->second;
+            return true;
+        }
+    }
+    return false;
 }
 
 void CommandProcessor::SyncRenderer() {
+    if (Piped()) {
+        PipeDrain();
+    }
     if (renderer) {
         renderer->WaitIdle();
     }
@@ -728,6 +818,12 @@ void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
             const u32 count = body[1] & 0x7FFF;
             u32* dst = Ptr<u32>(body[2], body[3]);
             if (!dst || off + count > ce.ram.size()) {
+                break;
+            }
+            if (Piped()) {
+                const u64 a = reinterpret_cast<u64>(dst);
+                const u32 hdr[3] = {u32(a), u32(a >> 32), 1};
+                PipeWords(kPipeMem, hdr, 3, ce.ram.data() + off, count);
                 break;
             }
             std::memcpy(dst, ce.ram.data() + off, count * 4);
@@ -801,6 +897,12 @@ void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset, u32 first
     dc.index_offset = index_offset;
     dc.index_size = index_size;
     dc.first_vertex = first_vertex;
+    if (Piped()) {
+        u32 w[kDrawCallWords] = {};
+        std::memcpy(w, &dc, sizeof(dc));
+        PipeWords(kPipeDraw, w, kDrawCallWords);
+        return;
+    }
     renderer->Draw(CurRegs(), dc);
 }
 
@@ -882,6 +984,14 @@ void CommandProcessor::FindUserData(u32 x, u32 y, u32 z) {
 
 void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int depth) {
     RegFile& regs = CurRegs();
+    const bool piped = Piped();
+    // SET_*_REG: the registers here, and in the pipe when recording into it.
+    auto set_regs = [&](u32 index, const u32* values, u32 count) {
+        SetRegs(index, values, count);
+        if (piped && index < RegFile::kSize && count <= RegFile::kSize - index) {
+            PipeRegs(index, values, count);
+        }
+    };
     const u32* p = cmds.data();
     const u32* end = p + cmds.size();
 
@@ -907,6 +1017,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 if (base_reg + i < RegFile::kSize) {
                     regs[base_reg + i] = p[1 + i];
                 }
+            }
+            if (Piped() && base_reg < RegFile::kSize) {
+                PipeRegs(base_reg, p + 1, std::min(count, RegFile::kSize - base_reg));
             }
             p += 1 + count;
             continue;
@@ -1018,19 +1131,21 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
 
         case Op::SetContextReg:
-            SetRegs(kContextRegBase + body[0], body + 1, body_n - 1);
-            if (renderer) {
+            set_regs(kContextRegBase + body[0], body + 1, body_n ? body_n - 1 : 0);
+            if (Piped()) {
+                PipeWords(kPipeCtx, body, body_n);
+            } else if (renderer) {
                 renderer->OnContextRegs(body, body_n);
             }
             break;
         case Op::SetShReg:
-            SetRegs(kShRegBase + body[0], body + 1, body_n - 1);
+            set_regs(kShRegBase + body[0], body + 1, body_n ? body_n - 1 : 0);
             break;
         case Op::SetUconfigReg:
-            SetRegs(kUconfigRegBase + body[0], body + 1, body_n - 1);
+            set_regs(kUconfigRegBase + body[0], body + 1, body_n ? body_n - 1 : 0);
             break;
         case Op::SetConfigReg:
-            SetRegs(kConfigRegBase + body[0], body + 1, body_n - 1);
+            set_regs(kConfigRegBase + body[0], body + 1, body_n ? body_n - 1 : 0);
             break;
 
         case Op::IndirectBuffer: {
@@ -1169,8 +1284,18 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                             body_n > 3 ? body[3] : 0);
                 }
                 u32* dst = Ptr<u32>(body[1], body[2]);
-                std::memcpy(dst, body + 3, (body_n - 3) * 4);
                 HistAdd('D', reinterpret_cast<u64>(dst), body_n > 3 ? body[3] : 0, t_ring ? t_ring->index : 99);
+                // A write into the packets still to be parsed must land now.
+                const u64 wa = reinterpret_cast<u64>(dst);
+                const bool patches_ib = wa < reinterpret_cast<u64>(end) &&
+                                        wa + (body_n - 3) * 4 > reinterpret_cast<u64>(cmds.data());
+                if (Piped() && !patches_ib) {
+                    const u64 a = wa;
+                    const u32 hdr[3] = {u32(a), u32(a >> 32), body_n - 3 > 2 ? 1u : 0u};
+                    PipeWords(kPipeMem, hdr, 3, body + 3, body_n - 3);
+                    break;
+                }
+                std::memcpy(dst, body + 3, (body_n - 3) * 4);
                 // Like a CE dump: draws recorded before this one must still read the
                 // old data when the host GPU runs them, later ones the new data.
                 if (renderer && body_n - 3 > 2) {
@@ -1214,45 +1339,22 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 if (bytes && !patches_ib && !dsel) {
                     HistAdd(ssel == 2 ? 'f' : 'c', dst_addr, bytes, t_ring ? t_ring->index : 99);
                 }
+                if (Piped() && !patches_ib) {
+                    u32 b[6];
+                    std::memcpy(b, body, sizeof(b));
+                    PipeFn([=, this] {
+                        if (bytes && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
+                            return;
+                        }
+                        DmaCopy(b, false);
+                    });
+                    break;
+                }
                 if (bytes && !patches_ib && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
                     break;
                 }
             }
-            u8* gds = renderer ? renderer->Gds() : nullptr;
-            const u64 dst_off = body[3] & (Gpu::kGdsPartition - 1);
-            u8* dst = dst_sel == 1
-                          ? (gds && dst_off + bytes <= Gpu::kGdsPartition ? gds + dst_off : nullptr)
-                          : Ptr<u8>(body[3], body[4]);
-            if (!dst || bytes == 0 || (dst_sel != 1 && !Mapped(dst, bytes)) ||
-                (src_sel != 1 && src_sel != 2 && !Mapped(Ptr<const u8>(body[1], body[2]), bytes))) {
-                if (bytes) {
-                    DC_WARN("gpu: DMA_DATA to/from unmapped memory skipped (ctl %#x dst %p, %u bytes)", ctl, dst, bytes);
-                }
-                break;
-            }
-            if (src_sel != 2) {
-                const u64 t = LtOn() ? LtNow() : 0;
-                SyncRenderer(); // the GPU may still be producing what we copy
-                if (t) {
-                    DC_INFO("lt %.0f dma sync %.0f us (ctl %#x %u bytes)%s", LtUs(LtNow()), (LtNow() - t) / 1e3, ctl,
-                            bytes, compute ? " (compute)" : "");
-                }
-            }
-            HistAdd(src_sel == 2 ? 'F' : 'C', reinterpret_cast<u64>(dst), bytes,
-                    t_ring ? t_ring->index : 99);
-            if (src_sel == 2) {
-                for (u32 k = 0; k + 4 <= bytes; k += 4) {
-                    std::memcpy(dst + k, &body[1], 4);
-                }
-            } else {
-                const u64 src_off = body[1] & (Gpu::kGdsPartition - 1);
-                const u8* src = src_sel == 1
-                                    ? (gds && src_off + bytes <= Gpu::kGdsPartition ? gds + src_off : nullptr)
-                                    : Ptr<const u8>(body[1], body[2]);
-                if (src) {
-                    std::memmove(dst, src, bytes);
-                }
-            }
+            DmaCopy(body, compute);
             break;
         }
 
@@ -1287,7 +1389,10 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     break;
                 }
                 // Whatever produces the value may sit in recorded host work.
-                if (renderer) {
+                if (Piped()) {
+                    PipeFn([this] { renderer->OnSubmit(); });
+                    PipeFlush();
+                } else if (renderer) {
                     renderer->OnSubmit();
                 }
                 HistAdd('S', reinterpret_cast<u64>(addr), ref, t_ring ? t_ring->index : 99);
@@ -1415,10 +1520,10 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 base_vtx_loc = body[1] & 0xFFFF;
             const u32 start_inst_loc = body[2] & 0xFFFF;
             if (base_vtx_loc) {
-                regs[kShRegBase + base_vtx_loc] = indexed ? a[3] : a[2];
+                set_regs(kShRegBase + base_vtx_loc, indexed ? &a[3] : &a[2], 1);
             }
             if (start_inst_loc) {
-                regs[kShRegBase + start_inst_loc] = indexed ? a[4] : a[3];
+                set_regs(kShRegBase + start_inst_loc, indexed ? &a[4] : &a[3], 1);
             }
             // The args may be GPU-written and not landed yet; garbage counts
             // would make a draw that hangs the GPU. Instance counts usually
@@ -1448,6 +1553,23 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             ++stats.dispatches;
             FindUserData(body[0], body[1], body[2]);
             if (renderer) {
+                if (Piped()) {
+                    if (auto it = t_dispatch_args.find(reinterpret_cast<u64>(body)); it != t_dispatch_args.end()) {
+                        const u64 args = it->second;
+                        t_dispatch_args.erase(it);
+                        PipeFn([this, args] {
+                            if (renderer->DispatchIndirect(pipe->regs, args)) {
+                                return;
+                            }
+                            renderer->WaitIdle();
+                            const u32* a = reinterpret_cast<const u32*>(args);
+                            renderer->Dispatch(pipe->regs, a[0], a[1], a[2]);
+                        });
+                        break;
+                    }
+                    PipeWords(kPipeDispatch, body, 3);
+                    break;
+                }
                 if (auto it = t_dispatch_args.find(reinterpret_cast<u64>(body)); it != t_dispatch_args.end()) {
                     const u64 args = it->second;
                     t_dispatch_args.erase(it);
@@ -1471,6 +1593,21 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             // The group counts are usually written by an earlier dispatch the
             // host GPU has not run yet (Driveclub's particle sort sizes its
             // passes from the particle count): the GPU reads them itself.
+            if (Piped()) {
+                if (a) {
+                    PipeFn([this, a] {
+                        if (renderer->DispatchIndirect(pipe->regs, reinterpret_cast<u64>(a))) {
+                            return;
+                        }
+                        if (u64(a[0]) * a[1] * a[2] > kMaxIndirectGroups) {
+                            DC_WARN("gpu: skipping indirect dispatch %ux%ux%u", a[0], a[1], a[2]);
+                            return;
+                        }
+                        renderer->Dispatch(pipe->regs, a[0], a[1], a[2]);
+                    });
+                }
+                break;
+            }
             if (renderer && a && renderer->DispatchIndirect(regs, reinterpret_cast<u64>(a))) {
                 break;
             }
@@ -1501,6 +1638,183 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     body_n > 4 ? body[4] : 0, body_n > 5 ? body[5] : 0);
         }
         p += body_n + 1;
+    }
+}
+
+void CommandProcessor::DmaCopy(const u32 body[6], bool compute) {
+    const u32 ctl = body[0];
+    const u32 cmd = body[5];
+    const u32 bytes = cmd & 0x1FFFFF;
+    const u32 src_sel = (ctl >> 29) & 3;
+    const u32 dst_sel = (ctl >> 20) & 3;
+    u8* gds = renderer ? renderer->Gds() : nullptr;
+    const u64 dst_off = body[3] & (Gpu::kGdsPartition - 1);
+    u8* dst = dst_sel == 1
+                  ? (gds && dst_off + bytes <= Gpu::kGdsPartition ? gds + dst_off : nullptr)
+                  : Ptr<u8>(body[3], body[4]);
+    if (!dst || bytes == 0 || (dst_sel != 1 && !Mapped(dst, bytes)) ||
+        (src_sel != 1 && src_sel != 2 && !Mapped(Ptr<const u8>(body[1], body[2]), bytes))) {
+        if (bytes) {
+            DC_WARN("gpu: DMA_DATA to/from unmapped memory skipped (ctl %#x dst %p, %u bytes)", ctl, dst, bytes);
+        }
+        return;
+    }
+    if (src_sel != 2) {
+        const u64 t = LtOn() ? LtNow() : 0;
+        SyncRenderer(); // the GPU may still be producing what we copy
+        if (t) {
+            DC_INFO("lt %.0f dma sync %.0f us (ctl %#x %u bytes)%s", LtUs(LtNow()), (LtNow() - t) / 1e3, ctl,
+                    bytes, compute ? " (compute)" : "");
+        }
+    }
+    HistAdd(src_sel == 2 ? 'F' : 'C', reinterpret_cast<u64>(dst), bytes,
+            t_ring ? t_ring->index : 99);
+    if (src_sel == 2) {
+        for (u32 k = 0; k + 4 <= bytes; k += 4) {
+            std::memcpy(dst + k, &body[1], 4);
+        }
+    } else {
+        const u64 src_off = body[1] & (Gpu::kGdsPartition - 1);
+        const u8* src = src_sel == 1
+                            ? (gds && src_off + bytes <= Gpu::kGdsPartition ? gds + src_off : nullptr)
+                            : Ptr<const u8>(body[1], body[2]);
+        if (src) {
+            std::memmove(dst, src, bytes);
+        }
+    }
+}
+
+void CommandProcessor::PipeWords(u32 kind, const u32* payload, u32 n, const u32* extra, u32 extra_n) {
+    Pipe::Batch& b = pipe->cur;
+    b.words.push_back(kind | ((n + extra_n) << 8));
+    b.words.insert(b.words.end(), payload, payload + n);
+    if (extra_n) {
+        b.words.insert(b.words.end(), extra, extra + extra_n);
+    }
+    if (kind == kPipeDraw && ++b.draws >= kPipeBatchDraws) {
+        PipeFlush();
+    } else if (b.words.size() > 64 * 1024) {
+        PipeFlush();
+    }
+}
+
+void CommandProcessor::PipeRegs(u32 index, const u32* values, u32 count) {
+    if (!count) {
+        return;
+    }
+    Pipe::Batch& b = pipe->cur;
+    b.words.push_back(kPipeRegs | ((count + 1) << 8));
+    b.words.push_back(index);
+    b.words.insert(b.words.end(), values, values + count);
+}
+
+void CommandProcessor::PipeFn(std::function<void()> fn) {
+    const u32 index = static_cast<u32>(pipe->cur.fns.size());
+    pipe->cur.fns.push_back(std::move(fn));
+    PipeWords(kPipeFn, &index, 1);
+}
+
+void CommandProcessor::PipeFlush() {
+    if (pipe->cur.words.empty()) {
+        return;
+    }
+    {
+        std::unique_lock lk(pipe->lock);
+        pipe->done_cv.wait(lk, [&] { return pipe->queue.size() < kPipeMaxQueued; });
+        pipe->queue.push_back(std::move(pipe->cur));
+        if (!pipe->spare.empty()) {
+            pipe->cur = std::move(pipe->spare.back());
+            pipe->spare.pop_back();
+        } else {
+            pipe->cur = {};
+        }
+    }
+    pipe->cv.notify_one();
+}
+
+void CommandProcessor::PipeDrain() {
+    PipeFlush();
+    std::unique_lock lk(pipe->lock);
+    pipe->done_cv.wait(lk, [&] { return pipe->queue.empty() && !pipe->busy; });
+}
+
+void CommandProcessor::PipeWorker(std::stop_token stop) {
+    pthread_setname_np("GPU gfx render");
+    Core::GuestProfile::RegisterThread("CPr");
+    if (!std::getenv("DC_NO_QOS")) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+    t_ring = nullptr; // SyncRenderer & co. act directly here
+    t_regs = &pipe->regs;
+    Gpu::t_queue = 0;
+    for (;;) {
+        Pipe::Batch b;
+        {
+            std::unique_lock lk(pipe->lock);
+            pipe->cv.wait(lk, [&] { return !pipe->queue.empty() || stop.stop_requested(); });
+            if (stop.stop_requested()) {
+                return;
+            }
+            b = std::move(pipe->queue.front());
+            pipe->queue.pop_front();
+            pipe->busy = true;
+        }
+        pipe->done_cv.notify_all(); // room for the ring thread
+        PipeReplay(b);
+        b.words.clear();
+        b.fns.clear();
+        b.draws = 0;
+        {
+            std::scoped_lock lk(pipe->lock);
+            pipe->busy = false;
+            if (pipe->spare.size() < kPipeMaxQueued) {
+                pipe->spare.push_back(std::move(b));
+            }
+        }
+        pipe->done_cv.notify_all();
+    }
+}
+
+void CommandProcessor::PipeReplay(Pipe::Batch& b) {
+    RegFile& r = pipe->regs;
+    const u32* w = b.words.data();
+    const u32* end = w + b.words.size();
+    while (w < end) {
+        const u32 kind = *w & 0xFF;
+        const u32 n = *w >> 8;
+        const u32* p = w + 1;
+        w = p + n;
+        switch (kind) {
+        case kPipeRegs:
+            std::memcpy(r.Data() + p[0], p + 1, (n - 1) * 4);
+            break;
+        case kPipeDraw: {
+            DrawCall dc;
+            std::memcpy(&dc, p, sizeof(dc));
+            renderer->Draw(r, dc);
+            break;
+        }
+        case kPipeDispatch:
+            renderer->Dispatch(r, p[0], p[1], p[2]);
+            break;
+        case kPipeCtx:
+            renderer->OnContextRegs(p, n);
+            break;
+        case kPipeMem: {
+            const u64 a = u64(p[0]) | (u64(p[1]) << 32);
+            std::memcpy(reinterpret_cast<void*>(a), p + 3, (n - 3) * 4);
+            if (p[2]) {
+                renderer->NoteConstDump(a, (n - 3) * 4);
+            }
+            break;
+        }
+        case kPipeFn:
+            b.fns[p[0]]();
+            break;
+        default:
+            DC_ERROR("gpu: pipe record kind %u", kind);
+            return;
+        }
     }
 }
 

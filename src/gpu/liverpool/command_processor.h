@@ -119,8 +119,11 @@ private:
     void Draw(bool indexed, u32 count, u32 index_offset, u32 first_vertex, u32 instances);
     RegFile& CurRegs();
     // Ring and registers of the ring the calling thread executes.
-    static thread_local Ring* t_ring;
-    static thread_local Liverpool::RegFile* t_regs;
+    // Never inlined: Apple clang 21 sometimes passes a thread-local's TLV
+    // descriptor in a register other than rdi while rdi is live, and the read
+    // then returns garbage (tlvcheck.py finds such call sites in a binary).
+    static Ring*& TRing();
+    static Liverpool::RegFile*& TRegs();
     const u32* IndirectArgs(u32 offset, u32 dwords);
     void SyncRenderer();
     // Runs `fn` once the renderer has executed everything recorded so far.
@@ -162,6 +165,44 @@ private:
 
     std::mutex rings_lock;
     std::vector<std::unique_ptr<Ring>> rings;
+
+    // Graphics ring pipeline (DC_CP_PIPE=1). The ring thread only parses PM4:
+    // register writes, draws and every memory side effect are recorded in
+    // order into batches, and a second thread replays them against its own
+    // register file and calls the renderer. Parsing and translation then
+    // overlap instead of taking turns on one thread.
+    struct Pipe {
+        struct Batch {
+            std::vector<u32> words; // [kind | dwords << 8] payload...
+            std::vector<std::function<void()>> fns;
+            u32 draws = 0;
+        };
+        std::mutex lock;
+        std::condition_variable cv;      // worker: a batch arrived
+        std::condition_variable done_cv; // ring thread: room, or drained
+        std::deque<Batch> queue;
+        std::vector<Batch> spare;
+        bool busy = false; // worker is replaying a batch
+        Batch cur;         // being recorded (ring thread only)
+        RegFile regs;      // the worker's registers
+        // Fence writes recorded into batches the renderer has not seen yet
+        // (guarded by fence_lock): the graphics ring may treat its own as
+        // pending, other rings only once the renderer has them.
+        std::unordered_map<u64, u32> pending;
+        std::jthread thread;
+    };
+    std::unique_ptr<Pipe> pipe;
+    // True on the graphics ring thread when it records into the pipe.
+    bool Piped() const { return pipe && renderer && TRing() && TRing()->index == 0; }
+    void PipeWords(u32 kind, const u32* payload, u32 n, const u32* extra = nullptr, u32 extra_n = 0);
+    void PipeRegs(u32 index, const u32* values, u32 count);
+    void PipeFn(std::function<void()> fn);
+    void PipeFlush(); // hands the recorded batch to the worker
+    void PipeDrain(); // PipeFlush, then waits until the worker has replayed everything
+    void PipeWorker(std::stop_token stop);
+    void PipeReplay(Pipe::Batch& b);
+    // DMA_DATA executed by the CP itself (memory, GDS or immediate data).
+    void DmaCopy(const u32 body[6], bool compute);
 };
 
 CommandProcessor& Instance();
