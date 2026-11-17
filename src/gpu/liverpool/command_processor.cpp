@@ -1760,7 +1760,19 @@ void CommandProcessor::PipeWorker(std::stop_token stop) {
             pipe->busy = true;
         }
         pipe->done_cv.notify_all(); // room for the ring thread
+        // One renderer lock and autorelease pool per batch instead of per
+        // draw. DC_PIPE_BATCH=0: per call, as without the pipe.
+        static const bool batch_lock = [] {
+            const char* e = std::getenv("DC_PIPE_BATCH");
+            return !e || std::atoi(e) != 0;
+        }();
+        if (batch_lock) {
+            renderer->BeginBatch();
+        }
         PipeReplay(b);
+        if (batch_lock) {
+            renderer->EndBatch();
+        }
         b.words.clear();
         b.fns.clear();
         b.draws = 0;

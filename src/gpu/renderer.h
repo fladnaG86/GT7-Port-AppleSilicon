@@ -107,6 +107,12 @@ public:
     // The calling queue's partition of the global data share, shared by its
     // shaders and CP DMA (call WaitIdle before reading what shaders wrote).
     virtual std::uint8_t* Gds() = 0;
+
+    // Brackets a run of calls from one thread (the graphics pipe replays
+    // batches of ~32 draws): the backend may take its lock and set up per-call
+    // state once for the whole run. Other threads still get in between runs.
+    virtual void BeginBatch() {}
+    virtual void EndBatch() {}
 };
 
 // Queue the calling thread executes (0 = graphics, n = compute vqid n).

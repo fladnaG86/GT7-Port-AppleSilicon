@@ -2,6 +2,9 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#include <pthread.h>
+extern "C" void *objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void *);
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <nmmintrin.h>
@@ -388,6 +391,15 @@ struct MetalRenderer::Impl {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
   std::mutex lock;
+  // Thread inside BeginBatch/EndBatch: it holds `lock` and an autorelease
+  // pool, so its calls skip both. Only that thread stores itself here, so a
+  // relaxed load tells any thread whether it is the owner.
+  std::atomic<pthread_t> batch_owner{nullptr};
+  void *batch_pool = nullptr;
+  std::atomic<pthread_t> pool_owner{nullptr}; // thread owning batch_pool
+  bool InBatch() const {
+    return batch_owner.load(std::memory_order_relaxed) == pthread_self();
+  }
 
   // ---- guest memory view ----
   id<MTLBuffer> mem[2] = {nil, nil};
@@ -10623,6 +10635,18 @@ void RequestGpuCapture() {
   g_capture_request.store(true, std::memory_order_release);
 }
 
+namespace {
+// The renderer lock, unless the calling thread already holds it for a batch.
+struct RendererLock {
+  std::optional<Gpu::LtLock<std::mutex>> lk;
+  RendererLock(std::mutex &m, bool in_batch) {
+    if (!in_batch) {
+      lk.emplace(m);
+    }
+  }
+};
+} // namespace
+
 MetalRenderer::MetalRenderer(Device &device) : impl(std::make_unique<Impl>()) {
   impl->device = (__bridge id<MTLDevice>)device.Handle();
   impl->queue = (__bridge id<MTLCommandQueue>)device.Queue();
@@ -10630,16 +10654,19 @@ MetalRenderer::MetalRenderer(Device &device) : impl(std::make_unique<Impl>()) {
 }
 
 MetalRenderer::~MetalRenderer() {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   impl->Commit(true);
 }
 
 void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   if (!impl->draw_thread) {
     impl->draw_thread = pthread_mach_thread_np(pthread_self());
   }
-  @autoreleasepool {
+  void *pool = impl->pool_owner.load(std::memory_order_relaxed) == pthread_self()
+                   ? nullptr
+                   : objc_autoreleasePoolPush();
+  {
     impl->NoteWork("  draw vs %#llx ps %#llx count %u x%u (idx %u)\n",
                    regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_VS),
                    regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS),
@@ -10664,11 +10691,14 @@ void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
       impl->ProfileCut(what);
     }
   }
+  if (pool) {
+    objc_autoreleasePoolPop(pool);
+  }
 }
 
 void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
                              std::uint32_t y, std::uint32_t z) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     impl->NoteWork("  dispatch cs %#llx %ux%ux%u\n",
                    regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), x, y, z);
@@ -10683,7 +10713,7 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
 }
 
 bool MetalRenderer::DispatchIndirect(const RegFile &regs, std::uint64_t args) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   id<MTLBuffer> buf = nil;
   u64 off = 0;
   if ((args & 3) || !impl->Locate(args, 12, &buf, &off)) {
@@ -10706,7 +10736,7 @@ bool MetalRenderer::DispatchIndirect(const RegFile &regs, std::uint64_t args) {
 }
 
 void MetalRenderer::OnSubmit() {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   // DC_SERIAL: wait for the GPU after every submit (debug: rules out CPU/GPU
   // races on guest memory).
   static const bool serial = std::getenv("DC_SERIAL") != nullptr;
@@ -10721,14 +10751,14 @@ void MetalRenderer::OnSubmit() {
 std::uint64_t MetalRenderer::GpuTimeNs() const { return impl->total_gpu_ns.load(); }
 
 void MetalRenderer::WaitIdle() {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     impl->Commit(true);
   }
 }
 
 void MetalRenderer::Signal(std::function<void()> done) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     impl->Signal(std::move(done));
   }
@@ -10736,7 +10766,7 @@ void MetalRenderer::Signal(std::function<void()> done) {
 
 void MetalRenderer::Flip(const FlipInfo &flip) {
   flips.fetch_add(1, std::memory_order_relaxed);
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     impl->Flip(flip);
   }
@@ -10745,7 +10775,7 @@ void MetalRenderer::Flip(const FlipInfo &flip) {
 bool MetalRenderer::DmaData(std::uint32_t dst_sel, std::uint64_t dst,
                             std::uint32_t src_sel, std::uint64_t src,
                             std::uint32_t bytes) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     return impl->DmaData(dst_sel, dst, src_sel, src, bytes);
   }
@@ -10764,7 +10794,7 @@ void MetalRenderer::OnContextRegs(const std::uint32_t *body,
       reg != Reg::DB_Z_INFO) {
     return;
   }
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   impl->OnContextRegs(body, body_dwords);
 }
 
@@ -10774,16 +10804,47 @@ void MetalRenderer::NoteConstDump(std::uint64_t addr, std::uint32_t bytes) {
 }
 
 void MetalRenderer::SaveTargets(const char *path) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     impl->SaveTargets(path);
   }
 }
 
 void MetalRenderer::LoadTargets(const char *path) {
-  Gpu::LtLock lk(impl->lock);
+  RendererLock lk(impl->lock, impl->InBatch());
   @autoreleasepool {
     impl->LoadTargets(path);
+  }
+}
+
+void MetalRenderer::BeginBatch() {
+  if (impl->pool_owner.load(std::memory_order_relaxed) == pthread_self()) {
+    return;
+  }
+  // DC_BATCH_LOCK=1 also holds the lock for the whole batch: measured slower
+  // in a race (24.5 vs 25.2 fps), the compute rings then wait for it.
+  static const bool hold = [] {
+    const char *e = std::getenv("DC_BATCH_LOCK");
+    return e && std::atoi(e) != 0;
+  }();
+  if (hold) {
+    Gpu::LtAcquire(impl->lock);
+    impl->batch_owner.store(pthread_self(), std::memory_order_relaxed);
+  }
+  impl->batch_pool = objc_autoreleasePoolPush();
+  impl->pool_owner.store(pthread_self(), std::memory_order_relaxed);
+}
+
+void MetalRenderer::EndBatch() {
+  if (impl->pool_owner.load(std::memory_order_relaxed) != pthread_self()) {
+    return;
+  }
+  impl->pool_owner.store(nullptr, std::memory_order_relaxed);
+  objc_autoreleasePoolPop(impl->batch_pool);
+  impl->batch_pool = nullptr;
+  if (impl->InBatch()) {
+    impl->batch_owner.store(nullptr, std::memory_order_relaxed);
+    impl->lock.unlock();
   }
 }
 

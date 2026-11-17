@@ -95,6 +95,28 @@ inline u64 LtSpinNs() {
     return ns;
 }
 
+// Takes `m` the way LtLock does (poll, then sleep).
+template <typename M>
+inline void LtAcquire(M& m) {
+    if (m.try_lock()) {
+        return;
+    }
+    const u64 t = LtNow();
+    if (const u64 spin = LtSpinNs()) {
+        do {
+            for (int k = 0; k < 8; ++k) {
+                __builtin_ia32_pause();
+            }
+            if (m.try_lock()) {
+                lt_lock_ns += LtNow() - t;
+                return;
+            }
+        } while (LtNow() - t < spin);
+    }
+    m.lock();
+    lt_lock_ns += LtNow() - t;
+}
+
 template <typename M>
 struct LtLock {
     M& m;
